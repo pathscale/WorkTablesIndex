@@ -1,9 +1,9 @@
 [package]
-name = "indexset"
-version = "0.16.0"
+name = "WorkTablesIndex"
+version = "0.0.1"
 edition = "2021"
-documentation = "https://docs.rs/indexset/"
-repository = "https://github.com/brurucy/indexset"
+documentation = "https://docs.rs/WorkTablesIndex/"
+repository = "https://github.com/pathscale/WorkTablesIndex"
 license = "Apache-2.0 OR MIT"
 description = "A two-level BTree with fast iteration and indexing operations"
 keywords = ["btreemap", "btreeset", "set", "map", "order-statistic"]
