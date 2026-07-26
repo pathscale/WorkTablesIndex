@@ -1,0 +1,68 @@
+# Working agreement — WorkTablesIndex
+
+The operating contract for **any** coding agent working in this repository,
+mirroring the standard used in [pathscale/WorkTable](https://github.com/pathscale/WorkTable)
+and applying to Codex, Cursor, Gemini CLI (native `AGENTS.md` readers) and
+Claude Code (via the `@AGENTS.md` import in `CLAUDE.md`). **Never fork these
+rules into a per-vendor file.**
+
+## What this crate is
+
+pathscale's maintained fork of [brurucy/indexset](https://github.com/brurucy/indexset)
+(base: upstream 0.16.0), published on crates.io as `WorkTablesIndex`. It exists
+for one reason: upstream's `NodeLike::halve()` split at `capacity()/2`, and
+`Vec::split_off` panics when `at > len` — reachable whenever a node shrank
+after growing (concurrent removals). Our fix splits at `len()/2`.
+
+Consumers (`worktable`, `data_bucket`) depend on it via a **package alias**:
+
+```toml
+indexset = { package = "WorkTablesIndex", version = "=0.0.1", features = ["concurrent", "cdc", "multimap"] }
+```
+
+so every `use indexset::` path in their code keeps working unchanged.
+
+## Invariants (don't break these)
+
+- **Minimal diff to upstream.** No reformatting of inherited code, no lint-fix
+  churn, no gratuitous refactors: the smaller our diff, the easier it is to
+  exchange patches with upstream and to rebase onto their releases. The
+  `[lints]` tables in `Cargo.toml` freeze the lint classes already present in
+  inherited code; CI denies everything else. Do not add allows for new code.
+- **Type identity is load-bearing.** `worktable` and `data_bucket` must always
+  pin the *same exact version* of this crate — two source crates providing the
+  same `Pair`/`ChangeEvent` types cannot coexist in one dependency tree. Any
+  version bump here requires bumping both consumers together.
+- **On-disk geometry coupling.** Changes to node split/merge behaviour change
+  WorkTable's space-index golden fixtures
+  (`tests/data/expected/space_index/indexset/…` in the WorkTable repo). Ship
+  such changes together with regenerated fixtures there.
+- **Doc examples import `indexset::` on purpose.** That is correct for aliased
+  consumers; it just cannot resolve under this crate name locally, so CI runs
+  `cargo test --all-features --lib --tests` (no doctests). Don't "fix" the
+  examples.
+- **Publishing to crates.io is irreversible.** Versions can never be reused;
+  yanking does not delete. `cargo publish --dry-run` first, publish from the
+  default branch, and remember the exact-pin consumers.
+
+## Build & test
+
+```bash
+cargo build --all-targets --all-features
+cargo test --all-features --lib --tests
+cargo clippy --all-targets --all-features -- -D warnings   # allow-list lives in Cargo.toml [lints]
+```
+
+## Syncing with upstream
+
+Add `upstream` as a remote (`git remote add upstream
+https://github.com/brurucy/indexset.git`), rebase or cherry-pick their
+changes, re-apply our fix commits on top, and re-run the WorkTable suite
+(including fixture checks) before publishing. Keep our history as: upstream
+base + clearly-labelled pathscale commits.
+
+## Git workflow
+
+- Default branch: `master`. Never force-push it.
+- Branch naming for changes: `fix/…` or `feat/…`; PRs preferred for anything
+  beyond upstream-sync mechanics.

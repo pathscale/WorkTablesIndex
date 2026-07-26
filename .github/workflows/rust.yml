@@ -1,0 +1,41 @@
+name: Rust
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_test:
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+      - name: Build (all features, all targets)
+        run: cargo build --all-targets --all-features
+      # Doctests are excluded on purpose: upstream doc examples import
+      # `indexset::...`, which is correct for consumers (they alias the
+      # package back to `indexset`) but unresolvable under this crate name.
+      - name: Test (lib + integration, all features)
+        run: cargo test --all-features --lib --tests
+
+  clippy:
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+      # The frozen allow-list for inherited upstream code lives in
+      # Cargo.toml's [lints] tables; everything else is denied.
+      - name: Clippy (deny new warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings

@@ -47,3 +47,49 @@ harness = false
 [[bench]]
 name = "concurrent"
 harness = false
+
+# Lint policy: this crate is a minimal-diff fork of upstream indexset
+# (github.com/brurucy/indexset) plus the halve() soundness fix. Upstream code
+# is deliberately NOT churned to satisfy lints or rustfmt - that would make
+# exchanging patches with upstream painful. The allows below freeze the lint
+# classes present in the inherited code; CI denies everything else. Do not
+# add new allows for newly written code.
+
+[lints.rust]
+unknown_lints = "allow" # entries below may not exist on older toolchains
+non_snake_case = "allow"
+deprecated = "allow"
+mismatched_lifetime_syntaxes = "allow"
+
+[lints.clippy]
+bind_instead_of_map = "allow"
+bool_assert_comparison = "allow"
+clone_on_copy = "allow"
+derived_hash_with_manual_eq = "allow"
+field_reassign_with_default = "allow"
+get_first = "allow"
+get_last_with_len = "allow"
+iter_cloned_collect = "allow"
+len_without_is_empty = "allow"
+len_zero = "allow"
+manual_ok_err = "allow"
+missing_transmute_annotations = "allow"
+multiple_bound_locations = "allow"
+needless_borrow = "allow"
+needless_range_loop = "allow"
+needless_return = "allow"
+never_loop = "allow"
+non_canonical_partial_ord_impl = "allow"
+op_ref = "allow"
+redundant_locals = "allow"
+redundant_pattern_matching = "allow"
+repeat_vec_with_capacity = "allow"
+type_complexity = "allow"
+uninit_assumed_init = "allow"
+unit_arg = "allow"
+unnecessary_lazy_evaluations = "allow"
+unnecessary_sort_by = "allow"
+unnecessary_unwrap = "allow"
+useless_conversion = "allow"
+useless_vec = "allow"
+while_let_loop = "allow"

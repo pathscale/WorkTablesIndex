@@ -22,7 +22,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
     c.bench_function("indexset insert 100k", |b| {
         b.iter(|| {
-            let mut indexset = indexset::BTreeSet::new();
+            let mut indexset = WorkTablesIndex::BTreeSet::new();
 
             input.iter().for_each(|item| {
                 black_box(indexset.insert(*item));
@@ -33,7 +33,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
     c.bench_function("concurrent indexset insert 100k", |b| {
         b.iter(|| {
-            let indexset: indexset::concurrent::set::BTreeSet<usize> = indexset::concurrent::set::BTreeSet::new();
+            let indexset: WorkTablesIndex::concurrent::set::BTreeSet<usize> = WorkTablesIndex::concurrent::set::BTreeSet::new();
 
             input.iter().for_each(|item| {
                 black_box(indexset.insert(*item));
@@ -55,8 +55,8 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     let stdlib = std::collections::BTreeSet::from_iter(input.iter());
-    let indexset = indexset::BTreeSet::from_iter(input.iter());
-    let concurrent_indexset: indexset::concurrent::set::BTreeSet<usize> = indexset::concurrent::set::BTreeSet::new();
+    let indexset = WorkTablesIndex::BTreeSet::from_iter(input.iter());
+    let concurrent_indexset: WorkTablesIndex::concurrent::set::BTreeSet<usize> = WorkTablesIndex::concurrent::set::BTreeSet::new();
     for i in &input {
         concurrent_indexset.insert(*i);
     }
