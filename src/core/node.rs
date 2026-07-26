@@ -143,7 +143,17 @@ impl<T: Ord> NodeLike<T> for Vec<T> {
     }
     #[inline]
     fn halve(&mut self) -> Self {
-        self.split_off(self.capacity() / 2)
+        // Split on `len`, not `capacity`. `Vec::split_off` panics when `at >
+        // len`, and a Vec's allocated capacity can exceed its length: it grows
+        // geometrically and never shrinks on removal. A node that grew and then
+        // had entries removed therefore has `capacity / 2 > len`, and splitting
+        // it panicked with "`at` split index is N should be <= len".
+        //
+        // The single-threaded caller guards with `len() == node_capacity`, where
+        // the two agree. `Operation::Split` in the concurrent path has no such
+        // guard, so it hits the mismatch whenever entries are removed between
+        // the split being scheduled and applied.
+        self.split_off(self.len() / 2)
     }
     #[inline]
     fn need_to_split(&self, border: usize, _: &T) -> bool {
