@@ -76,3 +76,11 @@ base + clearly-labelled pathscale commits.
 - Default branch: `master`. Never force-push it.
 - Branch naming for changes: `fix/…` or `feat/…`; PRs preferred for anything
   beyond upstream-sync mechanics.
+
+## No AI attribution
+
+Never add AI attribution to anything in this repo or leaving it: no "Generated with
+Claude Code" / robot-emoji footers, no `Co-Authored-By: Claude` (or any AI) trailers,
+and no AI credit in commit messages, PR or issue titles/bodies, changelogs, release
+notes, or code comments. Applies to every agent and every vendor. Work product should
+be indistinguishable from a human teammate's.
