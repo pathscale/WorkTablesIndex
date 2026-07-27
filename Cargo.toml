@@ -62,6 +62,8 @@ deprecated = "allow"
 mismatched_lifetime_syntaxes = "allow"
 
 [lints.clippy]
+# nonminimal_bool fires on upstream test code under older clippy (1.96 on CI)
+nonminimal_bool = "allow"
 bind_instead_of_map = "allow"
 bool_assert_comparison = "allow"
 clone_on_copy = "allow"
