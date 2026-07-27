@@ -15,6 +15,9 @@ env:
 jobs:
   build_test:
     runs-on: ubicloud-standard-2
+    # A hung test must fail fast, not squat the runner (a livelocking
+    # concurrent test once held a runner for 28+ minutes).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -25,11 +28,22 @@ jobs:
       # Doctests are excluded on purpose: upstream doc examples import
       # `indexset::...`, which is correct for consumers (they alias the
       # package back to `indexset`) but unresolvable under this crate name.
-      - name: Test (lib + integration, all features)
-        run: cargo test --all-features --lib --tests
+      # Fast tier only. The multi-threaded stress tests degrade badly (or
+      # livelock) on 2-core runners - they spawn 8 OS threads over spin-retry
+      # concurrent structures - so they are reserved for the manually
+      # triggered full-suite workflow (heavy.yml), per repo policy: tests
+      # that take too long do not run in automatic CI.
+      - name: Test (fast tier, all features)
+        run: >
+          cargo test --all-features --lib --tests --
+          --skip test_concurrent_insert
+          --skip test_remove_stress
+          --skip parallel_iter_and_mut
+          --skip test_concurrent_cdc_no_gaps
 
   clippy:
     runs-on: ubicloud-standard-2
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2

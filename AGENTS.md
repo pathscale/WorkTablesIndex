@@ -45,6 +45,16 @@ so every `use indexset::` path in their code keeps working unchanged.
   yanking does not delete. `cargo publish --dry-run` first, publish from the
   default branch, and remember the exact-pin consumers.
 
+## Testing tiers
+
+Automatic CI runs the fast tier only: tests that take too long (the
+multi-threaded stress tests, which spawn 8 OS threads over spin-retry
+structures and can livelock on 2-core runners) are reserved for special
+testing via the manually triggered `Heavy tests` workflow
+(`gh workflow run heavy.yml`). Run it whenever concurrency-relevant code
+changes. Keep this split honest: a test belongs in the fast tier unless it
+demonstrably cannot run quickly everywhere.
+
 ## Build & test
 
 ```bash

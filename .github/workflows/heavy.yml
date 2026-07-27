@@ -1,0 +1,24 @@
+# Special testing tier: the multi-threaded stress tests excluded from
+# automatic CI (they spawn many OS threads over spin-retry concurrent
+# structures and can run very long or livelock on small runners).
+# Trigger manually when touching concurrency-relevant code:
+#   gh workflow run heavy.yml --repo pathscale/WorkTablesIndex
+name: Heavy tests
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  full_test:
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+      - name: Full test suite (including stress tests)
+        run: cargo test --all-features --lib --tests
