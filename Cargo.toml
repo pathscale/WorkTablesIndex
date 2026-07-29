@@ -47,6 +47,7 @@ harness = false
 [[bench]]
 name = "concurrent"
 harness = false
+required-features = ["multimap"]
 
 # Lint policy: this crate is a minimal-diff fork of upstream indexset
 # (github.com/brurucy/indexset) plus the halve() soundness fix. Upstream code
