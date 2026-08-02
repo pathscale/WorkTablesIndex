@@ -8,11 +8,12 @@ rules into a per-vendor file.**
 
 ## What this crate is
 
-pathscale's maintained fork of [brurucy/indexset](https://github.com/brurucy/indexset)
-(base: upstream 0.16.0), published on crates.io as `WorkTablesIndex`. It exists
-for one reason: upstream's `NodeLike::halve()` split at `capacity()/2`, and
-`Vec::split_off` panics when `at > len` — reachable whenever a node shrank
-after growing (concurrent removals). Our fix splits at `len()/2`.
+pathscale's maintained downstream package of
+[indexset](https://github.com/lucidarium-systems/indexset), published on
+crates.io as `WorkTablesIndex`. It was created to ship the `NodeLike::halve()`
+`len()/2` fix before upstream adopted it. Upstream now carries that fix and its
+regression tests; this package remains the coordinated, exactly pinned source
+shared by WorkTable and DataBucket.
 
 Consumers (`worktable`, `data_bucket`) depend on it via a **package alias**:
 
@@ -66,10 +67,11 @@ cargo clippy --all-targets --all-features -- -D warnings   # allow-list lives in
 ## Syncing with upstream
 
 Add `upstream` as a remote (`git remote add upstream
-https://github.com/brurucy/indexset.git`), rebase or cherry-pick their
-changes, re-apply our fix commits on top, and re-run the WorkTable suite
-(including fixture checks) before publishing. Keep our history as: upstream
-base + clearly-labelled pathscale commits.
+https://github.com/lucidarium-systems/indexset.git`), then rebase or
+cherry-pick upstream changes in order. Preserve the package rename and CI
+policy, and re-run the WorkTable suite (including fixture checks) before
+publishing. Keep fork-only commits clearly labelled and the source diff from
+upstream minimal.
 
 ## Git workflow
 

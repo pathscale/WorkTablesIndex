@@ -49,12 +49,10 @@ name = "concurrent"
 harness = false
 required-features = ["multimap"]
 
-# Lint policy: this crate is a minimal-diff fork of upstream indexset
-# (github.com/brurucy/indexset) plus the halve() soundness fix. Upstream code
-# is deliberately NOT churned to satisfy lints or rustfmt - that would make
-# exchanging patches with upstream painful. The allows below freeze the lint
-# classes present in the inherited code; CI denies everything else. Do not
-# add new allows for newly written code.
+# Lint policy: this crate is a minimal-diff downstream package of upstream
+# indexset (github.com/lucidarium-systems/indexset). The allows below freeze
+# lint classes still present in inherited code; CI denies everything else.
+# Do not add new allows for newly written code.
 
 [lints.rust]
 unknown_lints = "allow" # entries below may not exist on older toolchains
