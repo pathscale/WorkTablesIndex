@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use crate::core::node::NodeLike;
 use crate::{
     cdc::change::ChangeEvent,
-    core::multipair::{MultiPair, MultiPairLike, MultiPairRemoveHelper},
+    core::multipair::{MultiPair, MultiPairLike, MultiPairRemoveHelper, OrdMultiPair},
 };
 
 use super::set::BTreeSet;
@@ -28,6 +28,22 @@ where
     pub(crate) set: BTreeSet<M, Node>,
     marker: PhantomData<(K, V)>,
 }
+
+/// A multimap whose entries are ordered by key and then value.
+///
+/// This representation requires `V: Ord`, and lets exact pair removal locate
+/// the value directly instead of scanning entries that share the same key.
+///
+/// ```
+/// use WorkTablesIndex::concurrent::multimap::OrderedBTreeMultiMap;
+///
+/// let map = OrderedBTreeMultiMap::<usize, &str>::new();
+/// map.insert(1, "b");
+/// map.insert(1, "a");
+///
+/// assert_eq!(map.remove(&1, &"b"), Some((1, "b")));
+/// ```
+pub type OrderedBTreeMultiMap<K, V> = BTreeMultiMap<K, V, Vec<OrdMultiPair<K, V>>, OrdMultiPair<K, V>>;
 
 impl<K, V, Node, M> Default for BTreeMultiMap<K, V, Node, M>
 where

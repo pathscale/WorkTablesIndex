@@ -5,8 +5,7 @@ use scc::TreeIndex;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::thread;
-use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
-use WorkTablesIndex::core::multipair::OrdMultiPair;
+use WorkTablesIndex::concurrent::multimap::{BTreeMultiMap, OrderedBTreeMultiMap};
 
 #[derive(Clone)]
 enum Op {
@@ -244,10 +243,8 @@ fn build_random_multimap(entries: &[(usize, usize)]) -> BTreeMultiMap<usize, usi
     map
 }
 
-fn build_ord_multimap(
-    entries: &[(usize, usize)],
-) -> BTreeMultiMap<usize, usize, Vec<OrdMultiPair<usize, usize>>, OrdMultiPair<usize, usize>> {
-    let map = BTreeMultiMap::<usize, usize, Vec<OrdMultiPair<usize, usize>>, OrdMultiPair<usize, usize>>::new();
+fn build_ord_multimap(entries: &[(usize, usize)]) -> OrderedBTreeMultiMap<usize, usize> {
+    let map = OrderedBTreeMultiMap::<usize, usize>::new();
     for (key, value) in entries {
         map.insert(*key, *value);
     }
