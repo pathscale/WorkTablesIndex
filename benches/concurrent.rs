@@ -208,18 +208,8 @@ fn build_random_multimap(entries: &[(usize, usize)]) -> BTreeMultiMap<usize, usi
 
 fn build_ord_multimap(
     entries: &[(usize, usize)],
-) -> BTreeMultiMap<
-    usize,
-    usize,
-    Vec<OrdMultiPair<usize, usize>>,
-    OrdMultiPair<usize, usize>,
-> {
-    let map = BTreeMultiMap::<
-        usize,
-        usize,
-        Vec<OrdMultiPair<usize, usize>>,
-        OrdMultiPair<usize, usize>,
-    >::new();
+) -> BTreeMultiMap<usize, usize, Vec<OrdMultiPair<usize, usize>>, OrdMultiPair<usize, usize>> {
+    let map = BTreeMultiMap::<usize, usize, Vec<OrdMultiPair<usize, usize>>, OrdMultiPair<usize, usize>>::new();
     for (key, value) in entries {
         map.insert(*key, *value);
     }

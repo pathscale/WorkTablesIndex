@@ -504,16 +504,8 @@ mod tests {
 
         assert_eq!(map.insert(split_left_max, "new"), Some("old"));
         assert_eq!(map.len(), maximum_node_size);
-        assert_eq!(
-            map.get(&split_left_max).map(|entry| entry.get().value),
-            Some("new")
-        );
-        assert_eq!(
-            map.iter()
-                .filter(|(key, _)| **key == split_left_max)
-                .count(),
-            1
-        );
+        assert_eq!(map.get(&split_left_max).map(|entry| entry.get().value), Some("new"));
+        assert_eq!(map.iter().filter(|(key, _)| **key == split_left_max).count(), 1);
     }
 
     #[derive(Debug, Default)]
