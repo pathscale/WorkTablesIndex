@@ -1,4 +1,5 @@
 use core::borrow::Borrow;
+#[cfg(not(feature = "std-binary-search"))]
 use core::cmp::Ordering;
 use std::ops::Deref;
 
@@ -50,6 +51,17 @@ pub trait NodeLike<T: Ord> {
 }
 
 #[inline]
+#[cfg(feature = "std-binary-search")]
+fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
+where
+    T: Borrow<Q> + Ord,
+    Q: Ord + ?Sized,
+{
+    haystack.binary_search_by(|candidate| candidate.borrow().cmp(needle))
+}
+
+#[inline]
+#[cfg(not(feature = "std-binary-search"))]
 fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
 where
     T: Borrow<Q> + Ord,

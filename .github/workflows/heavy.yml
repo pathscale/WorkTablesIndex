@@ -20,5 +20,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: "true"
-      - name: Full test suite (including stress tests)
+      - name: Full test suite (custom binary search, including stress tests)
+        run: cargo test --features "serde concurrent cdc multimap" --lib --tests
+      - name: Full test suite (all features, including stress tests)
         run: cargo test --all-features --lib --tests

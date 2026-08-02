@@ -30,6 +30,7 @@ The following table describes the variants of this data structure that are avail
 * `concurrent`: enables the three concurrent variants of `BTreeSet` referenced in the table above
 * `cdc`: provides helper methods to persist all concurrent trees
 * `multimap`: enables `BTreeMultiMap`
+* `std-binary-search`: replaces the custom node point lookup with the standard library binary search for downstream A/B measurement; the custom search remains the default because local microbenchmarks currently favor it
 
 # Background
 

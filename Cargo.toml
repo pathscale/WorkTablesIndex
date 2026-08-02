@@ -36,6 +36,7 @@ concurrent = [
 ]
 cdc = ["concurrent"]
 multimap = ["concurrent", "dep:fastrand"]
+std-binary-search = []
 
 [package.metadata.docs.rs]
 features = ["cdc", "concurrent", "multimap"]
