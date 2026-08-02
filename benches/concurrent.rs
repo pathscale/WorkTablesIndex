@@ -21,6 +21,7 @@ const OPERATIONS_PER_THREAD: usize = 100_000;
 const TOTAL_OPERATIONS: usize = NUM_THREADS * OPERATIONS_PER_THREAD;
 const MULTIMAP_REMOVE_ENTRIES: usize = 20_000;
 const MULTIMAP_REMOVE_SEED: u64 = 42;
+const IS_EMPTY_ENTRIES: usize = 100_000;
 
 // fn generate_operations(write_ratio: f64) -> Vec<Vec<Op>> {
 //     let mut rng = thread_rng();
@@ -183,6 +184,17 @@ fn bench_concurrent_btreeset(c: &mut Criterion) {
     }
 }
 
+fn bench_is_empty(c: &mut Criterion) {
+    let set = WorkTablesIndex::concurrent::set::BTreeSet::<usize>::new();
+    for value in 0..IS_EMPTY_ENTRIES {
+        set.insert(value);
+    }
+
+    c.bench_function("ConcurrentBTreeSet is_empty/non-empty", |b| {
+        b.iter(|| black_box(set.is_empty()))
+    });
+}
+
 fn removal_entries(values_per_key: RangeInclusive<usize>) -> Vec<(usize, usize)> {
     let mut rng = StdRng::seed_from_u64(MULTIMAP_REMOVE_SEED);
     let mut entries = Vec::with_capacity(MULTIMAP_REMOVE_ENTRIES);
@@ -272,5 +284,10 @@ fn bench_multimap_removal(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_concurrent_btreeset, bench_multimap_removal);
+criterion_group!(
+    benches,
+    bench_concurrent_btreeset,
+    bench_is_empty,
+    bench_multimap_removal
+);
 criterion_main!(benches);
