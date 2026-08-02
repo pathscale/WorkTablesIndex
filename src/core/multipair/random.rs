@@ -1,49 +1,31 @@
+use std::borrow::Borrow;
 use std::fmt::Debug;
-use std::{borrow::Borrow, mem::MaybeUninit};
+use std::ops::Bound;
 
 use core::cmp::Ordering;
-use fastrand;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::cdc::change::ChangeEvent;
+use crate::concurrent::set::BTreeSet;
+use crate::core::node::NodeLike;
 use crate::core::pair::Pair;
 
+use super::{MultiPairLike, MultiPairRemoveHelper};
+
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Hash)]
 pub struct RandomMultiPair<K, V> {
     pub key: K,
     pub value: V,
     pub discriminator: u64,
 }
 
-impl<K: Ord, V: PartialEq> RandomMultiPair<K, V> {
+impl<K, V> RandomMultiPair<K, V> {
     pub fn new(key: K, value: V) -> Self {
-        Self {
-            key,
-            value,
-            discriminator: fastrand::u64(..),
-        }
+        Self { key, value, discriminator: fastrand::u64(..) }
     }
-    // SAFETY: The `value` field is never read for sentinel values - only `key` and
-    // `discriminator` are used for ordering.
-    #[allow(clippy::uninit_assumed_init)]
-    pub fn with_infimum(key: K) -> Self {
-        Self {
-            key,
-            value: unsafe { MaybeUninit::uninit().assume_init() },
-            discriminator: INFIMUM,
-        }
-    }
-    // SAFETY: The `value` field is never read for sentinel values - only `key` and
-    // `discriminator` are used for ordering.
-    #[allow(clippy::uninit_assumed_init)]
-    pub fn with_supremum(key: K) -> Self {
-        Self {
-            key,
-            value: unsafe { MaybeUninit::uninit().assume_init() },
-            discriminator: SUPREMUM,
-        }
-    }
+
 }
 
 impl<K: Ord, V: PartialEq> Eq for RandomMultiPair<K, V> {}
@@ -54,25 +36,11 @@ impl<K: Ord, V: PartialEq> PartialEq<Self> for RandomMultiPair<K, V> {
     }
 }
 
-const INFIMUM: u64 = 0;
-const SUPREMUM: u64 = u64::MAX;
-
 impl<K: Ord, V: PartialEq> Ord for RandomMultiPair<K, V> {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.key.cmp(&other.key) {
-            Ordering::Equal => {
-                if (self.discriminator == INFIMUM || other.discriminator == INFIMUM)
-                    || (self.discriminator == SUPREMUM || other.discriminator == SUPREMUM)
-                {
-                    return self.discriminator.cmp(&other.discriminator);
-                }
-
-                if self.value.eq(&other.value) {
-                    return Ordering::Equal;
-                }
-
-                self.discriminator.cmp(&other.discriminator)
-            }
+            Ordering::Equal if self.value.eq(&other.value) => Ordering::Equal,
+            Ordering::Equal => self.discriminator.cmp(&other.discriminator),
             ord => ord,
         }
     }
@@ -84,24 +52,27 @@ impl<K: Ord, V: PartialEq> PartialOrd for RandomMultiPair<K, V> {
     }
 }
 
-impl<K, V> std::hash::Hash for RandomMultiPair<K, V>
-where
-    K: std::hash::Hash,
-    V: std::hash::Hash,
-{
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.key.hash(state);
-        self.value.hash(state);
-    }
-}
-
-impl<K: Ord, V: PartialEq> Borrow<K> for RandomMultiPair<K, V> {
+impl<K, V> Borrow<K> for RandomMultiPair<K, V> {
     fn borrow(&self) -> &K {
         &self.key
     }
 }
 
-impl<K: Ord, V: PartialEq> From<Pair<K, V>> for RandomMultiPair<K, V> {
+impl<K: Ord, V: PartialEq> MultiPairLike<K, V> for RandomMultiPair<K, V> {
+    fn new(key: K, value: V) -> Self {
+        Self::new(key, value)
+    }
+
+    fn key(&self) -> &K {
+        &self.key
+    }
+
+    fn value(&self) -> &V {
+        &self.value
+    }
+}
+
+impl<K, V> From<Pair<K, V>> for RandomMultiPair<K, V> {
     fn from(pair: Pair<K, V>) -> Self {
         RandomMultiPair {
             key: pair.key,
@@ -111,12 +82,46 @@ impl<K: Ord, V: PartialEq> From<Pair<K, V>> for RandomMultiPair<K, V> {
     }
 }
 
-impl<K: Ord, V: PartialEq> From<RandomMultiPair<K, V>> for Pair<K, V> {
+impl<K, V> From<RandomMultiPair<K, V>> for Pair<K, V> {
     fn from(pair: RandomMultiPair<K, V>) -> Self {
         Pair {
             key: pair.key,
             value: pair.value,
         }
+    }
+}
+
+impl<K, V> From<RandomMultiPair<K, V>> for (K, V) {
+    fn from(pair: RandomMultiPair<K, V>) -> Self {
+        (pair.key, pair.value)
+    }
+}
+
+impl<K, V> MultiPairRemoveHelper<K, V> for RandomMultiPair<K, V>
+where
+    K: Debug + Send + Ord + Clone + 'static,
+    V: Debug + Send + Clone + PartialEq + 'static,
+{
+    fn remove_cdc_from<Node>(
+        set: &BTreeSet<Self, Node>,
+        key: &K,
+        value: &V,
+    ) -> (Option<(K, V)>, Vec<ChangeEvent<Self>>)
+    where
+        Self: Ord + Clone + 'static,
+        Node: NodeLike<Self> + Send + 'static,
+    {
+        let pair_to_remove = set
+            .range::<K, _>((Bound::Included(key), Bound::Included(key)))
+            .find(|pair| pair.key == *key && pair.value == *value)
+            .cloned();
+
+        if let Some(pair_to_remove) = pair_to_remove {
+            let (res, evs) = set.remove_cdc(&pair_to_remove);
+            return (res.map(Into::into), evs);
+        }
+
+        (None, vec![])
     }
 }
 
@@ -145,22 +150,22 @@ mod test {
         let p1 = RandomMultiPair::new(1, "a");
         let p2 = RandomMultiPair::new(1, "b");
         let p3 = RandomMultiPair::new(2, "c");
-
+     
         NodeLike::insert(&mut vec, p1.clone());
         NodeLike::insert(&mut vec, p2.clone());
-        assert_eq!(vec.len(), 2);
+        assert_eq!(vec.len(), 2); 
 
         NodeLike::insert(&mut vec, p1.clone());
         assert_eq!(vec.len(), 2);
-
+     
         NodeLike::insert(&mut vec, p3.clone());
         assert_eq!(vec.len(), 3);
-    }
+     }
 
-    #[test]
-    fn range_bounds() {
+     #[test]
+     fn range_bounds() {
         let mut vec = Vec::new();
-
+    
         let p1a = RandomMultiPair::new(1, "a");
         let p1b = RandomMultiPair::new(1, "b");
         let p1c = RandomMultiPair::new(1, "c");
@@ -184,18 +189,15 @@ mod test {
         NodeLike::insert(&mut vec, p3c.clone());
         assert_eq!(vec.len(), 10);
 
-        let start_1 = vec
-            .rank(Included(&RandomMultiPair::with_infimum(1)), true)
-            .or_else(|| Some(0))
-            .unwrap();
-        let end_1 = vec.rank(Excluded(&RandomMultiPair::with_supremum(1)), true).unwrap();
+        let start_1 = vec.rank(Included(&1), true).map_or(0, |rank| rank + 1);
+        let end_1 = vec.rank(Excluded(&1), true).unwrap();
         let range_1 = &vec[start_1..=end_1];
         assert_eq!(range_1.len(), 3);
         assert!(range_1.contains(&p1a));
         assert!(range_1.contains(&p1b));
         assert!(range_1.contains(&p1c));
 
-        let end_2 = vec.rank(Excluded(&RandomMultiPair::with_supremum(2)), true).unwrap();
+        let end_2 = vec.rank(Excluded(&2), true).unwrap();
         let range_2 = &vec[start_1..=end_2];
         assert_eq!(range_2.len(), 5);
         assert!(range_2.contains(&p1a));
@@ -205,8 +207,8 @@ mod test {
         assert!(range_2.contains(&p2b));
         assert_ne!(range_2.contains(&p3a), true);
 
-        let start_3 = vec.rank(Included(&RandomMultiPair::with_infimum(3)), true).unwrap() + 1;
-        let end_3 = vec.rank(Excluded(&RandomMultiPair::with_supremum(3)), true).unwrap();
+        let start_3 = vec.rank(Included(&3), true).unwrap() + 1;
+        let end_3 = vec.rank(Excluded(&3), true).unwrap();
         let range_3 = &vec[start_3..=end_3];
         assert_eq!(range_3.len(), 4);
         assert!(range_3.contains(&p3a));
@@ -214,10 +216,10 @@ mod test {
         assert!(range_3.contains(&p3c));
         assert!(range_3.contains(&p3d));
 
-        let start_4 = vec.rank(Included(&RandomMultiPair::with_infimum(4)), true).unwrap() + 1;
-        let end_4 = vec.rank(Excluded(&RandomMultiPair::with_supremum(4)), true).unwrap();
+        let start_4 = vec.rank(Included(&4), true).unwrap() + 1;
+        let end_4 = vec.rank(Excluded(&4), true).unwrap();
         let range_4 = &vec[start_4..=end_4];
         assert_eq!(range_4.len(), 1);
         assert!(range_4.contains(&p4a));
-    }
+     }
 }
