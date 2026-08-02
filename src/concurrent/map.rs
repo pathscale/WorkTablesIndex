@@ -253,11 +253,11 @@ where
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let new_entry = Pair { key, value };
 
-        self.set.put_cdc(new_entry).0.map(|pair| pair.value)
+        self.set.put(new_entry).map(|pair| pair.value)
     }
     pub fn checked_insert(&self, key: K, value: V) -> Option<()> {
         let new_entry = Pair { key, value };
-        self.set.put_cdc_checked(new_entry).ok().map(|_| ())
+        self.set.put_checked(new_entry).ok().map(|_| ())
     }
     /// Inserts a key-value pair into the map and returns old value (if it was
     /// already in set) with [`ChangeEvent`]'s that describes this insert
@@ -805,6 +805,20 @@ mod tests {
                 curr_id
             );
         }
+    }
+
+    #[cfg(feature = "cdc")]
+    #[test]
+    fn normal_writes_do_not_consume_cdc_event_ids() {
+        let map = BTreeMap::<usize, String>::new();
+
+        map.insert(1, "first".to_owned());
+        map.insert(1, "second".to_owned());
+        map.remove(&1);
+
+        let (_, events) = map.insert_cdc(2, "recorded".to_owned());
+        assert!(!events.is_empty());
+        assert_eq!(events[0].id().inner(), 0);
     }
 
     #[cfg(feature = "cdc")]

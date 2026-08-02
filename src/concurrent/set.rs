@@ -133,7 +133,9 @@ where
     }
 
     #[allow(clippy::type_complexity)]
-    pub(crate) fn put_cdc_checked(
+    // Const specialization keeps ordinary writes free of CDC event construction
+    // even when the crate is compiled with the `cdc` feature.
+    fn put_checked_inner<const EMIT_CDC: bool>(
         &self,
         value: T,
     ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcMutexGuard<RawMutex, Node>, usize, T)> {
@@ -155,7 +157,7 @@ where
                         drop(_global_guard);
                         if self.index_lock.try_write().is_ok() {
                             #[cfg(feature = "cdc")]
-                            {
+                            if EMIT_CDC {
                                 let node_insertion = ChangeEvent::CreateNode {
                                     // is correct as index is locked and current thread is the only that can
                                     // fetch event_id.
@@ -184,7 +186,7 @@ where
                 let (inserted, idx) = NodeLike::insert(&mut *node_guard, value.clone());
                 if inserted {
                     #[cfg(feature = "cdc")]
-                    {
+                    if EMIT_CDC {
                         let node_element_insertion = ChangeEvent::InsertAt {
                             // is correct as node is locked and current thread is the only that can
                             // fetch event_id, so events for this node will have monotonic id's.
@@ -224,9 +226,9 @@ where
             let op = operation.unwrap();
             match &op {
                 Operation::Split(_, _, _) => {
-                    if let Ok((value, value_cdc)) = op.commit(&self.index) {
+                    if let Ok((value, value_cdc)) = op.commit::<EMIT_CDC>(&self.index) {
                         #[cfg(feature = "cdc")]
-                        {
+                        if EMIT_CDC {
                             for unassigned_event in value_cdc {
                                 let event_id = self.event_id.fetch_add(1, Ordering::AcqRel).into();
                                 cdc.push(unassigned_event.assign_id(event_id));
@@ -238,9 +240,9 @@ where
                     }
                 }
                 Operation::UpdateMax(_, _) => {
-                    return if let Ok((value, value_cdc)) = op.commit(&self.index) {
+                    return if let Ok((value, value_cdc)) = op.commit::<EMIT_CDC>(&self.index) {
                         #[cfg(feature = "cdc")]
-                        {
+                        if EMIT_CDC {
                             for unassigned_event in value_cdc {
                                 let event_id = self.event_id.fetch_add(1, Ordering::AcqRel).into();
                                 cdc.push(unassigned_event.assign_id(event_id));
@@ -255,13 +257,13 @@ where
             }
         }
     }
-    pub(crate) fn put_cdc(&self, value: T) -> (Option<T>, Vec<ChangeEvent<T>>) {
-        match self.put_cdc_checked(value.clone()) {
+    fn put_inner<const EMIT_CDC: bool>(&self, value: T) -> (Option<T>, Vec<ChangeEvent<T>>) {
+        match self.put_checked_inner::<EMIT_CDC>(value.clone()) {
             Ok(res) => res,
             Err((mut node_guard, idx, max)) => {
                 let mut cdc = vec![];
                 #[cfg(feature = "cdc")]
-                {
+                if EMIT_CDC {
                     if node_guard.len() == 1 {
                         let node_removal = ChangeEvent::RemoveNode {
                             // is correct as node is locked and current thread is the only that can
@@ -325,6 +327,30 @@ where
         }
     }
 
+    pub(crate) fn put(&self, value: T) -> Option<T> {
+        self.put_inner::<false>(value).0
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn put_checked(
+        &self,
+        value: T,
+    ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcMutexGuard<RawMutex, Node>, usize, T)> {
+        self.put_checked_inner::<false>(value)
+    }
+
+    pub(crate) fn put_cdc(&self, value: T) -> (Option<T>, Vec<ChangeEvent<T>>) {
+        self.put_inner::<true>(value)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn put_cdc_checked(
+        &self,
+        value: T,
+    ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcMutexGuard<RawMutex, Node>, usize, T)> {
+        self.put_checked_inner::<true>(value)
+    }
+
     /// Adds a value to the set.
     ///
     /// Returns whether the value was newly inserted. That is:
@@ -346,13 +372,11 @@ where
     /// assert_eq!(set.len(), 1);
     /// ```
     pub fn insert(&self, value: T) -> bool {
-        if let (None, _) = self.put_cdc(value) {
-            return true;
-        }
-
-        false
+        self.put(value).is_none()
     }
-    pub fn remove_cdc<Q>(&self, value: &Q) -> (Option<T>, Vec<ChangeEvent<T>>)
+    // See `put_checked_inner`: this is const-specialized to avoid paying for
+    // discarded events in the ordinary `remove` path.
+    fn remove_inner<const EMIT_CDC: bool, Q>(&self, value: &Q) -> (Option<T>, Vec<ChangeEvent<T>>)
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -370,7 +394,7 @@ where
 
             let operation = if node_guard.len() > 0 {
                 #[cfg(feature = "cdc")]
-                {
+                if EMIT_CDC {
                     let node_element_removal = ChangeEvent::RemoveAt {
                         // is correct as node is locked and current thread is the only that can
                         // fetch event_id, so events for this node will have monotonic id's.
@@ -402,9 +426,9 @@ where
 
             let _global_guard = self.index_lock.write();
 
-            return if let Ok((_, value_cdc)) = operation.unwrap().commit(&self.index) {
+            return if let Ok((_, value_cdc)) = operation.unwrap().commit::<EMIT_CDC>(&self.index) {
                 #[cfg(feature = "cdc")]
-                {
+                if EMIT_CDC {
                     for unassigned_event in value_cdc {
                         let event_id = self.event_id.fetch_add(1, Ordering::AcqRel).into();
                         cdc.push(unassigned_event.assign_id(event_id));
@@ -417,6 +441,14 @@ where
         }
 
         (None, vec![])
+    }
+
+    pub fn remove_cdc<Q>(&self, value: &Q) -> (Option<T>, Vec<ChangeEvent<T>>)
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.remove_inner::<true, Q>(value)
     }
     /// If the set contains an element equal to the value, removes it from the
     /// set and drops it. Returns whether such an element was present.
@@ -441,7 +473,7 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        self.remove_cdc(value).0
+        self.remove_inner::<false, Q>(value).0
     }
     fn locate_node<Q>(&self, value: &Q) -> Option<Arc<Mutex<Node>>>
     where

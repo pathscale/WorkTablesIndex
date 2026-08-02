@@ -209,6 +209,18 @@ fn bench_contains(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_map_update(c: &mut Criterion) {
+    let normal = WorkTablesIndex::concurrent::map::BTreeMap::<usize, usize>::new();
+    normal.insert(1, 1);
+    let with_cdc = WorkTablesIndex::concurrent::map::BTreeMap::<usize, usize>::new();
+    with_cdc.insert_cdc(1, 1);
+
+    let mut group = c.benchmark_group("ConcurrentBTreeMap update");
+    group.bench_function("normal", |b| b.iter(|| black_box(normal.insert(1, black_box(2)))));
+    group.bench_function("cdc", |b| b.iter(|| black_box(with_cdc.insert_cdc(1, black_box(2)))));
+    group.finish();
+}
+
 fn removal_entries(values_per_key: RangeInclusive<usize>) -> Vec<(usize, usize)> {
     let mut rng = StdRng::seed_from_u64(MULTIMAP_REMOVE_SEED);
     let mut entries = Vec::with_capacity(MULTIMAP_REMOVE_ENTRIES);
@@ -303,6 +315,7 @@ criterion_group!(
     bench_concurrent_btreeset,
     bench_is_empty,
     bench_contains,
+    bench_map_update,
     bench_multimap_removal
 );
 criterion_main!(benches);

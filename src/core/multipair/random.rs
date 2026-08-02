@@ -113,6 +113,19 @@ where
     K: Debug + Send + Ord + Clone + 'static,
     V: Debug + Send + Clone + PartialEq + 'static,
 {
+    fn remove_from<Node>(set: &BTreeSet<Self, Node>, key: &K, value: &V) -> Option<(K, V)>
+    where
+        Self: Ord + Clone + 'static,
+        Node: NodeLike<Self> + Send + 'static,
+    {
+        let pair_to_remove = set
+            .range::<K, _>((Bound::Included(key), Bound::Included(key)))
+            .find(|pair| pair.key == *key && pair.value == *value)
+            .cloned();
+
+        pair_to_remove.and_then(|pair| set.remove(&pair).map(Into::into))
+    }
+
     fn remove_cdc_from<Node>(
         set: &BTreeSet<Self, Node>,
         key: &K,
