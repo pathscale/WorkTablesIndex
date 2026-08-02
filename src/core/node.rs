@@ -1,7 +1,9 @@
 use core::borrow::Borrow;
-#[cfg(not(feature = "std-binary-search"))]
+#[cfg(not(any(feature = "std-binary-search", feature = "superslice-binary-search")))]
 use core::cmp::Ordering;
 use std::ops::Deref;
+#[cfg(all(feature = "superslice-binary-search", not(feature = "std-binary-search")))]
+use superslice::Ext;
 
 pub trait NodeLike<T: Ord> {
     #[allow(dead_code)]
@@ -61,7 +63,21 @@ where
 }
 
 #[inline]
-#[cfg(not(feature = "std-binary-search"))]
+#[cfg(all(feature = "superslice-binary-search", not(feature = "std-binary-search")))]
+fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
+where
+    T: Borrow<Q> + Ord,
+    Q: Ord + ?Sized,
+{
+    let index = haystack.lower_bound_by(|candidate| candidate.borrow().cmp(needle));
+    match haystack.get(index) {
+        Some(candidate) if candidate.borrow().cmp(needle).is_eq() => Ok(index),
+        _ => Err(index),
+    }
+}
+
+#[inline]
+#[cfg(not(any(feature = "std-binary-search", feature = "superslice-binary-search")))]
 fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
 where
     T: Borrow<Q> + Ord,
@@ -229,6 +245,21 @@ mod tests {
     impl Borrow<usize> for KeyThenValue {
         fn borrow(&self) -> &usize {
             &self.0
+        }
+    }
+
+    #[test]
+    fn point_search_returns_match_or_insertion_position() {
+        for values in [vec![], vec![2], vec![2, 4, 8, 16, 32]] {
+            for needle in 0..=34 {
+                let insertion = values.partition_point(|candidate| candidate < &needle);
+                let expected = match values.get(insertion) {
+                    Some(candidate) if candidate == &needle => Ok(insertion),
+                    _ => Err(insertion),
+                };
+
+                assert_eq!(search(&values, &needle), expected, "values={values:?}, needle={needle}");
+            }
         }
     }
 

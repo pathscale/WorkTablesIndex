@@ -30,7 +30,10 @@ The following table describes the variants of this data structure that are avail
 * `concurrent`: enables the three concurrent variants of `BTreeSet` referenced in the table above
 * `cdc`: provides helper methods to persist all concurrent trees
 * `multimap`: enables `BTreeMultiMap`
-* `std-binary-search`: replaces the custom node point lookup with the standard library binary search for downstream A/B measurement; the custom search remains the default because local microbenchmarks currently favor it
+* `std-binary-search`: uses the standard library's fixed-iteration, branch-optimized node search; it is an A/B option for cheap keys with unpredictable positions
+* `superslice-binary-search`: uses `superslice::Ext::lower_bound_by` plus an exact-match check as a second A/B option; it does not add a dependency unless enabled
+
+The custom early-exit search remains the default while downstream workloads are measured. It can favor expensive comparisons and predictable keys, while the fixed-iteration alternatives can favor cheap, randomly positioned keys. If both search features are enabled, `std-binary-search` takes precedence.
 
 # Background
 
