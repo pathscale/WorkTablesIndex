@@ -78,70 +78,32 @@ where
     }
 }
 
-enum Direction<'a, T> {
-    Forward(std::slice::Iter<'a, T>),
-    Backward(std::iter::Rev<std::slice::Iter<'a, T>>),
-}
-
 #[inline]
 fn compute_positions_to_skip<Q, T: Ord>(haystack: &[T], bound: std::ops::Bound<&Q>, forward: bool) -> Option<usize>
 where
     T: Borrow<Q> + Ord,
     Q: Ord + ?Sized,
 {
-    match bound {
-        // If the bound is unbounded, then no skipping is needed
-        std::ops::Bound::Unbounded => None,
-        std::ops::Bound::Included(value) | std::ops::Bound::Excluded(value) => {
-            let mut positions_to_skip = -1;
-            let iter = if forward {
-                Direction::Forward(haystack.iter())
-            } else {
-                Direction::Backward(haystack.iter().rev())
-            };
+    let skipped = match (bound, forward) {
+        // A forward iterator skips values before the start bound.
+        (std::ops::Bound::Included(value), true) => haystack.partition_point(|item| item.borrow().cmp(value).is_lt()),
+        (std::ops::Bound::Excluded(value), true) => haystack.partition_point(|item| !item.borrow().cmp(value).is_gt()),
 
-            match iter {
-                Direction::Forward(iter) => {
-                    for item in iter {
-                        match item.borrow().cmp(value) {
-                            Ordering::Less => positions_to_skip += 1,
-                            Ordering::Equal => match bound {
-                                std::ops::Bound::Included(_) => break,
-                                std::ops::Bound::Excluded(_) => {
-                                    positions_to_skip += 1;
-                                    continue;
-                                }
-                                _ => unreachable!(),
-                            },
-                            Ordering::Greater => break,
-                        }
-                    }
-                }
-                Direction::Backward(iter) => {
-                    for item in iter {
-                        match item.borrow().cmp(value) {
-                            Ordering::Greater => positions_to_skip += 1,
-                            Ordering::Equal => match bound {
-                                std::ops::Bound::Included(_) => break,
-                                std::ops::Bound::Excluded(_) => {
-                                    positions_to_skip += 1;
-                                    continue;
-                                }
-                                _ => unreachable!(),
-                            },
-                            Ordering::Less => break,
-                        }
-                    }
-                }
-            }
-
-            if positions_to_skip >= 0 {
-                Some(positions_to_skip as usize)
-            } else {
-                None
-            }
+        // A backward iterator skips values after the end bound.
+        (std::ops::Bound::Included(value), false) => {
+            let first_greater = haystack.partition_point(|item| !item.borrow().cmp(value).is_gt());
+            haystack.len() - first_greater
         }
-    }
+        (std::ops::Bound::Excluded(value), false) => {
+            let first_equal = haystack.partition_point(|item| item.borrow().cmp(value).is_lt());
+            haystack.len() - first_equal
+        }
+        (std::ops::Bound::Unbounded, _) => return None,
+    };
+
+    // Callers use this as the index of the last value to skip. No skipped
+    // values is represented by `None`.
+    skipped.checked_sub(1)
 }
 
 impl<T: Ord> NodeLike<T> for Vec<T> {
@@ -377,5 +339,40 @@ mod tests {
             compute_positions_to_skip(&node, std::ops::Bound::Excluded(&2), false),
             Some(2),
         );
+    }
+
+    #[test]
+    fn binary_bound_search_matches_linear_bound_semantics() {
+        fn expected(values: &[i32], bound: std::ops::Bound<&i32>, forward: bool) -> Option<usize> {
+            let skipped = match (bound, forward) {
+                (std::ops::Bound::Included(value), true) => values.iter().take_while(|item| *item < value).count(),
+                (std::ops::Bound::Excluded(value), true) => values.iter().take_while(|item| *item <= value).count(),
+                (std::ops::Bound::Included(value), false) => {
+                    values.iter().rev().take_while(|item| *item > value).count()
+                }
+                (std::ops::Bound::Excluded(value), false) => {
+                    values.iter().rev().take_while(|item| *item >= value).count()
+                }
+                (std::ops::Bound::Unbounded, _) => return None,
+            };
+
+            skipped.checked_sub(1)
+        }
+
+        let cases = [vec![], vec![1], vec![1, 3, 5, 7, 9], vec![1, 1, 1, 2, 2, 4, 7, 7, 9]];
+
+        for values in cases {
+            for probe in 0..=10 {
+                for forward in [true, false] {
+                    for bound in [std::ops::Bound::Included(&probe), std::ops::Bound::Excluded(&probe)] {
+                        assert_eq!(
+                            compute_positions_to_skip(&values, bound, forward),
+                            expected(&values, bound, forward),
+                            "values={values:?}, probe={probe}, forward={forward}, bound={bound:?}",
+                        );
+                    }
+                }
+            }
+        }
     }
 }
