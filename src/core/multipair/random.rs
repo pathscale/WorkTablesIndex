@@ -14,7 +14,7 @@ use crate::core::pair::Pair;
 use super::{MultiPairLike, MultiPairRemoveHelper};
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Default, Clone, Hash)]
+#[derive(Debug, Default, Clone)]
 pub struct RandomMultiPair<K, V> {
     pub key: K,
     pub value: V,
@@ -52,6 +52,17 @@ impl<K: Ord, V: PartialEq> Ord for RandomMultiPair<K, V> {
 impl<K: Ord, V: PartialEq> PartialOrd for RandomMultiPair<K, V> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl<K, V> std::hash::Hash for RandomMultiPair<K, V>
+where
+    K: std::hash::Hash,
+    V: std::hash::Hash,
+{
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
+        self.value.hash(state);
     }
 }
 
@@ -141,6 +152,31 @@ mod test {
         let pair_one = RandomMultiPair::new(1usize, 2usize);
         let pair_two = RandomMultiPair::new(1usize, 3usize);
         assert_ne!(pair_one, pair_two);
+    }
+
+    #[test]
+    fn equal_pairs_have_equal_hashes() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let pair_one = RandomMultiPair {
+            key: 1usize,
+            value: 2usize,
+            discriminator: 3,
+        };
+        let pair_two = RandomMultiPair {
+            key: 1usize,
+            value: 2usize,
+            discriminator: 4,
+        };
+
+        assert_eq!(pair_one, pair_two);
+
+        let mut hash_one = DefaultHasher::new();
+        pair_one.hash(&mut hash_one);
+        let mut hash_two = DefaultHasher::new();
+        pair_two.hash(&mut hash_two);
+
+        assert_eq!(hash_one.finish(), hash_two.finish());
     }
 
     #[test]
