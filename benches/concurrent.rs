@@ -195,6 +195,20 @@ fn bench_is_empty(c: &mut Criterion) {
     });
 }
 
+fn bench_contains(c: &mut Criterion) {
+    let set = WorkTablesIndex::concurrent::set::BTreeSet::<usize>::new();
+    for value in 0..IS_EMPTY_ENTRIES {
+        set.insert(value);
+    }
+
+    let present = IS_EMPTY_ENTRIES / 2;
+    let absent = IS_EMPTY_ENTRIES;
+    let mut group = c.benchmark_group("ConcurrentBTreeSet contains");
+    group.bench_function("present", |b| b.iter(|| black_box(set.contains(black_box(&present)))));
+    group.bench_function("absent", |b| b.iter(|| black_box(set.contains(black_box(&absent)))));
+    group.finish();
+}
+
 fn removal_entries(values_per_key: RangeInclusive<usize>) -> Vec<(usize, usize)> {
     let mut rng = StdRng::seed_from_u64(MULTIMAP_REMOVE_SEED);
     let mut entries = Vec::with_capacity(MULTIMAP_REMOVE_ENTRIES);
@@ -278,6 +292,7 @@ criterion_group!(
     benches,
     bench_concurrent_btreeset,
     bench_is_empty,
+    bench_contains,
     bench_multimap_removal
 );
 criterion_main!(benches);
