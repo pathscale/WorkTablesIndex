@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use crossbeam_skiplist::SkipSet;
 use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 use scc::TreeIndex;
@@ -21,6 +21,8 @@ const TOTAL_OPERATIONS: usize = NUM_THREADS * OPERATIONS_PER_THREAD;
 const MULTIMAP_REMOVE_ENTRIES: usize = 20_000;
 const MULTIMAP_REMOVE_SEED: u64 = 42;
 const IS_EMPTY_ENTRIES: usize = 100_000;
+const POINT_LOOKUP_QUERIES: usize = 65_536;
+const POINT_LOOKUP_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
 // fn generate_operations(write_ratio: f64) -> Vec<Vec<Op>> {
 //     let mut rng = thread_rng();
@@ -208,6 +210,62 @@ fn bench_contains(c: &mut Criterion) {
     group.finish();
 }
 
+fn randomized_point_lookups(hit_ratio: usize) -> Vec<usize> {
+    let mut rng = StdRng::seed_from_u64(POINT_LOOKUP_SEED ^ hit_ratio as u64);
+    (0..POINT_LOOKUP_QUERIES)
+        .map(|_| {
+            let position = rng.random_range(0..IS_EMPTY_ENTRIES);
+            if rng.random_range(0..100) < hit_ratio {
+                position * 2
+            } else {
+                position * 2 + 1
+            }
+        })
+        .collect()
+}
+
+fn point_lookup_string(value: usize) -> String {
+    format!("{value:016x}")
+}
+
+fn bench_randomized_contains(c: &mut Criterion) {
+    let numeric = WorkTablesIndex::concurrent::set::BTreeSet::<usize>::new();
+    let strings = WorkTablesIndex::concurrent::set::BTreeSet::<String>::new();
+    for value in 0..IS_EMPTY_ENTRIES {
+        numeric.insert(value * 2);
+        strings.insert(point_lookup_string(value * 2));
+    }
+
+    let queries = randomized_point_lookups(99);
+    let string_queries: Vec<String> = queries.iter().map(|query| point_lookup_string(*query)).collect();
+    let mut group = c.benchmark_group("ConcurrentBTreeSet randomized contains/99% hits");
+    group.sample_size(40);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(1));
+    group.throughput(Throughput::Elements(POINT_LOOKUP_QUERIES as u64));
+
+    group.bench_function("usize", |b| {
+        b.iter(|| {
+            let mut checksum = false;
+            for query in &queries {
+                checksum ^= numeric.contains(black_box(query));
+            }
+            black_box(checksum)
+        })
+    });
+    group.bench_function("16-byte string", |b| {
+        b.iter(|| {
+            let mut checksum = false;
+            for query in &string_queries {
+                checksum ^= strings.contains(black_box(query.as_str()));
+            }
+            black_box(checksum)
+        })
+    });
+
+    group.finish();
+}
+
 fn bench_map_update(c: &mut Criterion) {
     let normal = WorkTablesIndex::concurrent::map::BTreeMap::<usize, usize>::new();
     normal.insert(1, 1);
@@ -302,6 +360,7 @@ criterion_group!(
     bench_concurrent_btreeset,
     bench_is_empty,
     bench_contains,
+    bench_randomized_contains,
     bench_map_update,
     bench_multimap_removal
 );
