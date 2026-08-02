@@ -142,7 +142,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut map = BTreeMap::<usize, &str>::new();
     ///
@@ -160,7 +160,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let map = BTreeMap::<i32, i32>::with_maximum_node_size(128);
     pub fn with_maximum_node_size(node_capacity: usize) -> Self {
@@ -189,7 +189,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut map = BTreeMap::<usize, &str>::new();
     /// map.insert(1, "a");
@@ -213,7 +213,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut map = BTreeMap::<usize, &str>::new();
     /// map.insert(1, "a");
@@ -240,7 +240,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut map = BTreeMap::<usize, &str>::new();
     /// assert_eq!(map.insert(37, "a"), None);
@@ -284,7 +284,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let map = BTreeMap::<usize, &str>::new();
     /// map.insert(1, "a");
@@ -318,7 +318,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut a = BTreeMap::<usize, &str>::new();
     /// assert_eq!(a.len(), 0);
@@ -335,7 +335,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut a = BTreeMap::<usize, &str>::new();
     /// assert!(a.is_empty());
@@ -355,7 +355,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut a = BTreeMap::<usize, &str>::with_maximum_node_size(16);
     ///
@@ -376,7 +376,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut a = BTreeMap::<usize, &str>::with_maximum_node_size(16);
     ///
@@ -395,7 +395,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut map = BTreeMap::<usize, &str>::new();
     /// map.insert(3, "c");
@@ -429,7 +429,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     /// use std::ops::Bound::Included;
     ///
     /// let mut map = BTreeMap::<i32, &str>::new();

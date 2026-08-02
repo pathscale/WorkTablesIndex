@@ -43,7 +43,7 @@ type Node<T> = Vec<T>;
 /// # Examples
 ///
 /// ```
-/// use indexset::BTreeSet;
+/// use WorkTablesIndex::BTreeSet;
 ///
 /// // Type inference lets us omit an explicit type signature (which
 /// // would be `BTreeSet<&str>` in this example).
@@ -73,7 +73,7 @@ type Node<T> = Vec<T>;
 /// A `BTreeSet` with a known list of items can be initialized from an array:
 ///
 /// ```
-/// use indexset::BTreeSet;
+/// use WorkTablesIndex::BTreeSet;
 ///
 /// let set = BTreeSet::from_iter([1, 2, 3]);
 /// ```
@@ -111,7 +111,7 @@ impl<T: Ord> BTreeSet<T> {
     ///
     /// ```
     /// # #![allow(unused_mut)]
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set: BTreeSet<i32> = BTreeSet::new();
     /// ```
@@ -125,7 +125,7 @@ impl<T: Ord> BTreeSet<T> {
     ///
     /// ```
     /// # #![allow(unused_mut)]
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set: BTreeSet<i32> = BTreeSet::with_maximum_node_size(128);
     pub fn with_maximum_node_size(maximum_node_size: usize) -> Self {
@@ -140,7 +140,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut v = BTreeSet::new();
     /// v.insert(1);
@@ -243,7 +243,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let set = BTreeSet::from_iter([1, 2, 3]);
     /// assert_eq!(set.get_index(0), Some(&1));
@@ -276,7 +276,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let set = BTreeSet::from([1, 2, 3]);
     /// assert_eq!(set.get(&2), Some(&2));
@@ -304,7 +304,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let set = BTreeSet::from_iter([1, 2, 3, 5]);
     /// assert_eq!(set.lower_bound(&2), Some(&2));
@@ -327,7 +327,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut v = BTreeSet::new();
     /// assert_eq!(v.len(), 0);
@@ -382,7 +382,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::new();
     ///
@@ -401,7 +401,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::new();
     /// set.insert(Vec::<i32>::new());
@@ -426,7 +426,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let set = BTreeSet::from_iter([1, 2, 3]);
     /// assert_eq!(set.contains(&1), true);
@@ -555,7 +555,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::new();
     ///
@@ -580,7 +580,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::from_iter([1, 2, 3]);
     /// assert_eq!(set.take(&2), Some(2));
@@ -601,7 +601,7 @@ impl<T: Ord> BTreeSet<T> {
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::new();
     /// assert_eq!(set.first(), None);
@@ -625,7 +625,7 @@ impl<T: Ord> BTreeSet<T> {
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::new();
     /// assert_eq!(set.last(), None);
@@ -649,7 +649,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::new();
     ///
@@ -674,7 +674,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::new();
     ///
@@ -695,7 +695,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::new();
     ///
@@ -723,7 +723,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut v = BTreeSet::new();
     /// assert!(v.is_empty());
@@ -739,7 +739,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let sup = BTreeSet::from_iter([1, 2, 3]);
     /// let mut set = BTreeSet::new();
@@ -763,7 +763,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let sub = BTreeSet::from_iter([1, 2]);
     /// let mut set = BTreeSet::new();
@@ -790,7 +790,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let a = BTreeSet::from_iter([1, 2, 3]);
     /// let mut b = BTreeSet::new();
@@ -814,7 +814,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let set = BTreeSet::from_iter([1, 2, 3]);
     /// let mut set_iter = set.iter();
@@ -827,7 +827,7 @@ impl<T: Ord> BTreeSet<T> {
     /// Values returned by the iterator are returned in ascending order:
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let set = BTreeSet::from_iter([3, 1, 2]);
     /// let mut set_iter = set.iter();
@@ -846,7 +846,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut a = BTreeSet::new();
     /// a.insert(1);
@@ -875,7 +875,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut a = BTreeSet::new();
     /// a.insert(1);
@@ -906,7 +906,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut a = BTreeSet::new();
     /// a.insert(1);
@@ -937,7 +937,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut a = BTreeSet::new();
     /// a.insert(1);
@@ -969,7 +969,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut set = BTreeSet::from_iter([1, 2, 3, 4, 5, 6]);
     /// // Keep only the even numbers.
@@ -1034,7 +1034,7 @@ impl<T: Ord> BTreeSet<T> {
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut a = BTreeSet::new();
     /// a.insert(1);
@@ -1087,7 +1087,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut a = BTreeSet::new();
     /// a.insert(1);
@@ -1168,7 +1168,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     /// use std::ops::Bound::Included;
     ///
     /// let mut set = BTreeSet::new();
@@ -1209,7 +1209,7 @@ impl<T: Ord> BTreeSet<T> {
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let set = BTreeSet::from_iter([1, 2, 3]);
     /// assert_eq!(set.rank(&1), 0);
@@ -1902,7 +1902,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use indexset::BTreeMap;
+/// use WorkTablesIndex::BTreeMap;
 ///
 /// // type inference lets us omit an explicit type signature (which
 /// // would be `BTreeMap<&str, &str>` in this example).
@@ -1944,7 +1944,7 @@ where
 /// A `BTreeMap` with a known list of items can be initialized from an array:
 ///
 /// ```
-/// use indexset::BTreeMap;
+/// use WorkTablesIndex::BTreeMap;
 ///
 /// let solar_distance = BTreeMap::from_iter([
 ///     ("Mercury", 0.4),
@@ -1999,7 +1999,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// a.insert(1, "a");
@@ -2032,7 +2032,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// a.insert(1, "a");
@@ -2052,7 +2052,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2077,7 +2077,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// assert_eq!(map.first_key_value(), None);
@@ -2103,7 +2103,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2127,7 +2127,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2150,7 +2150,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2183,7 +2183,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2214,7 +2214,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2246,7 +2246,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// assert_eq!(map.insert(37, "a"), None);
@@ -2281,7 +2281,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// a.insert(2, "b");
@@ -2302,7 +2302,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// a.insert(1, "hello");
@@ -2323,7 +2323,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// assert!(a.is_empty());
@@ -2340,7 +2340,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(3, "c");
@@ -2364,7 +2364,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::from_iter([
     ///    ("a", 1),
@@ -2435,7 +2435,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// a.insert(2, "b");
@@ -2455,7 +2455,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "b");
@@ -2477,7 +2477,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// assert_eq!(a.len(), 0);
@@ -2496,7 +2496,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     ///
@@ -2513,7 +2513,7 @@ where
     ///
     /// ```
     /// # #![allow(unused_mut)]
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut set: BTreeMap<usize, usize> = BTreeMap::with_maximum_node_size(128);
     pub fn with_maximum_node_size(maximum_node_size: usize) -> Self {
@@ -2529,7 +2529,7 @@ where
     /// Draining elements in ascending order, while keeping a usable map each iteration.
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2552,7 +2552,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::{BTreeMap};
+    /// use WorkTablesIndex::{BTreeMap};
     ///
     /// let mut map = BTreeMap::new();
     ///
@@ -2575,7 +2575,7 @@ where
     /// Draining elements in descending order, while keeping a usable map each iteration.
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2610,7 +2610,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     /// use std::ops::Bound::Included;
     ///
     /// let mut map = BTreeMap::new();
@@ -2691,7 +2691,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map: BTreeMap<&str, i32> =
     ///     [("Alice", 0), ("Bob", 0), ("Carol", 0), ("Cheryl", 0)].into();
@@ -2775,7 +2775,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2809,7 +2809,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map = BTreeMap::new();
     /// map.insert(1, "a");
@@ -2841,7 +2841,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut map: BTreeMap<i32, i32> = (0..8).map(|x| (x, x*10)).collect();
     /// // Keep only the elements with even-numbered keys.
@@ -2879,7 +2879,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// a.insert(1, "a");
@@ -2916,7 +2916,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// a.insert(1, "hello");
@@ -2935,7 +2935,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let mut a = BTreeMap::new();
     /// a.insert(1, String::from("hello"));
@@ -3059,7 +3059,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     /// use std::ops::Bound;
     ///
     /// let mut a = BTreeMap::new();
@@ -3098,7 +3098,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::BTreeMap;
+    /// use WorkTablesIndex::BTreeMap;
     ///
     /// let set = BTreeMap::from_iter([(1, "a"), (2, "b"), (3, "c")]);
     /// assert_eq!(set.rank(&1), 0);
@@ -4350,7 +4350,7 @@ mod tests {
     #[test] // this test pass with std::collection::BTreeMap
     fn test_indexset_btreemap_overflow_bug() {
         // This test reproduces the "attempt to subtract with overflow" panic
-        // that occurs in indexset::BTreeMap::range_to_idx at line 2639
+        // that occurs in WorkTablesIndex::BTreeMap::range_to_idx at line 2639
 
         let mut map = BTreeMap::new();
 

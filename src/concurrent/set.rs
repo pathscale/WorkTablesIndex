@@ -37,7 +37,7 @@ use super::r#ref::Ref;
 /// # Examples
 ///
 /// ```
-/// use indexset::concurrent::set::BTreeSet;
+/// use WorkTablesIndex::concurrent::set::BTreeSet;
 ///
 /// // Type inference lets us omit an explicit type signature (which
 /// // would be `BTreeSet<&str>` in this example).
@@ -67,7 +67,7 @@ use super::r#ref::Ref;
 /// A `BTreeSet` with a known list of items can be initialized from an array:
 ///
 /// ```
-/// use indexset::concurrent::set::BTreeSet;
+/// use WorkTablesIndex::concurrent::set::BTreeSet;
 ///
 /// let set = BTreeSet::from_iter([1, 2, 3]);
 /// ```
@@ -111,7 +111,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::concurrent::set::BTreeSet;
+    /// use WorkTablesIndex::concurrent::set::BTreeSet;
     ///
     /// let set: BTreeSet<i32> = BTreeSet::with_maximum_node_size(128);
     pub fn with_maximum_node_size(node_capacity: usize) -> Self {
@@ -363,7 +363,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::concurrent::set::BTreeSet;
+    /// use WorkTablesIndex::concurrent::set::BTreeSet;
     ///
     /// let mut set = BTreeSet::<usize>::new();
     ///
@@ -460,7 +460,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::concurrent::set::BTreeSet;
+    /// use WorkTablesIndex::concurrent::set::BTreeSet;
     ///
     /// let mut set = BTreeSet::<usize>::new();
     ///
@@ -499,7 +499,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::concurrent::set::BTreeSet;
+    /// use WorkTablesIndex::concurrent::set::BTreeSet;
     ///
     /// let set = BTreeSet::from_iter([1, 2, 3]);
     /// assert_eq!(set.contains(&1), true);
@@ -1095,7 +1095,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::concurrent::set::BTreeSet;
+    /// use WorkTablesIndex::concurrent::set::BTreeSet;
     ///
     /// let set = BTreeSet::from_iter([1, 2, 3]);
     /// let mut set_iter = set.iter();
@@ -1108,7 +1108,7 @@ where
     /// Values returned by the iterator are returned in ascending order:
     ///
     /// ```
-    /// use indexset::concurrent::set::BTreeSet;
+    /// use WorkTablesIndex::concurrent::set::BTreeSet;
     ///
     /// let set = BTreeSet::from_iter([3, 1, 2]);
     /// let mut set_iter = set.iter();
@@ -1135,7 +1135,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::concurrent::set::BTreeSet;
+    /// use WorkTablesIndex::concurrent::set::BTreeSet;
     /// use std::ops::Bound::Included;
     ///
     /// let mut set = BTreeSet::<usize>::new();

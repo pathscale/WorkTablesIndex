@@ -158,7 +158,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let mut map = BTreeMultiMap::<usize, &str>::new();
     ///
@@ -177,7 +177,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let map = BTreeMultiMap::<i32, i32>::with_maximum_node_size(128);
     pub fn with_maximum_node_size(node_capacity: usize) -> Self {
@@ -207,7 +207,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let mut map = BTreeMultiMap::<usize, &str>::new();
     /// map.insert(1, "a");
@@ -236,8 +236,8 @@ where
     /// Constructs a double-ended iterator over all key value pairs with the given key in the map.
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
-    /// use indexset::BTreeSet;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::BTreeSet;
     ///
     /// let mut map = BTreeMultiMap::<usize, &str>::new();
     ///
@@ -262,7 +262,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let mut map = BTreeMultiMap::<usize, &str>::new();
     /// assert_eq!(map.insert(37, "a"), None);
@@ -298,7 +298,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let map = BTreeMultiMap::<usize, &str>::new();
     /// map.insert(1, "b");
@@ -338,7 +338,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let mut a = BTreeMultiMap::<usize, &str>::new();
     /// assert_eq!(a.len(), 0);
@@ -355,7 +355,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let mut a = BTreeMultiMap::<usize, &str>::new();
     /// assert!(a.is_empty());
@@ -375,7 +375,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let mut a = BTreeMultiMap::<usize, &str>::with_maximum_node_size(8);
     ///
@@ -396,7 +396,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::map::BTreeMap;
+    /// use WorkTablesIndex::concurrent::map::BTreeMap;
     ///
     /// let mut a = BTreeMap::<usize, &str>::with_maximum_node_size(16);
     ///
@@ -415,7 +415,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let mut map = BTreeMultiMap::<usize, &str>::new();
     /// map.insert(3, "c");
@@ -452,7 +452,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     /// use std::ops::Bound::Included;
     ///
     /// let mut map = BTreeMultiMap::<usize, &str>::new();
@@ -488,7 +488,7 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    /// use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
     ///
     /// let map = BTreeMultiMap::<usize, &str>::new();
     /// map.insert(1, "b");
