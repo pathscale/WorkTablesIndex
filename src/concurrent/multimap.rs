@@ -455,6 +455,23 @@ where
     pub fn len(&self) -> usize {
         self.set.len()
     }
+    /// Returns `true` if the multimap contains no elements.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    ///
+    /// let mut a = BTreeMultiMap::<usize, &str>::new();
+    /// assert!(a.is_empty());
+    /// a.insert(1, "a");
+    /// assert!(!a.is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
     /// Returns the total number of allocated slots across all internal nodes.
     ///
     /// This represents the number of key-value pairs the multimap can hold

@@ -332,6 +332,23 @@ where
     pub fn len(&self) -> usize {
         self.set.len()
     }
+    /// Returns `true` if the map contains no elements.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use indexset::concurrent::map::BTreeMap;
+    ///
+    /// let mut a = BTreeMap::<usize, &str>::new();
+    /// assert!(a.is_empty());
+    /// a.insert(1, "a");
+    /// assert!(!a.is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
     /// Returns the total number of allocated slots across all internal nodes.
     ///
     /// This represents the number of key-value pairs the map can hold
