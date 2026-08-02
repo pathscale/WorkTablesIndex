@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Default, Clone, Hash)]
+#[derive(Debug, Default, Clone)]
 pub struct Pair<K, V>
 {
     pub key: K,
@@ -40,6 +40,15 @@ where
     }
 }
 
+impl<K, V> std::hash::Hash for Pair<K, V>
+where
+    K: std::hash::Hash,
+{
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
+    }
+}
+
 impl<K: Ord, V> Borrow<K> for Pair<K, V> {
     fn borrow(&self) -> &K {
         &self.key
@@ -49,5 +58,26 @@ impl<K: Ord, V> Borrow<K> for Pair<K, V> {
 impl<V> Borrow<str> for Pair<String, V> {
     fn borrow(&self) -> &str {
         self.key.as_str()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pair;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    #[test]
+    fn equal_pairs_hash_identically() {
+        let first = Pair { key: 7, value: "first" };
+        let second = Pair { key: 7, value: "second" };
+        assert_eq!(first, second);
+
+        let mut first_hasher = DefaultHasher::new();
+        first.hash(&mut first_hasher);
+        let mut second_hasher = DefaultHasher::new();
+        second.hash(&mut second_hasher);
+
+        assert_eq!(first_hasher.finish(), second_hasher.finish());
     }
 }
