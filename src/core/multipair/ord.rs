@@ -94,6 +94,15 @@ where
     K: Debug + Send + Ord + Clone + 'static,
     V: Debug + Send + Ord + Clone + 'static,
 {
+    fn remove_from<Node>(set: &BTreeSet<Self, Node>, key: &K, value: &V) -> Option<(K, V)>
+    where
+        Self: Ord + Clone + 'static,
+        Node: NodeLike<Self> + Send + 'static,
+    {
+        let pair_to_remove = OrdMultiPair::new(key.clone(), value.clone());
+        set.remove(&pair_to_remove).map(Into::into)
+    }
+
     fn remove_cdc_from<Node>(set: &BTreeSet<Self, Node>, key: &K, value: &V) -> (Option<(K, V)>, Vec<ChangeEvent<Self>>)
     where
         Self: Ord + Clone + 'static,

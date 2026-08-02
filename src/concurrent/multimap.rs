@@ -274,7 +274,7 @@ where
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let new_entry = M::new(key, value);
 
-        self.set.put_cdc(new_entry).0.map(|pair| pair.into().1)
+        self.set.put(new_entry).map(|pair| pair.into().1)
     }
     /// Inserts a key-value pair into the map and returns old value (if it was
     /// already in set) with [`ChangeEvent`]'s that describes this insert
