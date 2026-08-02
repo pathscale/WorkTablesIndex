@@ -1,12 +1,12 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use crossbeam_skiplist::SkipSet;
-use indexset::concurrent::multimap::BTreeMultiMap;
-use indexset::core::multipair::OrdMultiPair;
 use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 use scc::TreeIndex;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::thread;
+use WorkTablesIndex::concurrent::multimap::BTreeMultiMap;
+use WorkTablesIndex::core::multipair::OrdMultiPair;
 
 #[derive(Clone)]
 enum Op {
