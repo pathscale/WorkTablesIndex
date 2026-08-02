@@ -2,8 +2,10 @@ use crate::cdc::change::ChangeEvent;
 use crate::concurrent::set::BTreeSet;
 use crate::core::node::NodeLike;
 
+pub mod ord;
 pub mod random;
 
+pub use ord::OrdMultiPair;
 pub use random::RandomMultiPair;
 
 pub type MultiPair<K, V> = RandomMultiPair<K, V>;
