@@ -56,26 +56,27 @@ where
     Q: Ord + ?Sized,
 {
     let mut j = haystack.len();
+    let mut i = 0;
+    let mut m = j >> 1;
 
-    unsafe {
-        let mut i = 0;
-        let p = haystack.as_ptr().cast::<T>();
-        let mut m = j >> 1;
-        while i != j {
-            match (*p.add(m)).borrow().cmp(needle) {
-                Ordering::Equal => return Ok(m),
-                Ordering::Less => {
-                    i = m + 1;
-                    m = (i + j) >> 1;
-                }
-                Ordering::Greater => {
-                    j = m;
-                    m = (i + j) >> 1;
-                }
+    while i != j {
+        // Invariant: `i <= m < j <= haystack.len()` while the search range is
+        // non-empty. Both branches below preserve it for the next iteration.
+        let candidate = unsafe { haystack.get_unchecked(m) };
+        match candidate.borrow().cmp(needle) {
+            Ordering::Equal => return Ok(m),
+            Ordering::Less => {
+                i = m + 1;
+                m = (i + j) >> 1;
+            }
+            Ordering::Greater => {
+                j = m;
+                m = (i + j) >> 1;
             }
         }
-        Err(i)
     }
+
+    Err(i)
 }
 
 #[inline]
