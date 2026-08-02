@@ -32,8 +32,9 @@ The following table describes the variants of this data structure that are avail
 * `multimap`: enables `BTreeMultiMap`
 * `std-binary-search`: uses the standard library's fixed-iteration, branch-optimized node search; it is an A/B option for cheap keys with unpredictable positions
 * `superslice-binary-search`: uses `superslice::Ext::lower_bound_by` plus an exact-match check as a second A/B option; it does not add a dependency unless enabled
+* `wt-slice-binary-search`: uses the `wt-slice` hybrid exact search, combining early equality exit with a branch-optimized direction update; it does not add a dependency unless enabled
 
-The custom early-exit search remains the default while downstream workloads are measured. It can favor expensive comparisons and predictable keys, while the fixed-iteration alternatives can favor cheap, randomly positioned keys. If both search features are enabled, `std-binary-search` takes precedence.
+The custom early-exit search remains the default while downstream workloads are measured. It can favor expensive comparisons and predictable keys, while the fixed-iteration alternatives can favor cheap, randomly positioned keys. The `wt-slice` hybrid is intended as a balanced option when one downstream mixes those profiles. If multiple search features are enabled, precedence is `std-binary-search`, `wt-slice-binary-search`, `superslice-binary-search`, then the default custom search.
 
 # Background
 

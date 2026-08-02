@@ -27,6 +27,8 @@ jobs:
         run: cargo build --all-targets --features "serde concurrent cdc multimap"
       - name: Build (superslice binary search, all targets)
         run: cargo build --all-targets --features "serde concurrent cdc multimap superslice-binary-search"
+      - name: Build (wt-slice hybrid binary search, all targets)
+        run: cargo build --all-targets --features "serde concurrent cdc multimap wt-slice-binary-search"
       - name: Build (std binary search, all features, all targets)
         run: cargo build --all-targets --all-features
       # Doctests are excluded on purpose: upstream doc examples import
@@ -47,6 +49,13 @@ jobs:
       - name: Test (fast tier, superslice binary search)
         run: >
           cargo test --features "serde concurrent cdc multimap superslice-binary-search" --lib --tests --
+          --skip test_concurrent_insert
+          --skip test_remove_stress
+          --skip parallel_iter_and_mut
+          --skip test_concurrent_cdc_no_gaps
+      - name: Test (fast tier, wt-slice hybrid binary search)
+        run: >
+          cargo test --features "serde concurrent cdc multimap wt-slice-binary-search" --lib --tests --
           --skip test_concurrent_insert
           --skip test_remove_stress
           --skip parallel_iter_and_mut
@@ -73,5 +82,7 @@ jobs:
         run: cargo clippy --all-targets --features "serde concurrent cdc multimap" -- -D warnings
       - name: Clippy (superslice binary search, deny new warnings)
         run: cargo clippy --all-targets --features "serde concurrent cdc multimap superslice-binary-search" -- -D warnings
+      - name: Clippy (wt-slice hybrid binary search, deny new warnings)
+        run: cargo clippy --all-targets --features "serde concurrent cdc multimap wt-slice-binary-search" -- -D warnings
       - name: Clippy (std binary search and all features, deny new warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings

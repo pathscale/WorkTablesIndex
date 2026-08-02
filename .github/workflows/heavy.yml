@@ -24,5 +24,7 @@ jobs:
         run: cargo test --features "serde concurrent cdc multimap" --lib --tests
       - name: Full test suite (superslice binary search, including stress tests)
         run: cargo test --features "serde concurrent cdc multimap superslice-binary-search" --lib --tests
+      - name: Full test suite (wt-slice hybrid binary search, including stress tests)
+        run: cargo test --features "serde concurrent cdc multimap wt-slice-binary-search" --lib --tests
       - name: Full test suite (std binary search and all features, including stress tests)
         run: cargo test --all-features --lib --tests

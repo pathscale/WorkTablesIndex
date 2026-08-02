@@ -1,9 +1,18 @@
 use core::borrow::Borrow;
-#[cfg(not(any(feature = "std-binary-search", feature = "superslice-binary-search")))]
+#[cfg(not(any(
+    feature = "std-binary-search",
+    feature = "superslice-binary-search",
+    feature = "wt-slice-binary-search"
+)))]
 use core::cmp::Ordering;
 use std::ops::Deref;
-#[cfg(all(feature = "superslice-binary-search", not(feature = "std-binary-search")))]
+#[cfg(all(
+    feature = "superslice-binary-search",
+    not(any(feature = "std-binary-search", feature = "wt-slice-binary-search"))
+))]
 use superslice::Ext;
+#[cfg(all(feature = "wt-slice-binary-search", not(feature = "std-binary-search")))]
+use wt_slice::ExactSearch;
 
 pub trait NodeLike<T: Ord> {
     #[allow(dead_code)]
@@ -64,6 +73,7 @@ where
 
 #[inline]
 #[cfg(all(feature = "superslice-binary-search", not(feature = "std-binary-search")))]
+#[cfg(not(feature = "wt-slice-binary-search"))]
 fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
 where
     T: Borrow<Q> + Ord,
@@ -77,7 +87,21 @@ where
 }
 
 #[inline]
-#[cfg(not(any(feature = "std-binary-search", feature = "superslice-binary-search")))]
+#[cfg(all(feature = "wt-slice-binary-search", not(feature = "std-binary-search")))]
+fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
+where
+    T: Borrow<Q> + Ord,
+    Q: Ord + ?Sized,
+{
+    haystack.exact_search_by(|candidate| candidate.borrow().cmp(needle))
+}
+
+#[inline]
+#[cfg(not(any(
+    feature = "std-binary-search",
+    feature = "superslice-binary-search",
+    feature = "wt-slice-binary-search"
+)))]
 fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
 where
     T: Borrow<Q> + Ord,
