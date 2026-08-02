@@ -101,7 +101,7 @@ where
                             Ordering::Less => positions_to_skip += 1,
                                 Ordering::Equal => match bound {
                                 std::ops::Bound::Included(_) => break,
-                                std::ops::Bound::Excluded(_) => { positions_to_skip += 1; break },
+                                std::ops::Bound::Excluded(_) => { positions_to_skip += 1; continue },
                                 _ => unreachable!(),
                             },
                             Ordering::Greater => break,
@@ -114,7 +114,7 @@ where
                             Ordering::Greater => positions_to_skip += 1,
                             Ordering::Equal => match bound {
                                 std::ops::Bound::Included(_) => break,
-                                std::ops::Bound::Excluded(_) => { positions_to_skip += 1; break },
+                                std::ops::Bound::Excluded(_) => { positions_to_skip += 1; continue },
                                 _ => unreachable!(),
                             },
                             Ordering::Less => break,
@@ -247,6 +247,15 @@ impl<T: Ord> NodeLike<T> for Vec<T> {
 mod tests {
     use super::*;
 
+    #[derive(Eq, Ord, PartialEq, PartialOrd)]
+    struct KeyThenValue(usize, &'static str);
+
+    impl Borrow<usize> for KeyThenValue {
+        fn borrow(&self) -> &usize {
+            &self.0
+        }
+    }
+
     #[test]
     fn test_search_bound() {
         let vec = vec![1, 3, 5, 7, 9];
@@ -281,6 +290,35 @@ mod tests {
         let empty: Vec<i32> = vec![];
         assert_eq!(compute_positions_to_skip(&empty, std::ops::Bound::Included(&1), true), None);
         assert_eq!(compute_positions_to_skip(&empty, std::ops::Bound::Excluded(&1), false), None);
+    }
+
+    #[test]
+    fn excluded_borrowed_start_bound_skips_all_equal_keys() {
+        let node = vec![
+            KeyThenValue(1, "a"),
+            KeyThenValue(1, "b"),
+            KeyThenValue(2, "a"),
+        ];
+
+        assert_eq!(
+            compute_positions_to_skip(&node, std::ops::Bound::Excluded(&1), true),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn excluded_borrowed_end_bound_skips_all_equal_keys() {
+        let node = vec![
+            KeyThenValue(1, "a"),
+            KeyThenValue(2, "a"),
+            KeyThenValue(2, "b"),
+            KeyThenValue(3, "a"),
+        ];
+
+        assert_eq!(
+            compute_positions_to_skip(&node, std::ops::Bound::Excluded(&2), false),
+            Some(2),
+        );
     }
 
 }
