@@ -508,7 +508,7 @@ where
         self.index.iter().map(|node| node.value().lock().len()).sum()
     }
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.index.iter().all(|node| node.value().lock().is_empty())
     }
     pub fn capacity(&self) -> usize {
         self.index
