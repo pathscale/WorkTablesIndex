@@ -24,6 +24,41 @@ use superslice::Ext;
 ))]
 use wt_slice::ExactSearch;
 
+// Search backend precedence is deterministic when features are composed:
+// custom > std > wt-slice > superslice. With no search feature selected, the
+// custom implementation is the compatibility fallback.
+
+#[cfg(all(
+    test,
+    any(
+        feature = "custom-binary-search",
+        not(any(
+            feature = "std-binary-search",
+            feature = "superslice-binary-search",
+            feature = "wt-slice-binary-search"
+        ))
+    )
+))]
+const SELECTED_SEARCH_IMPLEMENTATION: &str = "custom";
+#[cfg(all(test, feature = "std-binary-search", not(feature = "custom-binary-search")))]
+const SELECTED_SEARCH_IMPLEMENTATION: &str = "std";
+#[cfg(all(
+    test,
+    feature = "wt-slice-binary-search",
+    not(any(feature = "custom-binary-search", feature = "std-binary-search"))
+))]
+const SELECTED_SEARCH_IMPLEMENTATION: &str = "wt-slice";
+#[cfg(all(
+    test,
+    feature = "superslice-binary-search",
+    not(any(
+        feature = "custom-binary-search",
+        feature = "std-binary-search",
+        feature = "wt-slice-binary-search"
+    ))
+))]
+const SELECTED_SEARCH_IMPLEMENTATION: &str = "superslice";
+
 pub trait NodeLike<T: Ord> {
     #[allow(dead_code)]
     fn with_capacity(capacity: usize) -> Self;
@@ -132,6 +167,8 @@ where
     let mut j = haystack.len();
     let mut i = 0;
     let mut m = j >> 1;
+    // Cache the slice base once so the search loop only computes an offset;
+    // the invariant below supplies the bounds proof for each dereference.
     let pointer = haystack.as_ptr();
 
     while i != j {
@@ -290,6 +327,39 @@ mod tests {
         fn borrow(&self) -> &usize {
             &self.0
         }
+    }
+
+    #[test]
+    fn configured_search_implementation_matches_precedence() {
+        #[cfg(feature = "custom-binary-search")]
+        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "custom");
+
+        #[cfg(all(feature = "std-binary-search", not(feature = "custom-binary-search")))]
+        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "std");
+
+        #[cfg(all(
+            feature = "wt-slice-binary-search",
+            not(any(feature = "custom-binary-search", feature = "std-binary-search"))
+        ))]
+        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "wt-slice");
+
+        #[cfg(all(
+            feature = "superslice-binary-search",
+            not(any(
+                feature = "custom-binary-search",
+                feature = "std-binary-search",
+                feature = "wt-slice-binary-search"
+            ))
+        ))]
+        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "superslice");
+
+        #[cfg(not(any(
+            feature = "custom-binary-search",
+            feature = "std-binary-search",
+            feature = "superslice-binary-search",
+            feature = "wt-slice-binary-search"
+        )))]
+        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "custom");
     }
 
     #[test]

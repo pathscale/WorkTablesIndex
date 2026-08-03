@@ -228,7 +228,11 @@ where
         self.set.get(key)
     }
 
-    /// Returns a cloned value for select-style point lookups.
+    /// Returns an owned clone of the value from the optimistic point-lookup
+    /// path.
+    ///
+    /// This API requires `V: Clone`. Call [`BTreeMap::get`] instead when a
+    /// guard-backed reference is sufficient and cloning is undesirable.
     #[inline(never)]
     pub fn lookup_for_select<Q>(&self, key: &Q) -> Option<V>
     where
@@ -239,7 +243,13 @@ where
         self.set.get_cloned(key).map(|pair| pair.value)
     }
 
-    /// Confirms a select miss while structural changes are excluded.
+    /// Returns an owned clone after confirming a select miss against a stable
+    /// structural mapping.
+    ///
+    /// This cold-path API requires `V: Clone`. It releases the node lock before
+    /// validating the selected node Arc under the structural read lock and
+    /// retries if the mapping moved. Call [`BTreeMap::get`] when a guard-backed
+    /// reference is sufficient and cloning is undesirable.
     #[cold]
     #[inline(never)]
     pub fn confirm_lookup_for_select<Q>(&self, key: &Q) -> Option<V>

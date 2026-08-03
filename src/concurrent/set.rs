@@ -78,6 +78,10 @@ where
     Node: NodeLike<T>,
 {
     pub(crate) index: SkipMap<T, Arc<Mutex<Node>>>,
+    // Lock order: whenever both locks overlap, acquire `index_lock` before a
+    // node mutex. A path that starts with a node mutex must release it before
+    // requesting `index_lock`. Optimistic point reads instead clone the node
+    // Arc under `index_lock`, release the global guard, and then lock the node.
     index_lock: ShardedLock<()>,
     node_capacity: usize,
     #[cfg(feature = "cdc")]
@@ -155,7 +159,14 @@ where
                         let first_node = Arc::new(Mutex::new(first_node));
 
                         drop(_global_guard);
-                        let _global_guard = self.index_lock.write();
+                        let Ok(_global_guard) = self.index_lock.try_write() else {
+                            // Root publication is rare and must not block a
+                            // latency-sensitive caller behind existing readers.
+                            std::thread::yield_now();
+                            continue;
+                        };
+                        // Another first writer may have published while this
+                        // caller was acquiring the exclusive structural guard.
                         if self.index.is_empty() {
                             #[cfg(feature = "cdc")]
                             if EMIT_CDC {
@@ -572,23 +583,25 @@ where
 
     #[cold]
     #[inline(never)]
-    fn lock_node_for_value_confirmed<Q>(&self, value: &Q) -> Option<ArcMutexGuard<RawMutex, Node>>
+    fn lock_node_for_value_confirmed<Q>(&self, value: &Q) -> Option<(Arc<Mutex<Node>>, ArcMutexGuard<RawMutex, Node>)>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let _global_guard = self.index_lock.read();
-        let node = match self.index.lower_bound(std::ops::Bound::Included(value)) {
-            Some(entry) => Some(entry.value().clone()),
-            None => self
-                .index
-                .back()
-                .map(|last| last.value().clone())
-                .or_else(|| self.index.front().map(|first| first.value().clone())),
+        let node = {
+            let _global_guard = self.index_lock.read();
+            match self.index.lower_bound(std::ops::Bound::Included(value)) {
+                Some(entry) => Some(entry.value().clone()),
+                None => self
+                    .index
+                    .back()
+                    .map(|last| last.value().clone())
+                    .or_else(|| self.index.front().map(|first| first.value().clone())),
+            }
         }?;
-        let node_guard = node.lock_arc();
-        drop(_global_guard);
-        Some(node_guard)
+
+        let node_guard = node.clone().lock_arc();
+        Some((node, node_guard))
     }
     /// Returns `true` if the set contains an element equal to the value.
     ///
@@ -616,11 +629,7 @@ where
             }
         }
 
-        if let Some(node_guard) = self.lock_node_for_value_confirmed(value) {
-            return node_guard.contains(value);
-        }
-
-        false
+        self.get_cloned_confirmed(value).is_some()
     }
     pub fn get<'a, Q>(&'a self, value: &'a Q) -> Option<Ref<T, Node>>
     where
@@ -631,16 +640,6 @@ where
             let potential_position = node_guard.try_select(value);
 
             if let Some(position) = potential_position {
-                return Some(Ref {
-                    node_guard,
-                    position,
-                    phantom_data: PhantomData,
-                });
-            }
-        }
-
-        if let Some(node_guard) = self.lock_node_for_value_confirmed(value) {
-            if let Some(position) = node_guard.try_select(value) {
                 return Some(Ref {
                     node_guard,
                     position,
@@ -671,9 +670,22 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let node_guard = self.lock_node_for_value_confirmed(value)?;
-        let position = node_guard.try_select(value)?;
-        node_guard.get_ith(position).cloned()
+        loop {
+            let (node, node_guard) = self.lock_node_for_value_confirmed(value)?;
+            let result = node_guard
+                .try_select(value)
+                .and_then(|position| node_guard.get_ith(position).cloned());
+            drop(node_guard);
+
+            let current_node = self.locate_node(value);
+            let still_current = current_node
+                .as_ref()
+                .is_some_and(|current_node| Arc::ptr_eq(current_node, &node));
+
+            if still_current {
+                return result;
+            }
+        }
     }
     pub fn len(&self) -> usize {
         self.index.iter().map(|node| node.value().lock().len()).sum()
@@ -1394,6 +1406,8 @@ where
                     }
 
                     let mut removed_node = next_entry.value().lock_arc();
+                    // `ArcMutexGuard` owns an Arc to the node, so removing the
+                    // skip-list entry cannot invalidate the guarded storage.
                     next_entry.remove();
                     removed_node.drain(..);
                 }
@@ -1428,8 +1442,10 @@ mod tests {
     use rand::Rng;
     use std::collections::HashSet;
     use std::ops::Bound::Included;
+    use std::sync::mpsc;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+    use std::time::Duration;
 
     // Regression for https://github.com/lucidarium-systems/indexset/issues/57.
     #[test]
@@ -1483,6 +1499,62 @@ mod tests {
         let expected = (0..WRITERS * VALUES_PER_WRITER).collect::<Vec<_>>();
         assert_eq!(set.len(), expected.len());
         assert_eq!(set.iter().copied().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn mixed_structural_and_node_lock_paths_complete_without_deadlock() {
+        const THREADS: usize = 8;
+        const OPERATIONS: usize = 1_000;
+
+        let set = Arc::new(BTreeSet::<usize>::with_maximum_node_size(8));
+        for value in 0..256 {
+            set.insert(value);
+        }
+
+        let start = Arc::new(Barrier::new(THREADS));
+        let (done_tx, done_rx) = mpsc::channel();
+        let handles = (0..THREADS)
+            .map(|worker| {
+                let set = Arc::clone(&set);
+                let start = Arc::clone(&start);
+                let done_tx = done_tx.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    for operation in 0..OPERATIONS {
+                        let value = (operation * 17 + worker * 31) % 512;
+                        match (operation + worker) % 5 {
+                            0 => {
+                                set.insert(value);
+                            }
+                            1 => {
+                                set.remove(&value);
+                            }
+                            2 => {
+                                let _ = set.contains(&value);
+                            }
+                            3 => {
+                                let _ = set.get_cloned_confirmed(&value);
+                            }
+                            _ => {
+                                set.remove_range(value..=value);
+                                set.insert(value);
+                            }
+                        }
+                    }
+                    done_tx.send(()).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(done_tx);
+
+        for _ in 0..THREADS {
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("mixed structural/node-lock workload did not complete");
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     #[test]
