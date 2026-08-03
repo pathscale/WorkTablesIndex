@@ -475,6 +475,84 @@ where
     {
         self.remove_inner::<false, Q>(value).0
     }
+
+    // Slow-path recovery for multimap exact removal. Holding the structural
+    // write guard makes predicate lookup, deletion, and node reindexing one
+    // critical section after the ordinary point-removal path has missed.
+    fn remove_where_inner<const EMIT_CDC: bool, F>(
+        &self,
+        predicate: F,
+    ) -> (Option<T>, Vec<ChangeEvent<T>>)
+    where
+        F: Fn(&T) -> bool,
+    {
+        let mut cdc = vec![];
+        let _global_guard = self.index_lock.write();
+
+        for target_node_entry in self.index.iter() {
+            let mut node_guard = target_node_entry.value().lock_arc();
+            let Some(target) = node_guard.iter().find(|value| predicate(value)).cloned() else {
+                continue;
+            };
+            let old_max = node_guard
+                .max()
+                .cloned()
+                .expect("target node must have a maximum");
+            let (deleted, idx) = NodeLike::delete(&mut *node_guard, &target)
+                .expect("target was found while the node was locked");
+
+            #[cfg(feature = "cdc")]
+            if EMIT_CDC {
+                let node_element_removal = ChangeEvent::RemoveAt {
+                    event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
+                    max_value: old_max.clone(),
+                    value: deleted.clone(),
+                    index: idx,
+                };
+                cdc.push(node_element_removal);
+            }
+
+            if node_guard.max() != Some(&old_max) {
+                let node = target_node_entry.value().clone();
+                target_node_entry.remove();
+
+                if let Some(new_max) = node_guard.max().cloned() {
+                    self.index.insert(new_max, node);
+                } else {
+                    #[cfg(feature = "cdc")]
+                    if EMIT_CDC {
+                        let node_removal = ChangeEvent::RemoveNode {
+                            event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
+                            max_value: old_max,
+                        };
+                        cdc.push(node_removal);
+                    }
+                }
+            }
+
+            return (Some(deleted), cdc);
+        }
+
+        (None, cdc)
+    }
+
+    pub(crate) fn remove_where<F>(&self, predicate: F) -> Option<T>
+    where
+        F: Fn(&T) -> bool,
+    {
+        self.remove_where_inner::<false, F>(predicate).0
+    }
+
+    pub(crate) fn remove_where_cdc<F>(
+        &self,
+        predicate: F,
+    ) -> (Option<T>, Vec<ChangeEvent<T>>)
+    where
+        F: Fn(&T) -> bool,
+    {
+        self.remove_where_inner::<true, F>(predicate)
+    }
+
     fn locate_node<Q>(&self, value: &Q) -> Option<Arc<Mutex<Node>>>
     where
         T: Borrow<Q>,
@@ -1281,6 +1359,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cdc")]
+    use crate::cdc::change::ChangeEvent;
     use crate::concurrent::set::{BTreeSet, DEFAULT_INNER_SIZE};
     use rand::Rng;
     use std::collections::HashSet;
@@ -1620,6 +1700,43 @@ mod tests {
         assert!(set.remove(&5).is_some());
         assert!(!set.contains(&5));
         assert!(!set.remove(&5).is_some());
+    }
+
+    #[test]
+    fn test_remove_where_reindexes_changed_node_maximum() {
+        let set = BTreeSet::<usize>::with_maximum_node_size(4);
+        for value in 0..4 {
+            set.insert(value);
+        }
+
+        assert_eq!(set.remove_where(|value| *value == 3), Some(3));
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        assert!(set.insert(4));
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
+    }
+
+    #[cfg(feature = "cdc")]
+    #[test]
+    fn test_remove_where_cdc_removes_empty_node() {
+        let set = BTreeSet::<usize>::new();
+        set.insert(7);
+
+        let (removed, events) = set.remove_where_cdc(|value| *value == 7);
+
+        assert_eq!(removed, Some(7));
+        assert!(set.is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ChangeEvent::RemoveAt {
+                    max_value: 7,
+                    value: 7,
+                    ..
+                },
+                ChangeEvent::RemoveNode { max_value: 7, .. }
+            ]
+        ));
     }
 
     #[test]

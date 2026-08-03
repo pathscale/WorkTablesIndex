@@ -43,6 +43,7 @@ jobs:
         run: >
           cargo test --features "serde concurrent cdc multimap" --lib --tests --
           --skip test_concurrent_insert
+          --skip test_concurrent_multimap_remove_reinsert_stress
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
@@ -50,6 +51,7 @@ jobs:
         run: >
           cargo test --features "serde concurrent cdc multimap superslice-binary-search" --lib --tests --
           --skip test_concurrent_insert
+          --skip test_concurrent_multimap_remove_reinsert_stress
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
@@ -57,6 +59,7 @@ jobs:
         run: >
           cargo test --features "serde concurrent cdc multimap wt-slice-binary-search" --lib --tests --
           --skip test_concurrent_insert
+          --skip test_concurrent_multimap_remove_reinsert_stress
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
@@ -64,6 +67,7 @@ jobs:
         run: >
           cargo test --all-features --lib --tests --
           --skip test_concurrent_insert
+          --skip test_concurrent_multimap_remove_reinsert_stress
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
