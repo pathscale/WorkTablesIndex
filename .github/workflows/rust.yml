@@ -33,6 +33,11 @@ jobs:
         run: cargo build --no-default-features --all-targets --features "serde concurrent cdc multimap std-binary-search"
       - name: Build (explicit custom override, all features, all targets)
         run: cargo build --all-targets --all-features
+      - name: Test (composed search-feature precedence)
+        run: >
+          cargo test --no-default-features
+          --features "concurrent custom-binary-search std-binary-search wt-slice-binary-search superslice-binary-search"
+          configured_search_implementation_matches_precedence --lib
       # Doctests are excluded on purpose: upstream doc examples import
       # `indexset::...`, which is correct for consumers (they alias the
       # package back to `indexset`) but unresolvable under this crate name.
