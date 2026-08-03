@@ -1,6 +1,6 @@
 [package]
 name = "WorkTablesIndex"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 documentation = "https://docs.rs/WorkTablesIndex/"
 repository = "https://github.com/pathscale/WorkTablesIndex"
@@ -39,6 +39,7 @@ concurrent = [
 ]
 cdc = ["concurrent"]
 multimap = ["concurrent", "dep:fastrand"]
+custom-binary-search = []
 std-binary-search = []
 superslice-binary-search = ["dep:superslice"]
 wt-slice-binary-search = ["dep:wt-slice"]

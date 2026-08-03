@@ -33,8 +33,9 @@ The following table describes the variants of this data structure that are avail
 * `std-binary-search`: uses the standard library's fixed-iteration, branch-optimized node search; it is an A/B option for cheap keys with unpredictable positions
 * `superslice-binary-search`: uses `superslice::Ext::lower_bound_by` plus an exact-match check as a second A/B option; it does not add a dependency unless enabled
 * `wt-slice-binary-search` (default): uses the `wt-slice` hybrid exact search, combining early equality exit with a branch-optimized direction update
+* `custom-binary-search`: explicitly selects the original branch-based early-exit search, including when another dependency enables the default `wt-slice` feature
 
-The `wt-slice` hybrid is the default balanced option across cheap numeric keys and expensive comparisons. The original custom early-exit search remains available by disabling default features and enabling no other search feature. If multiple search features are enabled, precedence is `std-binary-search`, `wt-slice-binary-search`, `superslice-binary-search`, then the custom search.
+The `wt-slice` hybrid is the default balanced option across cheap numeric keys and expensive comparisons. The original custom early-exit search remains available by disabling default features and enabling no other search feature, or explicitly through `custom-binary-search`. If multiple search features are enabled, precedence is `custom-binary-search`, `std-binary-search`, `wt-slice-binary-search`, then `superslice-binary-search`.
 
 # Background
 
