@@ -23,6 +23,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: "true"
+      - name: Format
+        run: cargo fmt --all -- --check
       - name: Build (custom binary search, all targets)
         run: cargo build --no-default-features --all-targets --features "serde concurrent cdc multimap"
       - name: Build (superslice binary search, all targets)
@@ -54,6 +56,8 @@ jobs:
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
+          --skip concurrent_first_writers_preserve_disjoint_ranges
+          --skip mixed_structural_and_node_lock_paths_complete_without_deadlock
       - name: Test (fast tier, superslice binary search)
         run: >
           cargo test --no-default-features --features "serde concurrent cdc multimap superslice-binary-search" --lib --tests --
@@ -62,6 +66,8 @@ jobs:
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
+          --skip concurrent_first_writers_preserve_disjoint_ranges
+          --skip mixed_structural_and_node_lock_paths_complete_without_deadlock
       - name: Test (fast tier, default wt-slice hybrid binary search)
         run: >
           cargo test --features "serde concurrent cdc multimap" --lib --tests --
@@ -70,6 +76,8 @@ jobs:
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
+          --skip concurrent_first_writers_preserve_disjoint_ranges
+          --skip mixed_structural_and_node_lock_paths_complete_without_deadlock
       - name: Test (fast tier, std binary search)
         run: >
           cargo test --no-default-features --features "serde concurrent cdc multimap std-binary-search" --lib --tests --
@@ -78,6 +86,8 @@ jobs:
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
+          --skip concurrent_first_writers_preserve_disjoint_ranges
+          --skip mixed_structural_and_node_lock_paths_complete_without_deadlock
       - name: Test (fast tier, explicit custom override and all features)
         run: >
           cargo test --all-features --lib --tests --
@@ -86,6 +96,8 @@ jobs:
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
+          --skip concurrent_first_writers_preserve_disjoint_ranges
+          --skip mixed_structural_and_node_lock_paths_complete_without_deadlock
 
   clippy:
     runs-on: ubicloud-standard-2
