@@ -155,7 +155,8 @@ where
                         let first_node = Arc::new(Mutex::new(first_node));
 
                         drop(_global_guard);
-                        if self.index_lock.try_write().is_ok() {
+                        let _global_guard = self.index_lock.write();
+                        if self.index.is_empty() {
                             #[cfg(feature = "cdc")]
                             if EMIT_CDC {
                                 let node_insertion = ChangeEvent::CreateNode {
@@ -479,10 +480,7 @@ where
     // Slow-path recovery for multimap exact removal. Holding the structural
     // write guard makes predicate lookup, deletion, and node reindexing one
     // critical section after the ordinary point-removal path has missed.
-    fn remove_where_inner<const EMIT_CDC: bool, F>(
-        &self,
-        predicate: F,
-    ) -> (Option<T>, Vec<ChangeEvent<T>>)
+    fn remove_where_inner<const EMIT_CDC: bool, F>(&self, predicate: F) -> (Option<T>, Vec<ChangeEvent<T>>)
     where
         F: Fn(&T) -> bool,
     {
@@ -494,12 +492,9 @@ where
             let Some(target) = node_guard.iter().find(|value| predicate(value)).cloned() else {
                 continue;
             };
-            let old_max = node_guard
-                .max()
-                .cloned()
-                .expect("target node must have a maximum");
-            let (deleted, idx) = NodeLike::delete(&mut *node_guard, &target)
-                .expect("target was found while the node was locked");
+            let old_max = node_guard.max().cloned().expect("target node must have a maximum");
+            let (deleted, idx) =
+                NodeLike::delete(&mut *node_guard, &target).expect("target was found while the node was locked");
 
             #[cfg(feature = "cdc")]
             if EMIT_CDC {
@@ -543,10 +538,7 @@ where
         self.remove_where_inner::<false, F>(predicate).0
     }
 
-    pub(crate) fn remove_where_cdc<F>(
-        &self,
-        predicate: F,
-    ) -> (Option<T>, Vec<ChangeEvent<T>>)
+    pub(crate) fn remove_where_cdc<F>(&self, predicate: F) -> (Option<T>, Vec<ChangeEvent<T>>)
     where
         F: Fn(&T) -> bool,
     {
@@ -568,6 +560,36 @@ where
                 .or_else(|| self.index.front().map(|first| first.value().clone())),
         }
     }
+
+    #[inline(always)]
+    fn lock_node_for_value<Q>(&self, value: &Q) -> Option<ArcMutexGuard<RawMutex, Node>>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        Some(self.locate_node(value)?.lock_arc())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn lock_node_for_value_confirmed<Q>(&self, value: &Q) -> Option<ArcMutexGuard<RawMutex, Node>>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let _global_guard = self.index_lock.read();
+        let node = match self.index.lower_bound(std::ops::Bound::Included(value)) {
+            Some(entry) => Some(entry.value().clone()),
+            None => self
+                .index
+                .back()
+                .map(|last| last.value().clone())
+                .or_else(|| self.index.front().map(|first| first.value().clone())),
+        }?;
+        let node_guard = node.lock_arc();
+        drop(_global_guard);
+        Some(node_guard)
+    }
     /// Returns `true` if the set contains an element equal to the value.
     ///
     /// The value may be any borrowed form of the set's element type,
@@ -588,8 +610,14 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        if let Some(node) = self.locate_node(value) {
-            return node.lock().contains(value);
+        if let Some(node_guard) = self.lock_node_for_value(value) {
+            if node_guard.contains(value) {
+                return true;
+            }
+        }
+
+        if let Some(node_guard) = self.lock_node_for_value_confirmed(value) {
+            return node_guard.contains(value);
         }
 
         false
@@ -599,8 +627,7 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        if let Some(node) = self.locate_node(value) {
-            let node_guard = node.lock_arc();
+        if let Some(node_guard) = self.lock_node_for_value(value) {
             let potential_position = node_guard.try_select(value);
 
             if let Some(position) = potential_position {
@@ -612,7 +639,41 @@ where
             }
         }
 
+        if let Some(node_guard) = self.lock_node_for_value_confirmed(value) {
+            if let Some(position) = node_guard.try_select(value) {
+                return Some(Ref {
+                    node_guard,
+                    position,
+                    phantom_data: PhantomData,
+                });
+            }
+        }
+
         None
+    }
+
+    /// Returns a cloned value from the optimistic point-lookup path.
+    #[inline(always)]
+    pub(crate) fn get_cloned<Q>(&self, value: &Q) -> Option<T>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let node_guard = self.lock_node_for_value(value)?;
+        let position = node_guard.try_select(value)?;
+        node_guard.get_ith(position).cloned()
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn get_cloned_confirmed<Q>(&self, value: &Q) -> Option<T>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let node_guard = self.lock_node_for_value_confirmed(value)?;
+        let position = node_guard.try_select(value)?;
+        node_guard.get_ith(position).cloned()
     }
     pub fn len(&self) -> usize {
         self.index.iter().map(|node| node.value().lock().len()).sum()
@@ -1332,7 +1393,9 @@ where
                         break;
                     }
 
+                    let mut removed_node = next_entry.value().lock_arc();
                     next_entry.remove();
+                    removed_node.drain(..);
                 }
 
                 // And then trim the front from the left
@@ -1365,7 +1428,7 @@ mod tests {
     use rand::Rng;
     use std::collections::HashSet;
     use std::ops::Bound::Included;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
     // Regression for https://github.com/lucidarium-systems/indexset/issues/57.
@@ -1390,6 +1453,36 @@ mod tests {
         }
 
         assert_eq!(set.iter().copied().collect::<Vec<_>>(), (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn concurrent_first_writers_preserve_disjoint_ranges() {
+        const WRITERS: u64 = 8;
+        const VALUES_PER_WRITER: u64 = 1_000;
+
+        let set = Arc::new(BTreeSet::<u64>::new());
+        let start = Arc::new(Barrier::new(WRITERS as usize));
+        let handles = (0..WRITERS)
+            .map(|writer| {
+                let set = Arc::clone(&set);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    let first = writer * VALUES_PER_WRITER;
+                    for value in first..first + VALUES_PER_WRITER {
+                        assert!(set.insert(value));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let expected = (0..WRITERS * VALUES_PER_WRITER).collect::<Vec<_>>();
+        assert_eq!(set.len(), expected.len());
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), expected);
     }
 
     #[test]
@@ -1690,6 +1783,24 @@ mod tests {
         let expected_len = expected_len - 5;
         let actual_len = btree.len();
         assert_eq!(expected_len, actual_len);
+    }
+
+    #[test]
+    fn remove_range_clears_detached_nodes() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        for value in 0..32 {
+            set.insert(value);
+        }
+
+        let front = set.index.lower_bound(Included(&2)).unwrap();
+        let detached = front.next().unwrap().value().clone();
+        let detached_values = detached.lock().iter().copied().collect::<Vec<_>>();
+        assert!(detached_values.iter().all(|value| (2..30).contains(value)));
+
+        set.remove_range(2..30);
+
+        assert!(detached.lock().is_empty());
+        assert!(detached_values.iter().all(|value| !set.contains(value)));
     }
 
     #[test]

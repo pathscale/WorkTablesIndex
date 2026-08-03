@@ -23,9 +23,12 @@ pub struct RandomMultiPair<K, V> {
 
 impl<K, V> RandomMultiPair<K, V> {
     pub fn new(key: K, value: V) -> Self {
-        Self { key, value, discriminator: fastrand::u64(..) }
+        Self {
+            key,
+            value,
+            discriminator: fastrand::u64(..),
+        }
     }
-
 }
 
 impl<K: Ord, V: PartialEq> Eq for RandomMultiPair<K, V> {}
@@ -139,11 +142,7 @@ where
         None
     }
 
-    fn remove_cdc_from<Node>(
-        set: &BTreeSet<Self, Node>,
-        key: &K,
-        value: &V,
-    ) -> (Option<(K, V)>, Vec<ChangeEvent<Self>>)
+    fn remove_cdc_from<Node>(set: &BTreeSet<Self, Node>, key: &K, value: &V) -> (Option<(K, V)>, Vec<ChangeEvent<Self>>)
     where
         Self: Ord + Clone + 'static,
         Node: NodeLike<Self> + Send + 'static,
@@ -161,8 +160,7 @@ where
 
             // See `remove_from`: the locator can become stale when an equal
             // logical pair is concurrently removed and reinserted.
-            let (res, evs) =
-                set.remove_where_cdc(|pair| pair.key == *key && pair.value == *value);
+            let (res, evs) = set.remove_where_cdc(|pair| pair.key == *key && pair.value == *value);
             return (res.map(Into::into), evs);
         }
 
@@ -220,22 +218,22 @@ mod test {
         let p1 = RandomMultiPair::new(1, "a");
         let p2 = RandomMultiPair::new(1, "b");
         let p3 = RandomMultiPair::new(2, "c");
-     
+
         NodeLike::insert(&mut vec, p1.clone());
         NodeLike::insert(&mut vec, p2.clone());
-        assert_eq!(vec.len(), 2); 
+        assert_eq!(vec.len(), 2);
 
         NodeLike::insert(&mut vec, p1.clone());
         assert_eq!(vec.len(), 2);
-     
+
         NodeLike::insert(&mut vec, p3.clone());
         assert_eq!(vec.len(), 3);
-     }
+    }
 
-     #[test]
-     fn range_bounds() {
+    #[test]
+    fn range_bounds() {
         let mut vec = Vec::new();
-    
+
         let p1a = RandomMultiPair::new(1, "a");
         let p1b = RandomMultiPair::new(1, "b");
         let p1c = RandomMultiPair::new(1, "c");
@@ -291,5 +289,5 @@ mod test {
         let range_4 = &vec[start_4..=end_4];
         assert_eq!(range_4.len(), 1);
         assert!(range_4.contains(&p4a));
-     }
+    }
 }

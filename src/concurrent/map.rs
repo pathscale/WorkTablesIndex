@@ -227,6 +227,30 @@ where
     {
         self.set.get(key)
     }
+
+    /// Returns a cloned value for select-style point lookups.
+    #[inline(never)]
+    pub fn lookup_for_select<Q>(&self, key: &Q) -> Option<V>
+    where
+        Pair<K, V>: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+        V: Clone,
+    {
+        self.set.get_cloned(key).map(|pair| pair.value)
+    }
+
+    /// Confirms a select miss while structural changes are excluded.
+    #[cold]
+    #[inline(never)]
+    pub fn confirm_lookup_for_select<Q>(&self, key: &Q) -> Option<V>
+    where
+        Pair<K, V>: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+        V: Clone,
+    {
+        self.set.get_cloned_confirmed(key).map(|pair| pair.value)
+    }
+
     /// Inserts a key-value pair into the map.
     ///
     /// If the map did not have this key present, it will be inserted.
@@ -504,16 +528,8 @@ mod tests {
 
         assert_eq!(map.insert(split_left_max, "new"), Some("old"));
         assert_eq!(map.len(), maximum_node_size);
-        assert_eq!(
-            map.get(&split_left_max).map(|entry| entry.get().value),
-            Some("new")
-        );
-        assert_eq!(
-            map.iter()
-                .filter(|(key, _)| **key == split_left_max)
-                .count(),
-            1
-        );
+        assert_eq!(map.get(&split_left_max).map(|entry| entry.get().value), Some("new"));
+        assert_eq!(map.iter().filter(|(key, _)| **key == split_left_max).count(), 1);
     }
 
     #[derive(Debug, Default)]

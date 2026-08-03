@@ -156,11 +156,7 @@ where
 }
 
 #[inline]
-fn compute_positions_to_skip<Q, T: Ord>(
-    haystack: &[T],
-    bound: std::ops::Bound<&Q>,
-    forward: bool,
-) -> Option<usize>
+fn compute_positions_to_skip<Q, T: Ord>(haystack: &[T], bound: std::ops::Bound<&Q>, forward: bool) -> Option<usize>
 where
     T: Borrow<Q> + Ord,
     Q: Ord + ?Sized,
@@ -315,14 +311,8 @@ mod tests {
     fn test_search_bound() {
         let vec = vec![1, 3, 5, 7, 9];
 
-        assert_eq!(
-            compute_positions_to_skip(&vec, std::ops::Bound::Unbounded, true),
-            None
-        );
-        assert_eq!(
-            compute_positions_to_skip(&vec, std::ops::Bound::Unbounded, false),
-            None
-        );
+        assert_eq!(compute_positions_to_skip(&vec, std::ops::Bound::Unbounded, true), None);
+        assert_eq!(compute_positions_to_skip(&vec, std::ops::Bound::Unbounded, false), None);
 
         assert_eq!(
             compute_positions_to_skip(&vec, std::ops::Bound::Included(&1), true),
@@ -420,11 +410,7 @@ mod tests {
     }
     #[test]
     fn excluded_borrowed_bound_skips_all_equal_keys() {
-        let node = vec![
-            KeyThenValue(1, "a"),
-            KeyThenValue(1, "b"),
-            KeyThenValue(2, "a"),
-        ];
+        let node = vec![KeyThenValue(1, "a"), KeyThenValue(1, "b"), KeyThenValue(2, "a")];
 
         assert_eq!(
             compute_positions_to_skip(&node, std::ops::Bound::Excluded(&1), true),

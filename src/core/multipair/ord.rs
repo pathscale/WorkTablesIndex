@@ -103,11 +103,7 @@ where
         set.remove(&pair_to_remove).map(Into::into)
     }
 
-    fn remove_cdc_from<Node>(
-        set: &BTreeSet<Self, Node>,
-        key: &K,
-        value: &V,
-    ) -> (Option<(K, V)>, Vec<ChangeEvent<Self>>)
+    fn remove_cdc_from<Node>(set: &BTreeSet<Self, Node>, key: &K, value: &V) -> (Option<(K, V)>, Vec<ChangeEvent<Self>>)
     where
         Self: Ord + Clone + 'static,
         Node: NodeLike<Self> + Send + 'static,
