@@ -26,6 +26,8 @@ where
 ///
 /// This representation requires `V: Ord`, and lets exact pair removal locate
 /// the value directly instead of scanning entries that share the same key.
+/// Removal remains `O(log n)`; the ordered representation avoids a linear scan
+/// over values that share a key, rather than making removal `O(1)`.
 ///
 /// ```
 /// use indexset::concurrent::multimap::OrderedBTreeMultiMap;

@@ -128,6 +128,9 @@ where
                 return Some(removed.into());
             }
 
+            // A concurrent remove/reinsert can replace the located pair with a
+            // logically equal pair that has a new discriminator. Revalidate
+            // the logical pair under the structural write lock in that case.
             return set
                 .remove_where(|pair| pair.key == *key && pair.value == *value)
                 .map(Into::into);
@@ -156,6 +159,8 @@ where
                 return (res.map(Into::into), evs);
             }
 
+            // See `remove_from`: the locator can become stale when an equal
+            // logical pair is concurrently removed and reinserted.
             let (res, evs) =
                 set.remove_where_cdc(|pair| pair.key == *key && pair.value == *value);
             return (res.map(Into::into), evs);

@@ -112,8 +112,9 @@ where
     let mut m = j >> 1;
 
     while i != j {
-        // Invariant: `i <= m < j <= haystack.len()` while the search range is
-        // non-empty. Both branches below preserve it for the next iteration.
+        debug_assert!(i <= m && m < j && j <= haystack.len());
+        // SAFETY: initialization establishes `i <= m < j <= haystack.len()`
+        // for a non-empty range, and both branches preserve that invariant.
         let candidate = unsafe { haystack.get_unchecked(m) };
         match candidate.borrow().cmp(needle) {
             Ordering::Equal => return Ok(m),
@@ -144,11 +145,11 @@ where
     let skipped = match (bound, forward) {
         // A forward iterator skips values before the start bound.
         (std::ops::Bound::Included(value), true) => haystack.partition_point(|item| item.borrow().cmp(value).is_lt()),
-        (std::ops::Bound::Excluded(value), true) => haystack.partition_point(|item| !item.borrow().cmp(value).is_gt()),
+        (std::ops::Bound::Excluded(value), true) => haystack.partition_point(|item| item.borrow().cmp(value).is_le()),
 
         // A backward iterator skips values after the end bound.
         (std::ops::Bound::Included(value), false) => {
-            let first_greater = haystack.partition_point(|item| !item.borrow().cmp(value).is_gt());
+            let first_greater = haystack.partition_point(|item| item.borrow().cmp(value).is_le());
             haystack.len() - first_greater
         }
         (std::ops::Bound::Excluded(value), false) => {
