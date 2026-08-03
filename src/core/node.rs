@@ -1,63 +1,5 @@
 use core::borrow::Borrow;
-#[cfg(any(
-    feature = "custom-binary-search",
-    not(any(
-        feature = "std-binary-search",
-        feature = "superslice-binary-search",
-        feature = "wt-slice-binary-search"
-    ))
-))]
-use core::cmp::Ordering;
 use std::ops::Deref;
-#[cfg(all(
-    feature = "superslice-binary-search",
-    not(any(
-        feature = "custom-binary-search",
-        feature = "std-binary-search",
-        feature = "wt-slice-binary-search"
-    ))
-))]
-use superslice::Ext;
-#[cfg(all(
-    feature = "wt-slice-binary-search",
-    not(any(feature = "custom-binary-search", feature = "std-binary-search"))
-))]
-use wt_slice::ExactSearch;
-
-// Search backend precedence is deterministic when features are composed:
-// custom > std > wt-slice > superslice. With no search feature selected, the
-// custom implementation is the compatibility fallback.
-
-#[cfg(all(
-    test,
-    any(
-        feature = "custom-binary-search",
-        not(any(
-            feature = "std-binary-search",
-            feature = "superslice-binary-search",
-            feature = "wt-slice-binary-search"
-        ))
-    )
-))]
-const SELECTED_SEARCH_IMPLEMENTATION: &str = "custom";
-#[cfg(all(test, feature = "std-binary-search", not(feature = "custom-binary-search")))]
-const SELECTED_SEARCH_IMPLEMENTATION: &str = "std";
-#[cfg(all(
-    test,
-    feature = "wt-slice-binary-search",
-    not(any(feature = "custom-binary-search", feature = "std-binary-search"))
-))]
-const SELECTED_SEARCH_IMPLEMENTATION: &str = "wt-slice";
-#[cfg(all(
-    test,
-    feature = "superslice-binary-search",
-    not(any(
-        feature = "custom-binary-search",
-        feature = "std-binary-search",
-        feature = "wt-slice-binary-search"
-    ))
-))]
-const SELECTED_SEARCH_IMPLEMENTATION: &str = "superslice";
 
 pub trait NodeLike<T: Ord> {
     #[allow(dead_code)]
@@ -106,17 +48,23 @@ pub trait NodeLike<T: Ord> {
         T: 'a;
 }
 
-#[inline]
 #[cfg(all(feature = "std-binary-search", not(feature = "custom-binary-search")))]
-fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
-where
-    T: Borrow<Q> + Ord,
-    Q: Ord + ?Sized,
-{
-    haystack.binary_search_by(|candidate| candidate.borrow().cmp(needle))
+mod search_backend {
+    use core::borrow::Borrow;
+
+    #[cfg(test)]
+    pub(super) const NAME: &str = "std";
+
+    #[inline]
+    pub(super) fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        haystack.binary_search_by(|candidate| candidate.borrow().cmp(needle))
+    }
 }
 
-#[inline]
 #[cfg(all(
     feature = "superslice-binary-search",
     not(any(
@@ -125,32 +73,48 @@ where
         feature = "wt-slice-binary-search"
     ))
 ))]
-fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
-where
-    T: Borrow<Q> + Ord,
-    Q: Ord + ?Sized,
-{
-    let index = haystack.lower_bound_by(|candidate| candidate.borrow().cmp(needle));
-    match haystack.get(index) {
-        Some(candidate) if candidate.borrow().cmp(needle).is_eq() => Ok(index),
-        _ => Err(index),
+mod search_backend {
+    use core::borrow::Borrow;
+    use superslice::Ext;
+
+    #[cfg(test)]
+    pub(super) const NAME: &str = "superslice";
+
+    #[inline]
+    pub(super) fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        let index = haystack.lower_bound_by(|candidate| candidate.borrow().cmp(needle));
+        match haystack.get(index) {
+            Some(candidate) if candidate.borrow().cmp(needle).is_eq() => Ok(index),
+            _ => Err(index),
+        }
     }
 }
 
-#[inline]
 #[cfg(all(
     feature = "wt-slice-binary-search",
     not(any(feature = "custom-binary-search", feature = "std-binary-search"))
 ))]
-fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
-where
-    T: Borrow<Q> + Ord,
-    Q: Ord + ?Sized,
-{
-    haystack.exact_search_by(|candidate| candidate.borrow().cmp(needle))
+mod search_backend {
+    use core::borrow::Borrow;
+    use wt_slice::ExactSearch;
+
+    #[cfg(test)]
+    pub(super) const NAME: &str = "wt-slice";
+
+    #[inline]
+    pub(super) fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        haystack.exact_search_by(|candidate| candidate.borrow().cmp(needle))
+    }
 }
 
-#[inline]
 #[cfg(any(
     feature = "custom-binary-search",
     not(any(
@@ -159,38 +123,50 @@ where
         feature = "wt-slice-binary-search"
     ))
 ))]
-fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
-where
-    T: Borrow<Q> + Ord,
-    Q: Ord + ?Sized,
-{
-    let mut j = haystack.len();
-    let mut i = 0;
-    let mut m = j >> 1;
-    // Cache the slice base once so the search loop only computes an offset;
-    // the invariant below supplies the bounds proof for each dereference.
-    let pointer = haystack.as_ptr();
+mod search_backend {
+    use core::borrow::Borrow;
+    use core::cmp::Ordering;
 
-    while i != j {
-        debug_assert!(i <= m && m < j && j <= haystack.len());
-        // SAFETY: initialization establishes `i <= m < j <= haystack.len()`
-        // for a non-empty range, and both branches preserve that invariant.
-        let candidate = unsafe { &*pointer.add(m) };
-        match candidate.borrow().cmp(needle) {
-            Ordering::Equal => return Ok(m),
-            Ordering::Less => {
-                i = m + 1;
-                m = (i + j) >> 1;
-            }
-            Ordering::Greater => {
-                j = m;
-                m = (i + j) >> 1;
+    #[cfg(test)]
+    pub(super) const NAME: &str = "custom";
+
+    #[inline]
+    pub(super) fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        let mut j = haystack.len();
+        let mut i = 0;
+        let mut m = j >> 1;
+
+        while i != j {
+            debug_assert!(i <= m && m < j && j <= haystack.len());
+            // SAFETY: initialization establishes `i <= m < j <= haystack.len()`
+            // for a non-empty range, and both branches preserve that invariant.
+            let candidate = unsafe { haystack.get_unchecked(m) };
+            match candidate.borrow().cmp(needle) {
+                Ordering::Equal => return Ok(m),
+                Ordering::Less => {
+                    i = m + 1;
+                    m = (i + j) >> 1;
+                }
+                Ordering::Greater => {
+                    j = m;
+                    m = (i + j) >> 1;
+                }
             }
         }
-    }
 
-    Err(i)
+        Err(i)
+    }
 }
+
+// Search backend precedence is deterministic when features are composed:
+// custom > std > wt-slice > superslice. With no search feature selected, the
+// custom implementation is the compatibility fallback. Each backend's cfg
+// selects its implementation and test name together, preventing drift.
+use search_backend::search;
 
 #[inline]
 fn compute_positions_to_skip<Q, T: Ord>(haystack: &[T], bound: std::ops::Bound<&Q>, forward: bool) -> Option<usize>
@@ -332,16 +308,16 @@ mod tests {
     #[test]
     fn configured_search_implementation_matches_precedence() {
         #[cfg(feature = "custom-binary-search")]
-        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "custom");
+        assert_eq!(search_backend::NAME, "custom");
 
         #[cfg(all(feature = "std-binary-search", not(feature = "custom-binary-search")))]
-        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "std");
+        assert_eq!(search_backend::NAME, "std");
 
         #[cfg(all(
             feature = "wt-slice-binary-search",
             not(any(feature = "custom-binary-search", feature = "std-binary-search"))
         ))]
-        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "wt-slice");
+        assert_eq!(search_backend::NAME, "wt-slice");
 
         #[cfg(all(
             feature = "superslice-binary-search",
@@ -351,7 +327,7 @@ mod tests {
                 feature = "wt-slice-binary-search"
             ))
         ))]
-        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "superslice");
+        assert_eq!(search_backend::NAME, "superslice");
 
         #[cfg(not(any(
             feature = "custom-binary-search",
@@ -359,7 +335,7 @@ mod tests {
             feature = "superslice-binary-search",
             feature = "wt-slice-binary-search"
         )))]
-        assert_eq!(SELECTED_SEARCH_IMPLEMENTATION, "custom");
+        assert_eq!(search_backend::NAME, "custom");
     }
 
     #[test]

@@ -16,6 +16,13 @@ use crate::core::node::*;
 
 use super::r#ref::Ref;
 
+// Most point reads acquire the node mutex immediately while the structural
+// mapping is pinned. If a node is genuinely contended, wait without holding a
+// structural shard and retry. A bounded fallback preserves progress if the
+// node keeps being reacquired between the wait and the next stable attempt.
+const STABLE_READ_BLOCKING_FALLBACK_AFTER: usize = 2;
+const ROOT_PUBLICATION_SPIN_LIMIT: usize = 16;
+
 /// A **persistent** concurrent ordered set based on a B-Tree.
 ///
 /// See [`BTreeMap`]'s documentation for a detailed discussion of this collection's performance
@@ -80,11 +87,15 @@ where
     pub(crate) index: SkipMap<T, Arc<Mutex<Node>>>,
     // Lock order: whenever both locks overlap, acquire `index_lock` before a
     // node mutex. A path that starts with a node mutex must release it before
-    // requesting `index_lock`. Optimistic point reads instead clone the node
-    // Arc under `index_lock`, release the global guard, and then lock the node.
+    // requesting `index_lock`. Definitive point reads try the node lock while
+    // holding a structural read guard; on contention they release that guard
+    // before waiting and retry the mapping.
     index_lock: ShardedLock<()>,
     node_capacity: usize,
     #[cfg(feature = "cdc")]
+    // The counter provides unique sequence numbers only. Node/global locks
+    // order conflicting mutations, and the persistence queue publishes event
+    // payloads, so the counter itself does not carry memory visibility.
     event_id: AtomicU64,
 }
 impl<T: Ord + Clone + 'static, Node: NodeLike<T>> Default for BTreeSet<T, Node> {
@@ -152,39 +163,44 @@ where
                     if let Some(last) = self.index.back() {
                         last
                     } else {
-                        let mut first_node = Node::with_capacity(self.node_capacity);
-
-                        first_node.insert(value.clone());
-
-                        let first_node = Arc::new(Mutex::new(first_node));
-
                         drop(_global_guard);
-                        let Ok(_global_guard) = self.index_lock.try_write() else {
-                            // Root publication is rare and must not block a
-                            // latency-sensitive caller behind existing readers.
-                            std::thread::yield_now();
-                            continue;
+                        let mut spins = 0;
+                        let _global_guard = loop {
+                            if let Ok(guard) = self.index_lock.try_write() {
+                                break guard;
+                            }
+                            if spins >= ROOT_PUBLICATION_SPIN_LIMIT {
+                                // A bounded block gives root publication a
+                                // deterministic progress path under reader
+                                // contention instead of livelocking.
+                                break self.index_lock.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            }
+                            spins += 1;
+                            std::hint::spin_loop();
                         };
                         // Another first writer may have published while this
                         // caller was acquiring the exclusive structural guard.
-                        if self.index.is_empty() {
-                            #[cfg(feature = "cdc")]
-                            if EMIT_CDC {
-                                let node_insertion = ChangeEvent::CreateNode {
-                                    // is correct as index is locked and current thread is the only that can
-                                    // fetch event_id.
-                                    event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
-                                    max_value: value.clone(),
-                                };
-                                cdc.push(node_insertion);
-                            }
-
-                            self.index.insert(value, first_node);
-
-                            return Ok((None, cdc));
+                        if !self.index.is_empty() {
+                            continue;
                         }
 
-                        continue;
+                        let mut first_node = Node::with_capacity(self.node_capacity);
+                        first_node.insert(value.clone());
+
+                        #[cfg(feature = "cdc")]
+                        if EMIT_CDC {
+                            let node_insertion = ChangeEvent::CreateNode {
+                                // is correct as index is locked and current thread is the only that can
+                                // fetch event_id.
+                                event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
+                                max_value: value.clone(),
+                            };
+                            cdc.push(node_insertion);
+                        }
+
+                        self.index.insert(value, Arc::new(Mutex::new(first_node)));
+
+                        return Ok((None, cdc));
                     }
                 }
             };
@@ -202,7 +218,7 @@ where
                         let node_element_insertion = ChangeEvent::InsertAt {
                             // is correct as node is locked and current thread is the only that can
                             // fetch event_id, so events for this node will have monotonic id's.
-                            event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
+                            event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: old_max.clone().unwrap_or(value.clone()),
                             value: value.clone(),
                             index: idx,
@@ -242,7 +258,7 @@ where
                         #[cfg(feature = "cdc")]
                         if EMIT_CDC {
                             for unassigned_event in value_cdc {
-                                let event_id = self.event_id.fetch_add(1, Ordering::AcqRel).into();
+                                let event_id = self.event_id.fetch_add(1, Ordering::Relaxed).into();
                                 cdc.push(unassigned_event.assign_id(event_id));
                             }
                         }
@@ -256,7 +272,7 @@ where
                         #[cfg(feature = "cdc")]
                         if EMIT_CDC {
                             for unassigned_event in value_cdc {
-                                let event_id = self.event_id.fetch_add(1, Ordering::AcqRel).into();
+                                let event_id = self.event_id.fetch_add(1, Ordering::Relaxed).into();
                                 cdc.push(unassigned_event.assign_id(event_id));
                             }
                         }
@@ -280,12 +296,12 @@ where
                         let node_removal = ChangeEvent::RemoveNode {
                             // is correct as node is locked and current thread is the only that can
                             // fetch event_id, so events for this node will have monotonic id's.
-                            event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
+                            event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: max.clone(),
                         };
                         let node_insertion = ChangeEvent::CreateNode {
                             // same as for previous.
-                            event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
+                            event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: value.clone(),
                         };
                         cdc.push(node_removal);
@@ -299,14 +315,14 @@ where
                         let node_element_removal = ChangeEvent::RemoveAt {
                             // is correct as node is locked and current thread is the only that can
                             // fetch event_id, so events for this node will have monotonic id's.
-                            event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
+                            event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: max.clone(),
                             value: value.clone(),
                             index: idx,
                         };
                         let node_element_insertion = ChangeEvent::InsertAt {
                             // same as for previous.
-                            event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
+                            event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: new_max.expect("length was checked so should be ok").clone(),
                             value: value.clone(),
                             index: idx,
@@ -317,14 +333,14 @@ where
                         let node_element_removal = ChangeEvent::RemoveAt {
                             // is correct as node is locked and current thread is the only that can
                             // fetch event_id, so events for this node will have monotonic id's.
-                            event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
+                            event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: max.clone(),
                             value: value.clone(),
                             index: idx,
                         };
                         let node_element_insertion = ChangeEvent::InsertAt {
                             // same as for previous.
-                            event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
+                            event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: max.clone(),
                             value: value.clone(),
                             index: idx,
@@ -442,7 +458,7 @@ where
                 #[cfg(feature = "cdc")]
                 if EMIT_CDC {
                     for unassigned_event in value_cdc {
-                        let event_id = self.event_id.fetch_add(1, Ordering::AcqRel).into();
+                        let event_id = self.event_id.fetch_add(1, Ordering::Relaxed).into();
                         cdc.push(unassigned_event.assign_id(event_id));
                     }
                 }
@@ -528,7 +544,7 @@ where
                     #[cfg(feature = "cdc")]
                     if EMIT_CDC {
                         let node_removal = ChangeEvent::RemoveNode {
-                            event_id: self.event_id.fetch_add(1, Ordering::AcqRel).into(),
+                            event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: old_max,
                         };
                         cdc.push(node_removal);
@@ -556,57 +572,105 @@ where
         self.remove_where_inner::<true, F>(predicate)
     }
 
-    fn locate_node<Q>(&self, value: &Q) -> Option<Arc<Mutex<Node>>>
+    #[inline(always)]
+    fn lock_node_for_value_optimistic<Q>(&self, value: &Q) -> Option<ArcMutexGuard<RawMutex, Node>>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let _global_guard = self.index_lock.read();
-        match self.index.lower_bound(std::ops::Bound::Included(value)) {
-            Some(entry) => Some(entry.value().clone()),
-            None => self
-                .index
-                .back()
-                .map(|last| last.value().clone())
-                .or_else(|| self.index.front().map(|first| first.value().clone())),
-        }
+        let node = {
+            let _global_guard = self.index_lock.read();
+            match self.index.lower_bound(std::ops::Bound::Included(value)) {
+                Some(entry) => Some(entry.value().clone()),
+                None => self
+                    .index
+                    .back()
+                    .map(|last| last.value().clone())
+                    .or_else(|| self.index.front().map(|first| first.value().clone())),
+            }
+        }?;
+        Some(node.lock_arc())
     }
 
+    /// Locates and locks the node whose structural range owns `value`.
+    ///
+    /// The common uncontended path acquires the node with `try_lock_arc` while
+    /// holding `index_lock.read()`, making both hits and misses definitive with
+    /// one structural lookup. On contention, the structural guard is released
+    /// before waiting so a long-lived node reference cannot convoy unrelated
+    /// structural writers. After repeated contention, the documented
+    /// `index_lock -> node` order is used as a bounded progress fallback.
     #[inline(always)]
     fn lock_node_for_value<Q>(&self, value: &Q) -> Option<ArcMutexGuard<RawMutex, Node>>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        Some(self.locate_node(value)?.lock_arc())
+        let mut contentions = 0;
+
+        loop {
+            let global_guard = self.index_lock.read();
+            let node = match self.index.lower_bound(std::ops::Bound::Included(value)) {
+                Some(entry) => entry.value().clone(),
+                None => self
+                    .index
+                    .back()
+                    .map(|last| last.value().clone())
+                    .or_else(|| self.index.front().map(|first| first.value().clone()))?,
+            };
+
+            if let Some(node_guard) = node.try_lock_arc() {
+                drop(global_guard);
+                return Some(node_guard);
+            }
+
+            contentions += 1;
+            if contentions >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
+                let node_guard = node.lock_arc();
+                drop(global_guard);
+                return Some(node_guard);
+            }
+
+            drop(global_guard);
+            // Wait for the observed holder without pinning the structural
+            // mapping, then retry so the returned guard always corresponds to
+            // a mapping observed under `index_lock`.
+            drop(node.lock_arc());
+        }
     }
 
-    #[cold]
-    #[inline(never)]
-    fn candidate_nodes_for_value<Q>(&self, value: &Q) -> [Option<Arc<Mutex<Node>>>; 3]
+    #[inline(always)]
+    fn get_with_guard<Q, R>(
+        node_guard: ArcMutexGuard<RawMutex, Node>,
+        value: &Q,
+        read: impl FnOnce(&T) -> R,
+    ) -> Option<R>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let _global_guard = self.index_lock.read();
-        let Some(entry) = self
-            .index
-            .lower_bound(std::ops::Bound::Included(value))
-            .or_else(|| self.index.back())
-            .or_else(|| self.index.front())
-        else {
-            return [None, None, None];
-        };
-
-        // A node maximum can be temporarily stale while its writer moves from
-        // the shared mutation phase to exclusive structural reindexing. The
-        // selected node and its two boundaries cover that transition without
-        // turning a true miss into a full index scan.
-        let current = Some(entry.value().clone());
-        let previous = entry.prev().map(|previous| previous.value().clone());
-        let next = entry.next().map(|next| next.value().clone());
-        [current, previous, next]
+        let position = node_guard.try_select(value)?;
+        node_guard.get_ith(position).map(read)
     }
+
+    #[inline(always)]
+    pub(crate) fn get_with<Q, R>(&self, value: &Q, read: impl FnOnce(&T) -> R) -> Option<R>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        Self::get_with_guard(self.lock_node_for_value(value)?, value, read)
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_with_optimistic<Q, R>(&self, value: &Q, read: impl FnOnce(&T) -> R) -> Option<R>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        Self::get_with_guard(self.lock_node_for_value_optimistic(value)?, value, read)
+    }
+
     /// Returns `true` if the set contains an element equal to the value.
     ///
     /// The value may be any borrowed form of the set's element type,
@@ -627,13 +691,8 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        if let Some(node_guard) = self.lock_node_for_value(value) {
-            if node_guard.contains(value) {
-                return true;
-            }
-        }
-
-        self.get_cloned_confirmed(value).is_some()
+        self.lock_node_for_value(value)
+            .is_some_and(|node_guard| node_guard.contains(value))
     }
     pub fn get<'a, Q>(&'a self, value: &'a Q) -> Option<Ref<T, Node>>
     where
@@ -655,52 +714,6 @@ where
         None
     }
 
-    /// Returns a cloned value from the optimistic point-lookup path.
-    #[inline(always)]
-    pub(crate) fn get_cloned<Q>(&self, value: &Q) -> Option<T>
-    where
-        T: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        let node_guard = self.lock_node_for_value(value)?;
-        let position = node_guard.try_select(value)?;
-        node_guard.get_ith(position).cloned()
-    }
-
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn get_cloned_confirmed<Q>(&self, value: &Q) -> Option<T>
-    where
-        T: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        loop {
-            let candidates = self.candidate_nodes_for_value(value);
-            candidates[0].as_ref()?;
-
-            let result = candidates.iter().flatten().find_map(|node| {
-                let node_guard = node.lock_arc();
-                node_guard
-                    .try_select(value)
-                    .and_then(|position| node_guard.get_ith(position).cloned())
-            });
-
-            let current_candidates = self.candidate_nodes_for_value(value);
-            let structurally_stable =
-                candidates
-                    .iter()
-                    .zip(current_candidates.iter())
-                    .all(|(before, after)| match (before, after) {
-                        (Some(before), Some(after)) => Arc::ptr_eq(before, after),
-                        (None, None) => true,
-                        _ => false,
-                    });
-
-            if structurally_stable {
-                return result;
-            }
-        }
-    }
     pub fn len(&self) -> usize {
         self.index.iter().map(|node| node.value().lock().len()).sum()
     }
@@ -1332,6 +1345,9 @@ where
         T: Borrow<Q>,
         R: RangeBounds<Q>,
     {
+        // Declare detached storage before the structural guard so element
+        // destructors run only after that guard is released.
+        let mut detached_nodes = Vec::new();
         let _global_guard = self.index_lock.write();
 
         let start_bound = range.start_bound();
@@ -1423,7 +1439,7 @@ where
                     // `ArcMutexGuard` owns an Arc to the node, so removing the
                     // skip-list entry cannot invalidate the guarded storage.
                     next_entry.remove();
-                    removed_node.drain(..);
+                    detached_nodes.push(std::mem::take(&mut *removed_node));
                 }
 
                 // And then trim the front from the left
@@ -1547,7 +1563,7 @@ mod tests {
                                 let _ = set.contains(&value);
                             }
                             3 => {
-                                let _ = set.get_cloned_confirmed(&value);
+                                let _ = set.get_with(&value, Clone::clone);
                             }
                             _ => {
                                 set.remove_range(value..=value);
@@ -1873,6 +1889,10 @@ mod tests {
 
     #[test]
     fn remove_range_clears_detached_nodes() {
+        // White-box geometry fixture: a failure after split/merge tuning may
+        // mean node boundaries changed rather than detached-node clearing
+        // regressed. WorkTable's persisted-index fixtures have the same
+        // geometry coupling.
         let set = BTreeSet::<u64>::with_maximum_node_size(4);
         for value in 0..32 {
             set.insert(value);
@@ -1887,28 +1907,6 @@ mod tests {
 
         assert!(detached.lock().is_empty());
         assert!(detached_values.iter().all(|value| !set.contains(value)));
-    }
-
-    #[test]
-    fn confirmed_lookup_checks_a_stale_boundary_neighbor() {
-        let set = BTreeSet::<u64>::with_maximum_node_size(4);
-        for value in 0..16 {
-            set.insert(value);
-        }
-
-        let target = 4;
-        let _global_guard = set.index_lock.write();
-        let target_entry = set.index.lower_bound(Included(&target)).unwrap();
-        let previous_entry = target_entry.prev().unwrap();
-        let previous_key = *previous_entry.key();
-        let previous_node = previous_entry.value().clone();
-        previous_entry.remove();
-        set.index.insert(target, previous_node);
-        drop(_global_guard);
-
-        assert_eq!(set.get_cloned(&target), None);
-        assert_eq!(set.get_cloned_confirmed(&target), Some(target));
-        assert_ne!(previous_key, target);
     }
 
     #[test]

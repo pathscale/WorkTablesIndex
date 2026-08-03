@@ -228,12 +228,11 @@ where
         self.set.get(key)
     }
 
-    /// Returns an owned clone using the combined select path.
+    /// Returns an owned clone from the definitive point-lookup path.
     ///
-    /// Successful hits use the optimistic one-node path. Only a miss enters a
-    /// cold path that checks the selected node and adjacent structural
-    /// boundaries, then validates that the mapping did not move while those
-    /// nodes were inspected. This API requires `V: Clone`.
+    /// The structural mapping is pinned until the selected node is locked, so
+    /// both hits and misses are authoritative. Only the value is cloned; the
+    /// key remains borrowed. This API requires `V: Clone`.
     #[inline(always)]
     pub fn lookup_for_select<Q>(&self, key: &Q) -> Option<V>
     where
@@ -241,11 +240,7 @@ where
         Q: Ord + ?Sized,
         V: Clone,
     {
-        if let Some(pair) = self.set.get_cloned(key) {
-            return Some(pair.value);
-        }
-
-        self.set.get_cloned_confirmed(key).map(|pair| pair.value)
+        self.set.get_with(key, |pair| pair.value.clone())
     }
 
     /// Returns an owned clone from the optimistic one-node lookup only.
@@ -260,23 +255,7 @@ where
         Q: Ord + ?Sized,
         V: Clone,
     {
-        self.set.get_cloned(key).map(|pair| pair.value)
-    }
-
-    /// Returns an owned clone from the cold structurally validated path.
-    ///
-    /// This compatibility primitive skips the optimistic probe. New select
-    /// call sites should use [`BTreeMap::lookup_for_select`], which combines the
-    /// unchanged successful-hit path with this confirmation algorithm.
-    #[cold]
-    #[inline(never)]
-    pub fn confirm_lookup_for_select<Q>(&self, key: &Q) -> Option<V>
-    where
-        Pair<K, V>: Borrow<Q> + Ord,
-        Q: Ord + ?Sized,
-        V: Clone,
-    {
-        self.set.get_cloned_confirmed(key).map(|pair| pair.value)
+        self.set.get_with_optimistic(key, |pair| pair.value.clone())
     }
 
     /// Inserts a key-value pair into the map.

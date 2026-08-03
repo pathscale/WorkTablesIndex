@@ -9,11 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Added `custom-binary-search` so exact-pin consumers can select the original branch-based search even when another dependency enables the default search feature
+- Added definitive and explicitly optimistic owned point-lookup APIs for concurrent maps
 - Added `is_empty` to the concurrent `BTreeSet`, `BTreeMap`, and `BTreeMultiMap`
 - Added support for custom `BTreeMultiMap` pair representations through `MultiPairLike`, while keeping `RandomMultiPair` as the default and providing `OrdMultiPair` for ordered values and faster exact removals
 
 ### Fixed
-- Kept the custom binary search's bounds invariant explicit without changing its optimized pointer-loop shape
+- Concurrent point reads now pin the structural mapping until the selected node is locked, preventing false misses during node splits without penalizing ordinary negative lookups
+- Concurrent first writers now publish one root under a bounded exclusive-lock path without speculative full-node allocations
+- Detached range-removal nodes are emptied immediately while element destruction is deferred until after the structural write guard is released
+- Search implementation selection and its precedence test now share one cfg block per backend
 - CDC event IDs are now assigned only after operations commit, keeping them monotonic and free of gaps during concurrent operations
 - `Pair` hashing now matches its key-only equality semantics
 - Inserting an existing key during a concurrent node split now correctly replaces the old value

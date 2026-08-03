@@ -37,6 +37,12 @@ The following table describes the variants of this data structure that are avail
 
 The `wt-slice` hybrid is the default balanced option across cheap numeric keys and expensive comparisons. The original custom early-exit search remains available by disabling default features and enabling no other search feature, or explicitly through `custom-binary-search`. If multiple search features are enabled, precedence is `custom-binary-search`, `std-binary-search`, `wt-slice-binary-search`, then `superslice-binary-search`.
 
+Cargo features are unified across the dependency graph. Consequently,
+`custom-binary-search` is an intentional tree-wide override: enabling it in
+any direct or transitive dependency selects the custom implementation for
+every `WorkTablesIndex` instantiation in that build, even when another
+dependency enables a lower-precedence search feature.
+
 # Background
 
 This was heavily inspired by [`indexmap`](https://crates.io/crates/indexmap), and
