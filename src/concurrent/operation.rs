@@ -21,7 +21,9 @@ where
     T: Debug + Ord + Send + Clone + 'static,
     Node: NodeLike<T> + Send + 'static,
 {
-    pub fn commit(
+    // `EMIT_CDC` is a compile-time switch so event construction disappears
+    // from ordinary insert and remove monomorphizations.
+    pub fn commit<const EMIT_CDC: bool>(
         self,
         index: &SkipMap<T, Arc<Mutex<Node>>>,
     ) -> Result<(Option<T>, Vec<ChangeEventUnassigned<T>>), ()> {
@@ -32,17 +34,15 @@ where
                     if Arc::ptr_eq(entry.value(), &old_node) {
                         let mut cdc = vec![];
                         #[cfg(feature = "cdc")]
-                        let max_value = guard
-                            .max()
-                            .expect("node should be non empty if split")
-                            .clone();
+                        let max_value =
+                            EMIT_CDC.then(|| guard.max().expect("node should be non empty if split").clone());
                         entry.remove();
                         let mut new_vec = guard.halve();
 
                         #[cfg(feature = "cdc")]
-                        {
+                        if EMIT_CDC {
                             let node_split = ChangeEventUnassigned::SplitNode {
-                                max_value,
+                                max_value: max_value.expect("captured when CDC emission is enabled"),
                                 split_index: guard.len(),
                             };
                             cdc.push(node_split);
@@ -51,13 +51,13 @@ where
                         let mut old_value: Option<T> = None;
                         let mut insert_attempted = false;
                         if let Some(max) = guard.max().cloned() {
-                            if max > value {
+                            if max >= value {
                                 let (inserted, idx) = NodeLike::insert(&mut *guard, value.clone());
                                 insert_attempted = true;
                                 if !inserted {
                                     old_value = NodeLike::replace(&mut *guard, idx, value.clone());
                                     #[cfg(feature = "cdc")]
-                                    {
+                                    if EMIT_CDC {
                                         let value_insertion = ChangeEventUnassigned::RemoveAt {
                                             max_value: max.clone(),
                                             index: idx,
@@ -67,7 +67,7 @@ where
                                     }
                                 }
                                 #[cfg(feature = "cdc")]
-                                {
+                                if EMIT_CDC {
                                     let value_insertion = ChangeEventUnassigned::InsertAt {
                                         max_value: max.clone(),
                                         index: idx,
@@ -91,7 +91,7 @@ where
                                 } else {
                                     old_value = NodeLike::replace(&mut new_vec, idx, value.clone());
                                     #[cfg(feature = "cdc")]
-                                    {
+                                    if EMIT_CDC {
                                         let value_insertion = ChangeEventUnassigned::RemoveAt {
                                             max_value: old_max.clone(),
                                             index: idx,
@@ -101,7 +101,7 @@ where
                                     }
                                 }
                                 #[cfg(feature = "cdc")]
-                                {
+                                if EMIT_CDC {
                                     let value_insertion = ChangeEventUnassigned::InsertAt {
                                         max_value: old_max.clone(),
                                         index: idx,
@@ -160,7 +160,7 @@ where
                                 let mut cdc = vec![];
 
                                 #[cfg(feature = "cdc")]
-                                {
+                                if EMIT_CDC {
                                     let node_removal = ChangeEventUnassigned::RemoveNode {
                                         max_value: old_max.clone(),
                                     };

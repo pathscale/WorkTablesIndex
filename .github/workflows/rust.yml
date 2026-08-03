@@ -23,7 +23,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: "true"
-      - name: Build (all features, all targets)
+      - name: Build (custom binary search, all targets)
+        run: cargo build --all-targets --features "serde concurrent cdc multimap"
+      - name: Build (superslice binary search, all targets)
+        run: cargo build --all-targets --features "serde concurrent cdc multimap superslice-binary-search"
+      - name: Build (wt-slice hybrid binary search, all targets)
+        run: cargo build --all-targets --features "serde concurrent cdc multimap wt-slice-binary-search"
+      - name: Build (std binary search, all features, all targets)
         run: cargo build --all-targets --all-features
       # Doctests are excluded on purpose: upstream doc examples import
       # `indexset::...`, which is correct for consumers (they alias the
@@ -33,10 +39,35 @@ jobs:
       # concurrent structures - so they are reserved for the manually
       # triggered full-suite workflow (heavy.yml), per repo policy: tests
       # that take too long do not run in automatic CI.
-      - name: Test (fast tier, all features)
+      - name: Test (fast tier, custom binary search)
+        run: >
+          cargo test --features "serde concurrent cdc multimap" --lib --tests --
+          --skip test_concurrent_insert
+          --skip test_concurrent_multimap_remove_reinsert_stress
+          --skip test_remove_stress
+          --skip parallel_iter_and_mut
+          --skip test_concurrent_cdc_no_gaps
+      - name: Test (fast tier, superslice binary search)
+        run: >
+          cargo test --features "serde concurrent cdc multimap superslice-binary-search" --lib --tests --
+          --skip test_concurrent_insert
+          --skip test_concurrent_multimap_remove_reinsert_stress
+          --skip test_remove_stress
+          --skip parallel_iter_and_mut
+          --skip test_concurrent_cdc_no_gaps
+      - name: Test (fast tier, wt-slice hybrid binary search)
+        run: >
+          cargo test --features "serde concurrent cdc multimap wt-slice-binary-search" --lib --tests --
+          --skip test_concurrent_insert
+          --skip test_concurrent_multimap_remove_reinsert_stress
+          --skip test_remove_stress
+          --skip parallel_iter_and_mut
+          --skip test_concurrent_cdc_no_gaps
+      - name: Test (fast tier, std binary search and all features)
         run: >
           cargo test --all-features --lib --tests --
           --skip test_concurrent_insert
+          --skip test_concurrent_multimap_remove_reinsert_stress
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
@@ -51,5 +82,11 @@ jobs:
           cache-on-failure: "true"
       # The frozen allow-list for inherited upstream code lives in
       # Cargo.toml's [lints] tables; everything else is denied.
-      - name: Clippy (deny new warnings)
+      - name: Clippy (custom binary search, deny new warnings)
+        run: cargo clippy --all-targets --features "serde concurrent cdc multimap" -- -D warnings
+      - name: Clippy (superslice binary search, deny new warnings)
+        run: cargo clippy --all-targets --features "serde concurrent cdc multimap superslice-binary-search" -- -D warnings
+      - name: Clippy (wt-slice hybrid binary search, deny new warnings)
+        run: cargo clippy --all-targets --features "serde concurrent cdc multimap wt-slice-binary-search" -- -D warnings
+      - name: Clippy (std binary search and all features, deny new warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
