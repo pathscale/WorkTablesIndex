@@ -1,6 +1,6 @@
 [package]
 name = "WorkTablesIndex"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 documentation = "https://docs.rs/WorkTablesIndex/"
 repository = "https://github.com/pathscale/WorkTablesIndex"
@@ -27,7 +27,7 @@ crossbeam-utils = { version = "0.8.20", optional = true }
 crossbeam-skiplist = { version = "0.1.3", optional = true }
 fastrand = { version = "2.3.0", optional = true }
 superslice = { version = "=1.0.0", optional = true }
-wt-slice = { git = "https://github.com/pathscale/wt-slice", rev = "2f26a575973729d7a8f5c8cc7e321a4ecbcc7ca4", optional = true }
+wt-slice = { version = "=0.1.0", optional = true }
 
 [features]
 serde = ["dep:serde"]
