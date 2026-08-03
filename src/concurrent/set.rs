@@ -583,25 +583,29 @@ where
 
     #[cold]
     #[inline(never)]
-    fn lock_node_for_value_confirmed<Q>(&self, value: &Q) -> Option<(Arc<Mutex<Node>>, ArcMutexGuard<RawMutex, Node>)>
+    fn candidate_nodes_for_value<Q>(&self, value: &Q) -> [Option<Arc<Mutex<Node>>>; 3]
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let node = {
-            let _global_guard = self.index_lock.read();
-            match self.index.lower_bound(std::ops::Bound::Included(value)) {
-                Some(entry) => Some(entry.value().clone()),
-                None => self
-                    .index
-                    .back()
-                    .map(|last| last.value().clone())
-                    .or_else(|| self.index.front().map(|first| first.value().clone())),
-            }
-        }?;
+        let _global_guard = self.index_lock.read();
+        let Some(entry) = self
+            .index
+            .lower_bound(std::ops::Bound::Included(value))
+            .or_else(|| self.index.back())
+            .or_else(|| self.index.front())
+        else {
+            return [None, None, None];
+        };
 
-        let node_guard = node.clone().lock_arc();
-        Some((node, node_guard))
+        // A node maximum can be temporarily stale while its writer moves from
+        // the shared mutation phase to exclusive structural reindexing. The
+        // selected node and its two boundaries cover that transition without
+        // turning a true miss into a full index scan.
+        let current = Some(entry.value().clone());
+        let previous = entry.prev().map(|previous| previous.value().clone());
+        let next = entry.next().map(|next| next.value().clone());
+        [current, previous, next]
     }
     /// Returns `true` if the set contains an element equal to the value.
     ///
@@ -671,18 +675,28 @@ where
         Q: Ord + ?Sized,
     {
         loop {
-            let (node, node_guard) = self.lock_node_for_value_confirmed(value)?;
-            let result = node_guard
-                .try_select(value)
-                .and_then(|position| node_guard.get_ith(position).cloned());
-            drop(node_guard);
+            let candidates = self.candidate_nodes_for_value(value);
+            candidates[0].as_ref()?;
 
-            let current_node = self.locate_node(value);
-            let still_current = current_node
-                .as_ref()
-                .is_some_and(|current_node| Arc::ptr_eq(current_node, &node));
+            let result = candidates.iter().flatten().find_map(|node| {
+                let node_guard = node.lock_arc();
+                node_guard
+                    .try_select(value)
+                    .and_then(|position| node_guard.get_ith(position).cloned())
+            });
 
-            if still_current {
+            let current_candidates = self.candidate_nodes_for_value(value);
+            let structurally_stable =
+                candidates
+                    .iter()
+                    .zip(current_candidates.iter())
+                    .all(|(before, after)| match (before, after) {
+                        (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+                        (None, None) => true,
+                        _ => false,
+                    });
+
+            if structurally_stable {
                 return result;
             }
         }
@@ -1873,6 +1887,28 @@ mod tests {
 
         assert!(detached.lock().is_empty());
         assert!(detached_values.iter().all(|value| !set.contains(value)));
+    }
+
+    #[test]
+    fn confirmed_lookup_checks_a_stale_boundary_neighbor() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        for value in 0..16 {
+            set.insert(value);
+        }
+
+        let target = 4;
+        let _global_guard = set.index_lock.write();
+        let target_entry = set.index.lower_bound(Included(&target)).unwrap();
+        let previous_entry = target_entry.prev().unwrap();
+        let previous_key = *previous_entry.key();
+        let previous_node = previous_entry.value().clone();
+        previous_entry.remove();
+        set.index.insert(target, previous_node);
+        drop(_global_guard);
+
+        assert_eq!(set.get_cloned(&target), None);
+        assert_eq!(set.get_cloned_confirmed(&target), Some(target));
+        assert_ne!(previous_key, target);
     }
 
     #[test]

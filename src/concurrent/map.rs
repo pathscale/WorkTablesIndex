@@ -228,13 +228,33 @@ where
         self.set.get(key)
     }
 
-    /// Returns an owned clone of the value from the optimistic point-lookup
-    /// path.
+    /// Returns an owned clone using the combined select path.
     ///
-    /// This API requires `V: Clone`. Call [`BTreeMap::get`] instead when a
-    /// guard-backed reference is sufficient and cloning is undesirable.
-    #[inline(never)]
+    /// Successful hits use the optimistic one-node path. Only a miss enters a
+    /// cold path that checks the selected node and adjacent structural
+    /// boundaries, then validates that the mapping did not move while those
+    /// nodes were inspected. This API requires `V: Clone`.
+    #[inline(always)]
     pub fn lookup_for_select<Q>(&self, key: &Q) -> Option<V>
+    where
+        Pair<K, V>: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+        V: Clone,
+    {
+        if let Some(pair) = self.set.get_cloned(key) {
+            return Some(pair.value);
+        }
+
+        self.set.get_cloned_confirmed(key).map(|pair| pair.value)
+    }
+
+    /// Returns an owned clone from the optimistic one-node lookup only.
+    ///
+    /// This is an explicit latency-first primitive for callers that can accept
+    /// a transient false miss during concurrent structural reindexing. Most
+    /// callers should use [`BTreeMap::lookup_for_select`].
+    #[inline(always)]
+    pub fn lookup_for_select_optimistic<Q>(&self, key: &Q) -> Option<V>
     where
         Pair<K, V>: Borrow<Q> + Ord,
         Q: Ord + ?Sized,
@@ -243,13 +263,11 @@ where
         self.set.get_cloned(key).map(|pair| pair.value)
     }
 
-    /// Returns an owned clone after confirming a select miss against a stable
-    /// structural mapping.
+    /// Returns an owned clone from the cold structurally validated path.
     ///
-    /// This cold-path API requires `V: Clone`. It releases the node lock before
-    /// validating the selected node Arc under the structural read lock and
-    /// retries if the mapping moved. Call [`BTreeMap::get`] when a guard-backed
-    /// reference is sufficient and cloning is undesirable.
+    /// This compatibility primitive skips the optimistic probe. New select
+    /// call sites should use [`BTreeMap::lookup_for_select`], which combines the
+    /// unchanged successful-hit path with this confirmation algorithm.
     #[cold]
     #[inline(never)]
     pub fn confirm_lookup_for_select<Q>(&self, key: &Q) -> Option<V>
