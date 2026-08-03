@@ -123,7 +123,17 @@ where
             .find(|pair| pair.key == *key && pair.value == *value)
             .cloned();
 
-        pair_to_remove.and_then(|pair| set.remove(&pair).map(Into::into))
+        if let Some(pair_to_remove) = pair_to_remove {
+            if let Some(removed) = set.remove(&pair_to_remove) {
+                return Some(removed.into());
+            }
+
+            return set
+                .remove_where(|pair| pair.key == *key && pair.value == *value)
+                .map(Into::into);
+        }
+
+        None
     }
 
     fn remove_cdc_from<Node>(
@@ -142,6 +152,12 @@ where
 
         if let Some(pair_to_remove) = pair_to_remove {
             let (res, evs) = set.remove_cdc(&pair_to_remove);
+            if res.is_some() {
+                return (res.map(Into::into), evs);
+            }
+
+            let (res, evs) =
+                set.remove_where_cdc(|pair| pair.key == *key && pair.value == *value);
             return (res.map(Into::into), evs);
         }
 

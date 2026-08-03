@@ -533,6 +533,9 @@ mod tests {
     use std::borrow::Borrow;
     use std::fmt::Debug;
     use std::ops::Bound::{Excluded, Unbounded};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn test_insert_works_as_expected() {
@@ -584,6 +587,71 @@ mod tests {
         let all_ranged_pairs = map.range(1..2).map(|(k, v)| (*k, *v)).collect::<BTreeSet<_>>();
         assert_eq!(all_ranged_pairs, all_expected_pairs);
         assert!(map.range(1..1).next().is_none());
+    }
+
+    fn assert_concurrent_remove_reinsert_preserves_exact_pairs(
+        records: usize,
+        buckets: usize,
+        threads: usize,
+        operations: usize,
+    ) {
+        let map = Arc::new(BTreeMultiMap::<usize, usize>::new());
+        let expected = Arc::new(
+            (0..records)
+                .map(|id| AtomicUsize::new(id % buckets))
+                .collect::<Vec<_>>(),
+        );
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+
+        for id in 0..records {
+            map.insert(id % buckets, id);
+        }
+
+        for worker in 0..threads {
+            let map = Arc::clone(&map);
+            let expected = Arc::clone(&expected);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                let owned = (worker..records).step_by(threads).collect::<Vec<_>>();
+                let worker_operations =
+                    operations / threads + usize::from(worker < operations % threads);
+                start.wait();
+
+                for sequence in 0..worker_operations {
+                    let id = owned[sequence % owned.len()];
+                    let old_bucket = expected[id].load(Ordering::Relaxed);
+                    let new_bucket = (old_bucket + 1) % buckets;
+
+                    assert_eq!(map.remove(&old_bucket, &id), Some((old_bucket, id)));
+                    assert_eq!(map.insert(new_bucket, id), None);
+                    expected[id].store(new_bucket, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut occurrences = vec![0usize; records];
+        for (bucket, id) in map.iter() {
+            assert_eq!(*bucket, expected[*id].load(Ordering::Relaxed));
+            occurrences[*id] += 1;
+        }
+
+        assert_eq!(map.len(), records);
+        assert!(occurrences.into_iter().all(|count| count == 1));
+    }
+
+    #[test]
+    fn test_concurrent_remove_reinsert_preserves_exact_pairs() {
+        assert_concurrent_remove_reinsert_preserves_exact_pairs(1_000, 16, 16, 10_000);
+    }
+
+    #[test]
+    fn test_concurrent_multimap_remove_reinsert_stress() {
+        assert_concurrent_remove_reinsert_preserves_exact_pairs(1_000, 16, 32, 100_000);
     }
 
     #[test]
