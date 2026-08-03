@@ -29,7 +29,9 @@ jobs:
         run: cargo build --no-default-features --all-targets --features "serde concurrent cdc multimap superslice-binary-search"
       - name: Build (default wt-slice hybrid binary search, all targets)
         run: cargo build --all-targets --features "serde concurrent cdc multimap"
-      - name: Build (std binary search, all features, all targets)
+      - name: Build (std binary search, all targets)
+        run: cargo build --no-default-features --all-targets --features "serde concurrent cdc multimap std-binary-search"
+      - name: Build (explicit custom override, all features, all targets)
         run: cargo build --all-targets --all-features
       # Doctests are excluded on purpose: upstream doc examples import
       # `indexset::...`, which is correct for consumers (they alias the
@@ -63,7 +65,15 @@ jobs:
           --skip test_remove_stress
           --skip parallel_iter_and_mut
           --skip test_concurrent_cdc_no_gaps
-      - name: Test (fast tier, std binary search and all features)
+      - name: Test (fast tier, std binary search)
+        run: >
+          cargo test --no-default-features --features "serde concurrent cdc multimap std-binary-search" --lib --tests --
+          --skip test_concurrent_insert
+          --skip test_concurrent_multimap_remove_reinsert_stress
+          --skip test_remove_stress
+          --skip parallel_iter_and_mut
+          --skip test_concurrent_cdc_no_gaps
+      - name: Test (fast tier, explicit custom override and all features)
         run: >
           cargo test --all-features --lib --tests --
           --skip test_concurrent_insert
@@ -88,5 +98,7 @@ jobs:
         run: cargo clippy --no-default-features --all-targets --features "serde concurrent cdc multimap superslice-binary-search" -- -D warnings
       - name: Clippy (default wt-slice hybrid binary search, deny new warnings)
         run: cargo clippy --all-targets --features "serde concurrent cdc multimap" -- -D warnings
-      - name: Clippy (std binary search and all features, deny new warnings)
+      - name: Clippy (std binary search, deny new warnings)
+        run: cargo clippy --no-default-features --all-targets --features "serde concurrent cdc multimap std-binary-search" -- -D warnings
+      - name: Clippy (explicit custom override and all features, deny new warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings

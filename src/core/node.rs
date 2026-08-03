@@ -1,17 +1,27 @@
 use core::borrow::Borrow;
-#[cfg(not(any(
-    feature = "std-binary-search",
-    feature = "superslice-binary-search",
-    feature = "wt-slice-binary-search"
-)))]
+#[cfg(any(
+    feature = "custom-binary-search",
+    not(any(
+        feature = "std-binary-search",
+        feature = "superslice-binary-search",
+        feature = "wt-slice-binary-search"
+    ))
+))]
 use core::cmp::Ordering;
 use std::ops::Deref;
 #[cfg(all(
     feature = "superslice-binary-search",
-    not(any(feature = "std-binary-search", feature = "wt-slice-binary-search"))
+    not(any(
+        feature = "custom-binary-search",
+        feature = "std-binary-search",
+        feature = "wt-slice-binary-search"
+    ))
 ))]
 use superslice::Ext;
-#[cfg(all(feature = "wt-slice-binary-search", not(feature = "std-binary-search")))]
+#[cfg(all(
+    feature = "wt-slice-binary-search",
+    not(any(feature = "custom-binary-search", feature = "std-binary-search"))
+))]
 use wt_slice::ExactSearch;
 
 pub trait NodeLike<T: Ord> {
@@ -62,7 +72,7 @@ pub trait NodeLike<T: Ord> {
 }
 
 #[inline]
-#[cfg(feature = "std-binary-search")]
+#[cfg(all(feature = "std-binary-search", not(feature = "custom-binary-search")))]
 fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
 where
     T: Borrow<Q> + Ord,
@@ -72,8 +82,14 @@ where
 }
 
 #[inline]
-#[cfg(all(feature = "superslice-binary-search", not(feature = "std-binary-search")))]
-#[cfg(not(feature = "wt-slice-binary-search"))]
+#[cfg(all(
+    feature = "superslice-binary-search",
+    not(any(
+        feature = "custom-binary-search",
+        feature = "std-binary-search",
+        feature = "wt-slice-binary-search"
+    ))
+))]
 fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
 where
     T: Borrow<Q> + Ord,
@@ -87,7 +103,10 @@ where
 }
 
 #[inline]
-#[cfg(all(feature = "wt-slice-binary-search", not(feature = "std-binary-search")))]
+#[cfg(all(
+    feature = "wt-slice-binary-search",
+    not(any(feature = "custom-binary-search", feature = "std-binary-search"))
+))]
 fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
 where
     T: Borrow<Q> + Ord,
@@ -97,11 +116,14 @@ where
 }
 
 #[inline]
-#[cfg(not(any(
-    feature = "std-binary-search",
-    feature = "superslice-binary-search",
-    feature = "wt-slice-binary-search"
-)))]
+#[cfg(any(
+    feature = "custom-binary-search",
+    not(any(
+        feature = "std-binary-search",
+        feature = "superslice-binary-search",
+        feature = "wt-slice-binary-search"
+    ))
+))]
 fn search<Q, T>(haystack: &[T], needle: &Q) -> Result<usize, usize>
 where
     T: Borrow<Q> + Ord,
@@ -110,12 +132,13 @@ where
     let mut j = haystack.len();
     let mut i = 0;
     let mut m = j >> 1;
+    let pointer = haystack.as_ptr();
 
     while i != j {
         debug_assert!(i <= m && m < j && j <= haystack.len());
         // SAFETY: initialization establishes `i <= m < j <= haystack.len()`
         // for a non-empty range, and both branches preserve that invariant.
-        let candidate = unsafe { haystack.get_unchecked(m) };
+        let candidate = unsafe { &*pointer.add(m) };
         match candidate.borrow().cmp(needle) {
             Ordering::Equal => return Ok(m),
             Ordering::Less => {
