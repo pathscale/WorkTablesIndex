@@ -3,6 +3,7 @@ use crossbeam_skiplist::SkipSet;
 use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 use scc::TreeIndex;
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use WorkTablesIndex::concurrent::multimap::{BTreeMultiMap, OrderedBTreeMultiMap};
@@ -23,6 +24,8 @@ const MULTIMAP_REMOVE_SEED: u64 = 42;
 const IS_EMPTY_ENTRIES: usize = 100_000;
 const POINT_LOOKUP_QUERIES: usize = 65_536;
 const POINT_LOOKUP_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+static RUNTIME_CONCURRENT_MODE: AtomicBool = AtomicBool::new(false);
+static ACTIVE_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
 
 // fn generate_operations(write_ratio: f64) -> Vec<Vec<Op>> {
 //     let mut rng = thread_rng();
@@ -210,6 +213,57 @@ fn bench_contains(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_map_select(c: &mut Criterion) {
+    let map = WorkTablesIndex::concurrent::map::BTreeMap::<usize, usize>::new();
+    for value in 0..IS_EMPTY_ENTRIES {
+        map.insert(value, value);
+    }
+
+    let present = IS_EMPTY_ENTRIES / 2;
+    let absent = IS_EMPTY_ENTRIES;
+    let mut group = c.benchmark_group("ConcurrentBTreeMap lookup_for_select");
+    group.bench_function("present", |b| {
+        b.iter(|| black_box(map.lookup_for_select(black_box(&present))))
+    });
+    group.bench_function("absent", |b| {
+        b.iter(|| black_box(map.lookup_for_select(black_box(&absent))))
+    });
+    group.finish();
+}
+
+fn bench_runtime_read_policy(c: &mut Criterion) {
+    let map = WorkTablesIndex::concurrent::map::BTreeMap::<usize, usize>::new();
+    for value in 0..IS_EMPTY_ENTRIES {
+        map.insert(value, value);
+    }
+    let present = IS_EMPTY_ENTRIES / 2;
+    RUNTIME_CONCURRENT_MODE.store(false, Ordering::Relaxed);
+
+    let mut group = c.benchmark_group("ConcurrentBTreeMap runtime read policy/present");
+    group.bench_function("compile-time optimistic", |b| {
+        b.iter(|| black_box(map.lookup_for_select_optimistic(black_box(&present))))
+    });
+    group.bench_function("predictable atomic branch", |b| {
+        b.iter(|| {
+            let value = if RUNTIME_CONCURRENT_MODE.load(Ordering::Relaxed) {
+                map.lookup_for_select(black_box(&present))
+            } else {
+                map.lookup_for_select_optimistic(black_box(&present))
+            };
+            black_box(value)
+        })
+    });
+    group.bench_function("active-operation counter", |b| {
+        b.iter(|| {
+            ACTIVE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+            let value = map.lookup_for_select_optimistic(black_box(&present));
+            ACTIVE_LOOKUPS.fetch_sub(1, Ordering::Relaxed);
+            black_box(value)
+        })
+    });
+    group.finish();
+}
+
 fn randomized_point_lookups(hit_ratio: usize) -> Vec<usize> {
     let mut rng = StdRng::seed_from_u64(POINT_LOOKUP_SEED ^ hit_ratio as u64);
     (0..POINT_LOOKUP_QUERIES)
@@ -360,6 +414,8 @@ criterion_group!(
     bench_concurrent_btreeset,
     bench_is_empty,
     bench_contains,
+    bench_map_select,
+    bench_runtime_read_policy,
     bench_randomized_contains,
     bench_map_update,
     bench_multimap_removal
