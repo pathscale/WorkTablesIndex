@@ -21,10 +21,10 @@ jobs:
         with:
           cache-on-failure: "true"
       - name: Full test suite (custom binary search, including stress tests)
-        run: cargo test --features "serde concurrent cdc multimap" --lib --tests
+        run: cargo test --no-default-features --features "serde concurrent cdc multimap" --lib --tests
       - name: Full test suite (superslice binary search, including stress tests)
-        run: cargo test --features "serde concurrent cdc multimap superslice-binary-search" --lib --tests
-      - name: Full test suite (wt-slice hybrid binary search, including stress tests)
-        run: cargo test --features "serde concurrent cdc multimap wt-slice-binary-search" --lib --tests
+        run: cargo test --no-default-features --features "serde concurrent cdc multimap superslice-binary-search" --lib --tests
+      - name: Full test suite (default wt-slice hybrid binary search, including stress tests)
+        run: cargo test --features "serde concurrent cdc multimap" --lib --tests
       - name: Full test suite (std binary search and all features, including stress tests)
         run: cargo test --all-features --lib --tests

@@ -1,6 +1,6 @@
 [package]
 name = "WorkTablesIndex"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 documentation = "https://docs.rs/WorkTablesIndex/"
 repository = "https://github.com/pathscale/WorkTablesIndex"
@@ -30,6 +30,7 @@ superslice = { version = "=1.0.0", optional = true }
 wt-slice = { version = "=0.1.0", optional = true }
 
 [features]
+default = ["wt-slice-binary-search"]
 serde = ["dep:serde"]
 concurrent = [
     "dep:crossbeam-utils",
