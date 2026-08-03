@@ -1,12 +1,19 @@
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::{borrow::Borrow, iter::FusedIterator, ops::{Bound, RangeBounds}};
+use std::{
+    borrow::Borrow,
+    iter::FusedIterator,
+    ops::{Bound, RangeBounds},
+};
 
 use parking_lot::Mutex;
 
 use crate::core::node::NodeLike;
-use crate::{cdc::change::ChangeEvent, core::multipair::{MultiPair, MultiPairLike, MultiPairRemoveHelper, OrdMultiPair}};
+use crate::{
+    cdc::change::ChangeEvent,
+    core::multipair::{MultiPair, MultiPairLike, MultiPairRemoveHelper, OrdMultiPair},
+};
 
 use super::set::BTreeSet;
 
@@ -327,9 +334,7 @@ where
         M: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        self.set
-            .remove(key)
-            .map(Into::into)
+        self.set.remove(key).map(Into::into)
     }
     /// Removes some key from the map that matches the given key, returning the
     /// key and the value if the key was previously in the map with
@@ -518,11 +523,7 @@ where
     /// value if the key was previously in the map with [`ChangeEvent`]'s
     /// describing this `remove_some` action.
     #[cfg(feature = "cdc")]
-    pub fn remove_cdc(
-        &self,
-        key: &K,
-        value: &V,
-    ) -> (Option<(K, V)>, Vec<ChangeEvent<M>>) {
+    pub fn remove_cdc(&self, key: &K, value: &V) -> (Option<(K, V)>, Vec<ChangeEvent<M>>) {
         M::remove_cdc_from(&self.set, key, value)
     }
 }
@@ -616,8 +617,7 @@ mod tests {
             let start = Arc::clone(&start);
             handles.push(thread::spawn(move || {
                 let owned = (worker..records).step_by(threads).collect::<Vec<_>>();
-                let worker_operations =
-                    operations / threads + usize::from(worker < operations % threads);
+                let worker_operations = operations / threads + usize::from(worker < operations % threads);
                 start.wait();
 
                 for sequence in 0..worker_operations {
@@ -681,9 +681,7 @@ mod tests {
         M: MultiPairLike<usize, &'static str> + Borrow<usize> + Debug + Clone + Send + 'static,
     {
         let maximum_node_size = 3;
-        let map = BTreeMultiMap::<usize, &'static str, Vec<M>, M>::with_maximum_node_size(
-            maximum_node_size,
-        );
+        let map = BTreeMultiMap::<usize, &'static str, Vec<M>, M>::with_maximum_node_size(maximum_node_size);
 
         map.insert(1usize, "a");
         map.insert(1usize, "b");
@@ -708,7 +706,7 @@ mod tests {
             reverse_range,
             vec![(&3, &"e"), (&2, &"d"), (&2, &"c"), (&1, &"b"), (&1, &"a"),]
                 .into_iter()
-            .collect::<BTreeSet<_>>()
+                .collect::<BTreeSet<_>>()
         );
 
         let empty_range = map.range(5..).collect::<BTreeSet<_>>();
@@ -759,9 +757,7 @@ mod tests {
         M: MultiPairLike<usize, &'static str> + Borrow<usize> + Debug + Clone + Send + 'static,
     {
         let maximum_node_size = 10;
-        let map = BTreeMultiMap::<usize, &'static str, Vec<M>, M>::with_maximum_node_size(
-            maximum_node_size,
-        );
+        let map = BTreeMultiMap::<usize, &'static str, Vec<M>, M>::with_maximum_node_size(maximum_node_size);
 
         map.insert(1usize, "a");
         map.insert(1usize, "b");
