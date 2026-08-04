@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 use std::{borrow::Borrow, iter::FusedIterator, ops::RangeBounds};
 
@@ -7,6 +7,54 @@ use parking_lot::Mutex;
 use super::set::BTreeSet;
 use crate::core::node::NodeLike;
 use crate::{cdc::change::ChangeEvent, core::pair::Pair};
+
+/// Pointer-free node layout used by background checkpointing.
+///
+/// The snapshot preserves node boundaries without retaining locks, pointers,
+/// or allocator state. It is intended for quiescent or externally sequenced
+/// capture; ordinary point reads and mutations do not touch it.
+#[cfg(feature = "cdc")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Topology<T> {
+    pub node_capacity: usize,
+    pub nodes: Vec<Vec<T>>,
+}
+
+/// A pointer-free topology cannot be attached without violating B-tree node
+/// ordering or capacity invariants.
+#[cfg(feature = "cdc")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TopologyError {
+    ZeroNodeCapacity,
+    EmptyNode { index: usize },
+    OversizedNode { index: usize, len: usize, capacity: usize },
+    UnsortedNode { index: usize },
+    OverlappingNodes { left: usize, right: usize },
+}
+
+#[cfg(feature = "cdc")]
+impl Display for TopologyError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroNodeCapacity => formatter.write_str("topology node capacity must be non-zero"),
+            Self::EmptyNode { index } => write!(formatter, "topology node {index} is empty"),
+            Self::OversizedNode { index, len, capacity } => write!(
+                formatter,
+                "topology node {index} has {len} entries but capacity is {capacity}"
+            ),
+            Self::UnsortedNode { index } => write!(formatter, "topology node {index} is not strictly ordered"),
+            Self::OverlappingNodes { left, right } => {
+                write!(
+                    formatter,
+                    "topology nodes {left} and {right} overlap or are out of order"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cdc")]
+impl std::error::Error for TopologyError {}
 
 #[derive(Debug)]
 pub struct BTreeMap<K, V, Node = Vec<Pair<K, V>>>
@@ -178,6 +226,63 @@ where
     #[cfg(feature = "cdc")]
     pub fn iter_nodes(&self) -> impl Iterator<Item = Arc<Mutex<Node>>> + '_ {
         self.set.index.iter().map(|e| e.value().clone())
+    }
+
+    /// Copies the exact node boundaries into a pointer-free checkpoint image.
+    ///
+    /// Callers that need a single logical generation must externally prevent
+    /// mutations for the duration of this method, or snapshot a temporary
+    /// index reconstructed from an ordered redo log.
+    #[cfg(feature = "cdc")]
+    pub fn export_topology(&self) -> Topology<Pair<K, V>> {
+        let (node_capacity, nodes) = self.set.export_topology();
+        Topology { node_capacity, nodes }
+    }
+
+    /// Reconstructs a B-tree from a validated pointer-free topology image.
+    #[cfg(feature = "cdc")]
+    pub fn from_topology(topology: Topology<Pair<K, V>>) -> Result<Self, TopologyError> {
+        if topology.node_capacity == 0 {
+            return Err(TopologyError::ZeroNodeCapacity);
+        }
+
+        for (index, node) in topology.nodes.iter().enumerate() {
+            if node.is_empty() {
+                return Err(TopologyError::EmptyNode { index });
+            }
+            if node.len() > topology.node_capacity {
+                return Err(TopologyError::OversizedNode {
+                    index,
+                    len: node.len(),
+                    capacity: topology.node_capacity,
+                });
+            }
+            if node.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(TopologyError::UnsortedNode { index });
+            }
+            if index > 0
+                && topology.nodes[index - 1]
+                    .last()
+                    .expect("non-empty node validated above")
+                    >= node.first().expect("non-empty node validated above")
+            {
+                return Err(TopologyError::OverlappingNodes {
+                    left: index - 1,
+                    right: index,
+                });
+            }
+        }
+
+        let map = Self::with_maximum_node_size(topology.node_capacity);
+        for values in topology.nodes {
+            let mut node = Node::with_capacity(topology.node_capacity);
+            for value in values {
+                let (inserted, _) = NodeLike::insert(&mut node, value);
+                debug_assert!(inserted, "validated topology contains unique values");
+            }
+            map.attach_node(node);
+        }
+        Ok(map)
     }
     /// Returns `true` if the map contains a value for the specified key.
     ///
@@ -489,6 +594,8 @@ mod tests {
     use super::BTreeMap;
     use super::ChangeEvent;
     use super::Pair;
+    #[cfg(feature = "cdc")]
+    use super::{Topology, TopologyError};
     use crate::core::constants::DEFAULT_INNER_SIZE;
     use crate::BTreeSet;
     use rand::Rng;
@@ -496,6 +603,39 @@ mod tests {
     use std::fmt::Debug;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[cfg(feature = "cdc")]
+    #[test]
+    fn pointer_free_topology_round_trip_preserves_nodes() {
+        let map = BTreeMap::<u64, u64>::with_maximum_node_size(4);
+        for key in 0..37 {
+            map.insert(key, key * 10);
+        }
+
+        let topology = map.export_topology();
+        assert!(topology.nodes.len() > 1);
+        let restored = BTreeMap::<u64, u64>::from_topology(topology.clone()).unwrap();
+
+        assert_eq!(restored.export_topology(), topology);
+        assert_eq!(
+            restored.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+            (0..37).map(|k| (k, k * 10)).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "cdc")]
+    #[test]
+    fn pointer_free_topology_rejects_invalid_boundaries() {
+        let error = BTreeMap::<u64, u64>::from_topology(Topology {
+            node_capacity: 4,
+            nodes: vec![
+                vec![Pair { key: 1, value: 10 }, Pair { key: 3, value: 30 }],
+                vec![Pair { key: 2, value: 20 }],
+            ],
+        })
+        .unwrap_err();
+        assert_eq!(error, TopologyError::OverlappingNodes { left: 0, right: 1 });
+    }
 
     #[test]
     fn test_range_edge_cast() {
