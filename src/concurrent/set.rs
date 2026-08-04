@@ -147,6 +147,17 @@ where
         self.index.insert(node_id, Arc::new(Mutex::new(node)));
     }
 
+    #[cfg(feature = "cdc")]
+    pub(crate) fn export_topology(&self) -> (usize, Vec<Vec<T>>) {
+        let _structural_guard = self.index_lock.read();
+        let nodes = self
+            .index
+            .iter()
+            .map(|entry| entry.value().lock().iter().cloned().collect())
+            .collect();
+        (self.node_capacity, nodes)
+    }
+
     #[allow(clippy::type_complexity)]
     // Const specialization keeps ordinary writes free of CDC event construction
     // even when the crate is compiled with the `cdc` feature.
