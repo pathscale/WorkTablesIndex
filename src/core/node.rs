@@ -37,6 +37,8 @@ pub trait NodeLike<T: Ord> {
     where
         T: Borrow<Q>;
     #[allow(dead_code)]
+    fn delete_at(&mut self, index: usize) -> Option<T>;
+    #[allow(dead_code)]
     fn replace(&mut self, idx: usize, value: T) -> Option<T>;
     #[allow(dead_code)]
     fn max(&self) -> Option<&T>;
@@ -264,6 +266,14 @@ impl<T: Ord> NodeLike<T> for Vec<T> {
         match search(self, value) {
             Ok(idx) => Some((self.remove(idx), idx)),
             Err(_) => None,
+        }
+    }
+    #[inline]
+    fn delete_at(&mut self, index: usize) -> Option<T> {
+        if index < self.len() {
+            Some(self.remove(index))
+        } else {
+            None
         }
     }
     #[inline]

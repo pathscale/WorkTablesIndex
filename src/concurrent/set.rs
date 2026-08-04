@@ -516,12 +516,12 @@ where
 
         for target_node_entry in self.index.iter() {
             let mut node_guard = target_node_entry.value().lock_arc();
-            let Some(target) = node_guard.iter().find(|value| predicate(value)).cloned() else {
+            let Some(target_index) = node_guard.iter().position(&predicate) else {
                 continue;
             };
             let old_max = node_guard.max().cloned().expect("target node must have a maximum");
-            let (deleted, idx) =
-                NodeLike::delete(&mut *node_guard, &target).expect("target was found while the node was locked");
+            let deleted = NodeLike::delete_at(&mut *node_guard, target_index)
+                .expect("target position was found while the node was locked");
 
             #[cfg(feature = "cdc")]
             if EMIT_CDC {
@@ -529,7 +529,7 @@ where
                     event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                     max_value: old_max.clone(),
                     value: deleted.clone(),
-                    index: idx,
+                    index: target_index,
                 };
                 cdc.push(node_element_removal);
             }
@@ -1469,6 +1469,7 @@ mod tests {
     #[cfg(feature = "cdc")]
     use crate::cdc::change::ChangeEvent;
     use crate::concurrent::set::{BTreeSet, DEFAULT_INNER_SIZE};
+    use crate::core::multipair::RandomMultiPair;
     use rand::Rng;
     use std::collections::HashSet;
     use std::ops::Bound::Included;
@@ -1931,6 +1932,36 @@ mod tests {
 
         assert!(set.insert(4));
         assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
+    }
+
+    #[test]
+    fn test_remove_where_deletes_the_position_found_under_the_node_lock() {
+        let set = BTreeSet::<RandomMultiPair<usize, &'static str>>::new();
+        set.attach_node(vec![
+            RandomMultiPair {
+                key: 1,
+                value: "target",
+                discriminator: 100,
+            },
+            RandomMultiPair {
+                key: 1,
+                value: "middle",
+                discriminator: 20,
+            },
+            RandomMultiPair {
+                key: 1,
+                value: "last",
+                discriminator: 30,
+            },
+        ]);
+
+        let removed = set.remove_where(|pair| pair.value == "target");
+
+        assert_eq!(removed.map(Into::<(usize, &'static str)>::into), Some((1, "target")));
+        assert_eq!(
+            set.iter().map(|pair| pair.value).collect::<Vec<_>>(),
+            vec!["middle", "last"]
+        );
     }
 
     #[cfg(feature = "cdc")]
