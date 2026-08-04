@@ -36,6 +36,11 @@ pub trait NodeLike<T: Ord> {
     fn delete<Q: Ord + ?Sized>(&mut self, value: &Q) -> Option<(T, usize)>
     where
         T: Borrow<Q>;
+    // Positional deletion is only used by the multimap concurrent-removal
+    // recovery path. Gate it so enabling this trait method is not an
+    // unconditional source-compatibility break for custom NodeLike impls that
+    // do not use multimap.
+    #[cfg(feature = "multimap")]
     #[allow(dead_code)]
     fn delete_at(&mut self, index: usize) -> Option<T>;
     #[allow(dead_code)]
@@ -268,6 +273,7 @@ impl<T: Ord> NodeLike<T> for Vec<T> {
             Err(_) => None,
         }
     }
+    #[cfg(feature = "multimap")]
     #[inline]
     fn delete_at(&mut self, index: usize) -> Option<T> {
         if index < self.len() {

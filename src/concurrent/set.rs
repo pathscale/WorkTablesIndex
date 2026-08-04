@@ -506,7 +506,10 @@ where
 
     // Slow-path recovery for multimap exact removal. Holding the structural
     // write guard makes predicate lookup, deletion, and node reindexing one
-    // critical section after the ordinary point-removal path has missed.
+    // critical section after the ordinary point-removal path has missed. Only
+    // the multimap paths use this, and it relies on NodeLike::delete_at (also
+    // multimap-gated), so gate the whole family to avoid an unconditional break.
+    #[cfg(feature = "multimap")]
     fn remove_where_inner<const EMIT_CDC: bool, F>(&self, predicate: F) -> (Option<T>, Vec<ChangeEvent<T>>)
     where
         F: Fn(&T) -> bool,
@@ -558,6 +561,7 @@ where
         (None, cdc)
     }
 
+    #[cfg(feature = "multimap")]
     pub(crate) fn remove_where<F>(&self, predicate: F) -> Option<T>
     where
         F: Fn(&T) -> bool,
@@ -565,6 +569,7 @@ where
         self.remove_where_inner::<false, F>(predicate).0
     }
 
+    #[cfg(feature = "multimap")]
     pub(crate) fn remove_where_cdc<F>(&self, predicate: F) -> (Option<T>, Vec<ChangeEvent<T>>)
     where
         F: Fn(&T) -> bool,
@@ -1469,6 +1474,7 @@ mod tests {
     #[cfg(feature = "cdc")]
     use crate::cdc::change::ChangeEvent;
     use crate::concurrent::set::{BTreeSet, DEFAULT_INNER_SIZE};
+    #[cfg(feature = "multimap")]
     use crate::core::multipair::RandomMultiPair;
     use rand::Rng;
     use std::collections::HashSet;
@@ -1920,6 +1926,7 @@ mod tests {
         assert!(!set.remove(&5).is_some());
     }
 
+    #[cfg(feature = "multimap")]
     #[test]
     fn test_remove_where_reindexes_changed_node_maximum() {
         let set = BTreeSet::<usize>::with_maximum_node_size(4);
@@ -1934,6 +1941,7 @@ mod tests {
         assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
     }
 
+    #[cfg(feature = "multimap")]
     #[test]
     fn test_remove_where_deletes_the_position_found_under_the_node_lock() {
         let set = BTreeSet::<RandomMultiPair<usize, &'static str>>::new();
@@ -1964,7 +1972,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cdc")]
+    #[cfg(all(feature = "cdc", feature = "multimap"))]
     #[test]
     fn test_remove_where_cdc_removes_empty_node() {
         let set = BTreeSet::<usize>::new();
