@@ -25,11 +25,6 @@ so every `use indexset::` path in their code keeps working unchanged.
 
 ## Invariants (don't break these)
 
-- **Minimal diff to upstream.** No reformatting of inherited code, no lint-fix
-  churn, no gratuitous refactors: the smaller our diff, the easier it is to
-  exchange patches with upstream and to rebase onto their releases. The
-  `[lints]` tables in `Cargo.toml` freeze the lint classes already present in
-  inherited code; CI denies everything else. Do not add allows for new code.
 - **Type identity is load-bearing.** `worktable` and `data_bucket` must always
   pin the *same exact version* of this crate — two source crates providing the
   same `Pair`/`ChangeEvent` types cannot coexist in one dependency tree. Any
