@@ -5,7 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.0.6] - 2026-09-01
+
+### Fixed
+- Inserts into a concurrently emptied node are no longer lost: index repairs are addressed by the entry key, `UpdateMax` unlinks drained nodes, and `MakeUnreachable` re-keys refilled nodes instead of unlinking them
+- `Split` committed against a concurrently drained node fails and retries instead of panicking (cdc) or silently dropping the insert
+- `remove_range` end bounds resolve correctly (previously drained whole nodes outside the range and missed elements inside it)
+- `remove` reaches values above every index key via the same back-node fallback the other paths had
+- Scans reposition by cursor instead of truncating when the current node is re-keyed or removed, filter duplicate yields after splits, and advance in logarithmic time instead of a linear relocation per node
+- Iterators release node guards on completion and before structural lookups, fixing a self-deadlock at cursor meeting and a lock-order inversion against structural commits
+- Replacing a logically equal multimap pair preserves the stored discriminator, keeping node order intact
+- `Range` construction never holds two node locks, removing an ABBA deadlock between concurrent range constructions
 
 ### Added
 - Added `custom-binary-search` so exact-pin consumers can select the original branch-based search even when another dependency enables the default search feature
