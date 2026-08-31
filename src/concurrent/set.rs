@@ -1249,24 +1249,29 @@ where
 
         let front_value = if let Some(front_entry) = current_front_entry.as_ref() {
             let front_guard = front_entry.value().lock_arc();
-            if let Some(rank) = match start_bound {
+            let rank = match start_bound {
                 Bound::Included(v) => front_guard.rank(Bound::Included(v), true),
                 Bound::Excluded(v) => front_guard.rank(Bound::Excluded(v), true),
                 Bound::Unbounded => None,
-            } {
-                let mut front_iter = front_guard.iter();
-                let front_value = front_iter.nth(rank).cloned();
+            };
+            if let Some(rank) = rank {
+                let value = front_guard.iter().nth(rank).cloned();
                 drop(front_guard);
 
-                front_value
-            } else if let Some(pre_front_entry) = front_entry.prev() {
-                let pre_front_guard = pre_front_entry.value().lock_arc();
-                let front_value = pre_front_guard.iter().last().cloned();
-                drop(pre_front_guard);
-
-                front_value
+                value
             } else {
-                None
+                // Release the current node before locking its neighbor: this
+                // branch used to hold front then prev (descending) while the
+                // back branch below held back then next (ascending), an
+                // ABBA deadlock between two concurrent Range constructions.
+                // Never hold two node locks here.
+                drop(front_guard);
+                if let Some(pre_front_entry) = front_entry.prev() {
+                    let pre_front_guard = pre_front_entry.value().lock_arc();
+                    pre_front_guard.iter().last().cloned()
+                } else {
+                    None
+                }
             }
         } else {
             None
@@ -1281,24 +1286,25 @@ where
 
         let back_value = if let Some(back_entry) = current_back_entry.as_ref() {
             let back_guard = back_entry.value().lock_arc();
-            if let Some(rank) = match end_bound {
+            let rank = match end_bound {
                 Bound::Included(v) => back_guard.rank(Bound::Included(v), false),
                 Bound::Excluded(v) => back_guard.rank(Bound::Excluded(v), false),
                 Bound::Unbounded => None,
-            } {
-                let mut back_iter = back_guard.iter();
-                let back_value = back_iter.nth_back(rank).cloned();
+            };
+            if let Some(rank) = rank {
+                let value = back_guard.iter().nth_back(rank).cloned();
                 drop(back_guard);
 
-                back_value
-            } else if let Some(prev_back_entry) = back_entry.next() {
-                let prev_back_guard = prev_back_entry.value().lock_arc();
-                let back_value = prev_back_guard.iter().next().cloned();
-                drop(prev_back_guard);
-
-                back_value
+                value
             } else {
-                None
+                // See the front branch: release before locking the neighbor.
+                drop(back_guard);
+                if let Some(next_back_entry) = back_entry.next() {
+                    let next_back_guard = next_back_entry.value().lock_arc();
+                    next_back_guard.iter().next().cloned()
+                } else {
+                    None
+                }
             }
         } else {
             None
@@ -2697,6 +2703,54 @@ mod tests {
         assert!(set.range(..0).collect::<Vec<_>>().is_empty());
         assert!(set.range(20..).rev().collect::<Vec<_>>().is_empty());
         assert!(set.range(..0).rev().collect::<Vec<_>>().is_empty());
+    }
+
+    #[test]
+    fn concurrent_range_constructions_at_node_boundaries_do_not_deadlock() {
+        const THREAD_ITERATIONS: usize = 20_000;
+
+        let set = Arc::new(BTreeSet::<u64>::with_maximum_node_size(4));
+        for value in 0..64 {
+            set.insert(value);
+        }
+
+        // One thread constructs ranges whose start sits at node minima
+        // (locking a node, then its predecessor); the other constructs
+        // ranges whose end sits at node maxima (locking a node, then its
+        // successor). Pre-fix these acquisitions ran in opposite orders
+        // while both locks were held, an ABBA deadlock.
+        let (done_tx, done_rx) = mpsc::channel();
+        let forward = {
+            let set = Arc::clone(&set);
+            let done_tx = done_tx.clone();
+            thread::spawn(move || {
+                for iteration in 0..THREAD_ITERATIONS {
+                    let start = (iteration % 64) as u64;
+                    assert_eq!(set.range(start..).next(), Some(&start));
+                }
+                done_tx.send(()).unwrap();
+            })
+        };
+        let backward = {
+            let set = Arc::clone(&set);
+            let done_tx = done_tx.clone();
+            thread::spawn(move || {
+                for iteration in 0..THREAD_ITERATIONS {
+                    let end = (iteration % 64) as u64;
+                    assert_eq!(set.range(..=end).next_back(), Some(&end));
+                }
+                done_tx.send(()).unwrap();
+            })
+        };
+        drop(done_tx);
+
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("concurrent range constructions deadlocked");
+        }
+        forward.join().unwrap();
+        backward.join().unwrap();
     }
 
     // Builds nodes [0, 10] (key 10), [20, 30] (key 30), [40, 50, 60] (key 60).
