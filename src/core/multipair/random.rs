@@ -11,8 +11,20 @@ use crate::concurrent::set::BTreeSet;
 use crate::core::node::NodeLike;
 use crate::core::pair::Pair;
 
-use super::{MultiPairLike, MultiPairRemoveHelper};
+use super::{MultiPairInsertHelper, MultiPairLike, MultiPairRemoveHelper};
 
+/// A multimap pair whose stored identity and total order are the
+/// `(key, discriminator)` tuple.
+///
+/// The discriminator is drawn at random on construction and refines the order
+/// of equal-key entries, so every stored pair is strictly ordered and every
+/// index entry key is unique. The value does not participate in `Ord`, `Eq`,
+/// or `Hash` at all: an order that consulted value equality was not a lawful
+/// total order (it violated transitivity, broke binary search, and let index
+/// entry keys compare `Equal`, corrupting routing once equal-key nodes
+/// split). Logical `(key, value)` operations are explicit scans over the
+/// key's range with a separate value-equality bound; see
+/// [`MultiPairInsertHelper`] and [`MultiPairRemoveHelper`].
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Default, Clone)]
 pub struct RandomMultiPair<K, V> {
@@ -31,25 +43,23 @@ impl<K, V> RandomMultiPair<K, V> {
     }
 }
 
-impl<K: Ord, V: PartialEq> Eq for RandomMultiPair<K, V> {}
+impl<K: Ord, V> Eq for RandomMultiPair<K, V> {}
 
-impl<K: Ord, V: PartialEq> PartialEq<Self> for RandomMultiPair<K, V> {
+impl<K: Ord, V> PartialEq<Self> for RandomMultiPair<K, V> {
     fn eq(&self, other: &Self) -> bool {
-        self.key.eq(&other.key) && self.value.eq(&other.value)
+        self.key.eq(&other.key) && self.discriminator.eq(&other.discriminator)
     }
 }
 
-impl<K: Ord, V: PartialEq> Ord for RandomMultiPair<K, V> {
+impl<K: Ord, V> Ord for RandomMultiPair<K, V> {
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.key.cmp(&other.key) {
-            Ordering::Equal if self.value.eq(&other.value) => Ordering::Equal,
-            Ordering::Equal => self.discriminator.cmp(&other.discriminator),
-            ord => ord,
-        }
+        self.key
+            .cmp(&other.key)
+            .then(self.discriminator.cmp(&other.discriminator))
     }
 }
 
-impl<K: Ord, V: PartialEq> PartialOrd for RandomMultiPair<K, V> {
+impl<K: Ord, V> PartialOrd for RandomMultiPair<K, V> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -58,11 +68,10 @@ impl<K: Ord, V: PartialEq> PartialOrd for RandomMultiPair<K, V> {
 impl<K, V> std::hash::Hash for RandomMultiPair<K, V>
 where
     K: std::hash::Hash,
-    V: std::hash::Hash,
 {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.key.hash(state);
-        self.value.hash(state);
+        self.discriminator.hash(state);
     }
 }
 
@@ -72,7 +81,7 @@ impl<K, V> Borrow<K> for RandomMultiPair<K, V> {
     }
 }
 
-impl<K: Ord, V: PartialEq> MultiPairLike<K, V> for RandomMultiPair<K, V> {
+impl<K: Ord, V> MultiPairLike<K, V> for RandomMultiPair<K, V> {
     fn new(key: K, value: V) -> Self {
         Self::new(key, value)
     }
@@ -86,7 +95,9 @@ impl<K: Ord, V: PartialEq> MultiPairLike<K, V> for RandomMultiPair<K, V> {
     }
 
     // The stored pair's position among equal-key neighbors is determined by
-    // its discriminator; keeping it on replace keeps the node sorted.
+    // its discriminator; keeping it on replace keeps the node sorted. With
+    // identity being (key, discriminator), an Ord-equal replace already
+    // carries the stored discriminator, so this is defensive.
     fn adopt_stored_identity(stored: &Self, incoming: &mut Self) {
         incoming.discriminator = stored.discriminator;
     }
@@ -114,6 +125,91 @@ impl<K, V> From<RandomMultiPair<K, V>> for Pair<K, V> {
 impl<K, V> From<RandomMultiPair<K, V>> for (K, V) {
     fn from(pair: RandomMultiPair<K, V>) -> Self {
         (pair.key, pair.value)
+    }
+}
+
+impl<K, V> MultiPairInsertHelper<K, V> for RandomMultiPair<K, V>
+where
+    K: Debug + Send + Ord + Clone + 'static,
+    V: Debug + Send + Clone + PartialEq + 'static,
+{
+    fn insert_into<Node>(set: &BTreeSet<Self, Node>, key: K, value: V) -> Option<(K, V)>
+    where
+        Self: Debug + Ord + Clone + Send + 'static,
+        Node: NodeLike<Self> + Send + 'static,
+    {
+        loop {
+            // Logical identity is (key, value): locate a stored pair with an
+            // equal value in the key's range and replace it in place. The
+            // incoming pair carries the stored discriminator, so the put
+            // finds the exact stored entry (Ord-equal) and the replacement
+            // keeps its position among equal-key neighbors.
+            let stored = set
+                .range::<K, _>((Bound::Included(&key), Bound::Included(&key)))
+                .find(|pair| pair.value == value);
+            if let Some(stored) = stored {
+                let incoming = Self {
+                    key: key.clone(),
+                    value: value.clone(),
+                    discriminator: stored.discriminator,
+                };
+                if let Some(replaced) = set.put_with(incoming, Self::adopt_stored_identity) {
+                    return Some(replaced.into());
+                }
+                // The located pair was removed concurrently before the
+                // replace landed and the put inserted the pair fresh, which
+                // completes the logical insert.
+                return None;
+            }
+
+            // No logical match: insert a fresh entry under a random
+            // discriminator. `put_checked` fails instead of replacing when
+            // the (key, discriminator) identity is already taken by another
+            // pair, so a random collision re-rolls by restarting (which also
+            // re-runs the logical-match scan). A collision that lands inside
+            // a concurrent split commit is replaced there instead of failing;
+            // surface it as the replace it was.
+            let candidate = Self::new(key.clone(), value.clone());
+            match set.put_checked(candidate) {
+                Ok((replaced, _)) => return replaced.map(Into::into),
+                Err((node_guard, _, _)) => {
+                    drop(node_guard);
+                    continue;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cdc")]
+    fn insert_cdc_into<Node>(set: &BTreeSet<Self, Node>, key: K, value: V) -> (Option<(K, V)>, Vec<ChangeEvent<Self>>)
+    where
+        Self: Debug + Ord + Clone + Send + 'static,
+        Node: NodeLike<Self> + Send + 'static,
+    {
+        // See `insert_into`; this is the event-emitting twin.
+        loop {
+            let stored = set
+                .range::<K, _>((Bound::Included(&key), Bound::Included(&key)))
+                .find(|pair| pair.value == value);
+            if let Some(stored) = stored {
+                let incoming = Self {
+                    key: key.clone(),
+                    value: value.clone(),
+                    discriminator: stored.discriminator,
+                };
+                let (replaced, events) = set.put_cdc_with(incoming, Self::adopt_stored_identity);
+                return (replaced.map(Into::into), events);
+            }
+
+            let candidate = Self::new(key.clone(), value.clone());
+            match set.put_cdc_checked(candidate) {
+                Ok((replaced, events)) => return (replaced.map(Into::into), events),
+                Err((node_guard, _, _)) => {
+                    drop(node_guard);
+                    continue;
+                }
+            }
+        }
     }
 }
 
@@ -186,15 +282,33 @@ mod test {
 
     #[test]
     fn eq_test() {
-        let pair_one = RandomMultiPair::new(1usize, 2usize);
-        let pair_two = RandomMultiPair::new(1usize, 3usize);
+        // Identity is (key, discriminator); the value does not participate.
+        let pair_one = RandomMultiPair {
+            key: 1usize,
+            value: 2usize,
+            discriminator: 7,
+        };
+        let pair_two = RandomMultiPair {
+            key: 1usize,
+            value: 3usize,
+            discriminator: 8,
+        };
         assert_ne!(pair_one, pair_two);
+
+        let same_slot = RandomMultiPair {
+            key: 1usize,
+            value: 3usize,
+            discriminator: 7,
+        };
+        assert_eq!(pair_one, same_slot);
     }
 
     #[test]
     fn equal_pairs_have_equal_hashes() {
         use std::hash::{DefaultHasher, Hash, Hasher};
 
+        // Hash follows the (key, discriminator) identity, so Eq-equal pairs
+        // hash equal even when their values differ.
         let pair_one = RandomMultiPair {
             key: 1usize,
             value: 2usize,
@@ -202,8 +316,8 @@ mod test {
         };
         let pair_two = RandomMultiPair {
             key: 1usize,
-            value: 2usize,
-            discriminator: 4,
+            value: 9usize,
+            discriminator: 3,
         };
 
         assert_eq!(pair_one, pair_two);
@@ -214,6 +328,47 @@ mod test {
         pair_two.hash(&mut hash_two);
 
         assert_eq!(hash_one.finish(), hash_two.finish());
+    }
+
+    // Exhaustive Ord-laws check over a small domain dense in collisions on
+    // every axis. The previous Ord consulted value equality before the
+    // discriminator, which made it non-transitive (a == b and b == c with
+    // a < c was reachable), broke binary search, and let index entry keys
+    // compare Equal.
+        #[test]
+    fn replace_of_logically_equal_pair_preserves_discriminator_and_position() {
+        let set = BTreeSet::<RandomMultiPair<usize, &'static str>>::new();
+        set.attach_node(vec![
+            RandomMultiPair {
+                key: 1,
+                value: "a",
+                discriminator: 10,
+            },
+            RandomMultiPair {
+                key: 1,
+                value: "b",
+                discriminator: 20,
+            },
+            RandomMultiPair {
+                key: 1,
+                value: "c",
+                discriminator: 30,
+            },
+        ]);
+
+        let replaced = RandomMultiPair::insert_into(&set, 1, "b");
+        assert_eq!(replaced, Some((1, "b")), "logical duplicate must replace in place");
+
+        let stored = set
+            .range::<usize, _>((Bound::Included(&1), Bound::Included(&1)))
+            .collect::<Vec<_>>();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(
+            stored.iter().map(|pair| pair.discriminator).collect::<Vec<_>>(),
+            vec![10, 20, 30],
+            "replace must preserve the stored discriminator and position"
+        );
+        assert_eq!(stored[1].value, "b");
     }
 
     #[test]

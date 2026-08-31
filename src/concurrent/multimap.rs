@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use crate::core::node::NodeLike;
 use crate::{
     cdc::change::ChangeEvent,
-    core::multipair::{MultiPair, MultiPairLike, MultiPairRemoveHelper, OrdMultiPair},
+    core::multipair::{MultiPair, MultiPairInsertHelper, MultiPairLike, MultiPairRemoveHelper, OrdMultiPair},
 };
 
 use super::set::BTreeSet;
@@ -273,42 +273,6 @@ where
     {
         self._range((Bound::Included(key), Bound::Included(key)))
     }
-    /// Inserts a key-value pair into the multi map.
-    ///
-    /// # Examples
-    ///
-    /// Basic usage:
-    ///
-    /// ```
-    /// use indexset::concurrent::multimap::BTreeMultiMap;
-    ///
-    /// let mut map = BTreeMultiMap::<usize, &str>::new();
-    /// assert_eq!(map.insert(37, "a"), None);
-    /// assert_eq!(map.len() == 0, false);
-    ///
-    /// map.insert(37, "b");
-    /// assert_eq!(map.insert(37, "c"), None);
-    /// ```
-    pub fn insert(&self, key: K, value: V) -> Option<V> {
-        let new_entry = M::new(key, value);
-
-        // A logical replace must keep the stored pair's ordering identity
-        // (e.g. its discriminator) or the node's sort invariant breaks.
-        self.set
-            .put_with(new_entry, M::adopt_stored_identity)
-            .map(|pair| pair.into().1)
-    }
-    /// Inserts a key-value pair into the map and returns old value (if it was
-    /// already in set) with [`ChangeEvent`]'s that describes this insert
-    /// action.
-    #[cfg(feature = "cdc")]
-    pub fn insert_cdc(&self, key: K, value: V) -> (Option<V>, Vec<ChangeEvent<M>>) {
-        let new_entry = M::new(key, value);
-
-        let (old_value, cdc) = self.set.put_cdc_with(new_entry, M::adopt_stored_identity);
-
-        (old_value.map(|pair| pair.into().1), cdc)
-    }
     /// Removes some key from the map that matches the given key, returning the
     /// key and the value if the key was previously in the map.
     ///
@@ -499,6 +463,51 @@ impl<K, V, Node, M> BTreeMultiMap<K, V, Node, M>
 where
     K: Debug + Send + Ord + Clone + 'static,
     V: Debug + Send + Clone + 'static,
+    M: MultiPairLike<K, V> + MultiPairInsertHelper<K, V> + Debug + Clone + Send + 'static,
+    Node: NodeLike<M> + Send + 'static,
+{
+    /// Inserts a key-value pair into the multi map.
+    ///
+    /// The logical identity of an entry is the `(key, value)` pair: inserting
+    /// a pair that is already present (by the representation's value
+    /// equality) replaces it in place and returns the old value, while a new
+    /// pair is added alongside the key's other values.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use indexset::concurrent::multimap::BTreeMultiMap;
+    ///
+    /// let mut map = BTreeMultiMap::<usize, &str>::new();
+    /// assert_eq!(map.insert(37, "a"), None);
+    /// assert_eq!(map.len() == 0, false);
+    ///
+    /// map.insert(37, "b");
+    /// assert_eq!(map.insert(37, "c"), None);
+    /// assert_eq!(map.insert(37, "a"), Some("a"));
+    /// assert_eq!(map.len(), 3);
+    /// ```
+    pub fn insert(&self, key: K, value: V) -> Option<V> {
+        M::insert_into(&self.set, key, value).map(|(_, value)| value)
+    }
+
+    /// Inserts a key-value pair into the map and returns old value (if it was
+    /// already in set) with [`ChangeEvent`]'s that describes this insert
+    /// action. See [`BTreeMultiMap::insert`] for the replace semantics.
+    #[cfg(feature = "cdc")]
+    pub fn insert_cdc(&self, key: K, value: V) -> (Option<V>, Vec<ChangeEvent<M>>) {
+        let (old_value, cdc) = M::insert_cdc_into(&self.set, key, value);
+
+        (old_value.map(|(_, value)| value), cdc)
+    }
+}
+
+impl<K, V, Node, M> BTreeMultiMap<K, V, Node, M>
+where
+    K: Debug + Send + Ord + Clone + 'static,
+    V: Debug + Send + Clone + 'static,
     M: MultiPairLike<K, V> + MultiPairRemoveHelper<K, V> + Debug + Clone + Send + 'static,
     Node: NodeLike<M> + Send + 'static,
 {
@@ -652,7 +661,16 @@ mod tests {
         assert_concurrent_remove_reinsert_preserves_exact_pairs(1_000, 16, 32, 100_000);
     }
 
-    #[test]
+    // The 250-insert churn that measured 55 live pairs under the old
+    // value-consulting Ord: cycling 5 logical pairs through insert must keep
+    // the logical pair count exact, with every repeat reported as a replace.
+        // Split-livelock regression: many values under one key force nodes whose
+    // maxima share the key to split. Under the old Ord the split maxima
+    // compared Equal as skip-map entry keys, corrupting routing and
+    // livelocking the split retry loop (reproduced on master). With
+    // (key, discriminator) identity every entry key is unique, so this must
+    // terminate with every pair reachable and removable.
+        #[test]
     fn test_range_edge_cast() {
         let maximum_node_size = 3;
         let map = BTreeMultiMap::<usize, &str>::with_maximum_node_size(maximum_node_size);
@@ -674,7 +692,13 @@ mod tests {
 
     fn assert_range_works_as_expected<M>()
     where
-        M: MultiPairLike<usize, &'static str> + Borrow<usize> + Debug + Clone + Send + 'static,
+        M: MultiPairLike<usize, &'static str>
+            + crate::core::multipair::MultiPairInsertHelper<usize, &'static str>
+            + Borrow<usize>
+            + Debug
+            + Clone
+            + Send
+            + 'static,
     {
         let maximum_node_size = 3;
         let map = BTreeMultiMap::<usize, &'static str, Vec<M>, M>::with_maximum_node_size(maximum_node_size);
@@ -717,7 +741,13 @@ mod tests {
 
     fn assert_range_excludes_values_at_bounds<M>()
     where
-        M: MultiPairLike<usize, &'static str> + Borrow<usize> + Debug + Clone + Send + 'static,
+        M: MultiPairLike<usize, &'static str>
+            + crate::core::multipair::MultiPairInsertHelper<usize, &'static str>
+            + Borrow<usize>
+            + Debug
+            + Clone
+            + Send
+            + 'static,
     {
         let map = BTreeMultiMap::<usize, &'static str, Vec<M>, M>::with_maximum_node_size(10);
 
@@ -750,7 +780,13 @@ mod tests {
 
     fn assert_get_works_as_expected<M>()
     where
-        M: MultiPairLike<usize, &'static str> + Borrow<usize> + Debug + Clone + Send + 'static,
+        M: MultiPairLike<usize, &'static str>
+            + crate::core::multipair::MultiPairInsertHelper<usize, &'static str>
+            + Borrow<usize>
+            + Debug
+            + Clone
+            + Send
+            + 'static,
     {
         let maximum_node_size = 10;
         let map = BTreeMultiMap::<usize, &'static str, Vec<M>, M>::with_maximum_node_size(maximum_node_size);

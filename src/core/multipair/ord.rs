@@ -10,7 +10,7 @@ use crate::concurrent::set::BTreeSet;
 use crate::core::node::NodeLike;
 use crate::core::pair::Pair;
 
-use super::{MultiPairLike, MultiPairRemoveHelper};
+use super::{MultiPairInsertHelper, MultiPairLike, MultiPairRemoveHelper};
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Default, Clone, Hash)]
@@ -86,6 +86,33 @@ impl<K, V> From<OrdMultiPair<K, V>> for Pair<K, V> {
 impl<K, V> From<OrdMultiPair<K, V>> for (K, V) {
     fn from(pair: OrdMultiPair<K, V>) -> Self {
         (pair.key, pair.value)
+    }
+}
+
+impl<K, V> MultiPairInsertHelper<K, V> for OrdMultiPair<K, V>
+where
+    K: Debug + Send + Ord + Clone + 'static,
+    V: Debug + Send + Ord + Clone + 'static,
+{
+    // Value participates in this representation's total order, so the plain
+    // put already is insert-or-replace on the logical (key, value) identity.
+    fn insert_into<Node>(set: &BTreeSet<Self, Node>, key: K, value: V) -> Option<(K, V)>
+    where
+        Self: Debug + Ord + Clone + Send + 'static,
+        Node: NodeLike<Self> + Send + 'static,
+    {
+        set.put_with(Self::new(key, value), Self::adopt_stored_identity)
+            .map(Into::into)
+    }
+
+    #[cfg(feature = "cdc")]
+    fn insert_cdc_into<Node>(set: &BTreeSet<Self, Node>, key: K, value: V) -> (Option<(K, V)>, Vec<ChangeEvent<Self>>)
+    where
+        Self: Debug + Ord + Clone + Send + 'static,
+        Node: NodeLike<Self> + Send + 'static,
+    {
+        let (replaced, events) = set.put_cdc_with(Self::new(key, value), Self::adopt_stored_identity);
+        (replaced.map(Into::into), events)
     }
 }
 

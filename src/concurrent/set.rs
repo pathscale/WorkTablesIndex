@@ -2205,8 +2205,8 @@ mod tests {
 
     #[cfg(feature = "multimap")]
     #[test]
-    fn replace_of_logically_equal_pair_preserves_discriminator_order() {
-        use crate::core::multipair::MultiPairLike;
+    fn replace_of_logically_equal_pair_preserves_discriminator_and_position() {
+        use crate::core::multipair::MultiPairInsertHelper;
 
         let set = BTreeSet::<RandomMultiPair<usize, &'static str>>::new();
         set.attach_node(vec![
@@ -2227,25 +2227,24 @@ mod tests {
             },
         ]);
 
-        // A logical replace: the incoming pair carries a fresh discriminator.
-        // The stored pair's position among equal-key neighbors was determined
-        // by ITS discriminator, so the replacement must adopt it; keeping the
-        // fresh one is what scrambled node order under random draws (a fresh
-        // discriminator outside the neighbor range breaks the sort invariant,
-        // and with an inconsistent Ord such a pair is not even reliably
-        // findable). The fixture discriminator sits between the neighbors so
-        // that every search backend's probe sequence reaches the stored pair.
-        let incoming = RandomMultiPair {
-            key: 1,
-            value: "b",
-            discriminator: 25,
-        };
-        let replaced = set.put_with(incoming, RandomMultiPair::adopt_stored_identity);
-        assert!(replaced.is_some(), "logically equal pair must replace, not duplicate");
+        // A logical replace: inserting a (key, value) that is already
+        // present must locate the stored pair by value equality and replace
+        // it in place under its stored discriminator. The stored pair's
+        // position among equal-key neighbors was determined by ITS
+        // discriminator; a replacement under a fresh random discriminator
+        // would be a duplicate, which is what accumulated under the old
+        // value-consulting Ord.
+        let replaced = RandomMultiPair::insert_into(&set, 1, "b");
+        assert_eq!(
+            replaced,
+            Some((1, "b")),
+            "logically equal pair must replace, not duplicate"
+        );
 
         {
             let node = set.index.back().expect("node must exist").value().clone();
             let guard = node.lock();
+            assert_eq!(guard.len(), 3, "logical replace must not change the pair count");
             assert!(
                 guard.windows(2).all(|pair| pair[0] < pair[1]),
                 "node sort invariant broken: {:?}",
@@ -2289,7 +2288,7 @@ mod tests {
             RandomMultiPair {
                 key: 1,
                 value: "target",
-                discriminator: 100,
+                discriminator: 5,
             },
             RandomMultiPair {
                 key: 1,
