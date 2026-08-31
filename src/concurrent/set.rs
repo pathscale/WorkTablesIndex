@@ -897,6 +897,16 @@ where
 
             if let Some(iter) = self.current_front_node_iter.as_mut() {
                 if let Some(value) = iter.next() {
+                    // A node installed after advancing or repositioning can
+                    // re-expose elements at or below the last yielded value
+                    // (a split re-distributes the just-finished node, a
+                    // repositioned node covers part of the scanned range).
+                    // Skip them instead of yielding duplicates.
+                    if let Some(current_front_value) = self.current_front_value.as_ref() {
+                        if value.le(current_front_value) {
+                            continue;
+                        }
+                    }
                     if let Some(current_back_value) = self.current_back_value.as_ref() {
                         if value.ge(current_back_value) {
                             self.met = true;
@@ -948,6 +958,22 @@ where
                             return None;
                         }
                     } else {
+                        // The just-finished node is no longer in the index (it
+                        // was re-keyed by an UpdateMax repair or removed).
+                        // Ending the scan here would silently truncate it;
+                        // reposition after the last yielded value instead. The
+                        // resume path below skips anything already yielded.
+                        let repositioned = match self.current_front_value.as_ref() {
+                            Some(last_yielded) => self.tree.index.lower_bound(Bound::Excluded(last_yielded)),
+                            None => self.tree.index.front(),
+                        };
+                        if let Some(entry) = repositioned {
+                            self.current_front_node = Some(entry.value().clone());
+                            self.current_front_node_guard = None;
+                            self.current_front_node_iter = None;
+                            continue;
+                        }
+
                         self.current_front_node = None;
                         self.current_front_node_guard = None;
                         self.current_front_node_iter = None;
@@ -1041,6 +1067,14 @@ where
 
             if let Some(iter) = self.current_back_node_iter.as_mut() {
                 if let Some(value) = iter.next_back() {
+                    // Mirror of the forward path: skip elements at or above
+                    // the last value yielded from the back, which a freshly
+                    // installed node iterator can re-expose after churn.
+                    if let Some(current_back_value) = self.current_back_value.as_ref() {
+                        if value.ge(current_back_value) {
+                            continue;
+                        }
+                    }
                     if let Some(current_front_value) = self.current_front_value.as_ref() {
                         if value.le(current_front_value) {
                             self.met = true;
@@ -1087,6 +1121,25 @@ where
                             return None;
                         }
                     } else {
+                        // Mirror of the forward path: the just-finished node
+                        // vanished from the index, so reposition on the node
+                        // covering the last value yielded from the back
+                        // instead of truncating the scan.
+                        let repositioned = match self.current_back_value.as_ref() {
+                            Some(last_yielded) => self
+                                .tree
+                                .index
+                                .lower_bound(Bound::Included(last_yielded))
+                                .or_else(|| self.tree.index.back()),
+                            None => self.tree.index.back(),
+                        };
+                        if let Some(entry) = repositioned {
+                            self.current_back_node = Some(entry.value().clone());
+                            self.current_back_node_guard = None;
+                            self.current_back_node_iter = None;
+                            continue;
+                        }
+
                         self.current_back_node = None;
                         self.current_back_node_guard = None;
                         self.current_back_node_iter = None;
@@ -1495,7 +1548,7 @@ mod tests {
     #[cfg(feature = "cdc")]
     use crate::cdc::change::ChangeEvent;
     use crate::concurrent::operation::Operation;
-    use crate::concurrent::set::{BTreeSet, DEFAULT_INNER_SIZE};
+    use crate::concurrent::set::{BTreeSet, Iter, DEFAULT_INNER_SIZE};
     #[cfg(feature = "multimap")]
     use crate::core::multipair::RandomMultiPair;
     use crate::core::node::NodeLike;
@@ -2551,6 +2604,189 @@ mod tests {
         assert!(set.range(..0).collect::<Vec<_>>().is_empty());
         assert!(set.range(20..).rev().collect::<Vec<_>>().is_empty());
         assert!(set.range(..0).rev().collect::<Vec<_>>().is_empty());
+    }
+
+    // Builds nodes [0, 10] (key 10), [20, 30] (key 30), [40, 50, 60] (key 60).
+    fn three_node_set() -> BTreeSet<u64> {
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        for value in [0u64, 10, 20, 30, 40, 50, 60] {
+            set.insert(value);
+        }
+        assert_eq!(
+            set.index.iter().map(|e| *e.key()).collect::<Vec<_>>(),
+            vec![10, 30, 60],
+            "fixture geometry changed"
+        );
+        set
+    }
+
+    #[test]
+    fn forward_scan_repositions_when_current_node_vanishes() {
+        let set = three_node_set();
+
+        let mut iter = set.iter();
+        assert_eq!(iter.next(), Some(&0));
+        assert_eq!(iter.next(), Some(&10));
+        assert_eq!(iter.next(), Some(&20));
+
+        // The node the iterator is parked in vanishes from the index, as
+        // UpdateMax's remove-then-insert re-key does on every monotonic
+        // insert. The scan must reposition, not end.
+        set.index.get(&30).expect("fixture entry").remove();
+
+        assert_eq!(iter.next(), Some(&30));
+        assert_eq!(iter.next(), Some(&40));
+        assert_eq!(iter.next(), Some(&50));
+        assert_eq!(iter.next(), Some(&60));
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn backward_scan_repositions_when_current_node_vanishes() {
+        let set = three_node_set();
+
+        let mut iter = set.iter();
+        assert_eq!(iter.next_back(), Some(&60));
+        assert_eq!(iter.next_back(), Some(&50));
+
+        set.index.get(&60).expect("fixture entry").remove();
+
+        assert_eq!(iter.next_back(), Some(&40));
+        assert_eq!(iter.next_back(), Some(&30));
+        assert_eq!(iter.next_back(), Some(&20));
+        assert_eq!(iter.next_back(), Some(&10));
+        assert_eq!(iter.next_back(), Some(&0));
+        assert_eq!(iter.next_back(), None);
+    }
+
+    #[test]
+    fn forward_scan_does_not_re_yield_after_split_of_finished_node() {
+        // Nodes [0, 10] (key 10) and [20, 30, 40] (key 40), as left behind by
+        // a split of [0, 10, 20, 30].
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        for value in [0u64, 10, 20, 30, 40] {
+            set.insert(value);
+        }
+
+        // An iterator that had already yielded through 20 from the pre-split
+        // node and resumes positioned on the lower half: advancing into the
+        // upper half must not re-yield 20.
+        let iter = Iter {
+            tree: &set,
+            current_front_node: Some(set.index.front().expect("fixture node").value().clone()),
+            current_front_node_guard: None,
+            current_front_node_iter: None,
+            current_back_node: None,
+            current_back_node_guard: None,
+            current_back_node_iter: None,
+            current_front_value: Some(20),
+            current_back_value: None,
+            met: false,
+        };
+
+        assert_eq!(iter.copied().collect::<Vec<_>>(), vec![30, 40]);
+    }
+
+    #[test]
+    fn backward_scan_does_not_re_yield_values_from_scanned_range() {
+        // A stale-key window: the front node's maximum (35) grew past its
+        // index key (10) while the backward scan had already advanced below
+        // 30. Advancing into that node must not yield 35 again.
+        let set = BTreeSet::<u64>::new();
+        set.attach_node(vec![0u64, 10]);
+        set.attach_node(vec![30u64, 40]);
+        {
+            let node = set.index.front().expect("fixture node").value().clone();
+            let mut guard = node.lock();
+            NodeLike::insert(&mut *guard, 35u64);
+        }
+
+        let mut iter = Iter {
+            tree: &set,
+            current_front_node: None,
+            current_front_node_guard: None,
+            current_front_node_iter: None,
+            current_back_node: Some(set.index.back().expect("fixture node").value().clone()),
+            current_back_node_guard: None,
+            current_back_node_iter: None,
+            current_front_value: None,
+            current_back_value: Some(30),
+            met: false,
+        };
+
+        let mut collected = vec![];
+        while let Some(value) = iter.next_back() {
+            collected.push(*value);
+        }
+        assert_eq!(collected, vec![10, 0]);
+    }
+
+    #[test]
+    fn scans_stay_sorted_and_complete_under_monotonic_insert_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        const BASELINE: u64 = 400;
+        const EXTRA: u64 = 2_000;
+        const SCAN_BOUND: usize = 10_000;
+
+        // Small nodes: every monotonic insert re-keys the last node and
+        // regularly splits it, exercising the reposition paths constantly.
+        let set = Arc::new(BTreeSet::<u64>::with_maximum_node_size(8));
+        for value in 0..BASELINE {
+            set.insert(value);
+        }
+
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let set = Arc::clone(&set);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                for value in BASELINE..BASELINE + EXTRA {
+                    assert!(set.insert(value));
+                }
+                done.store(true, AtomicOrdering::Release);
+            })
+        };
+
+        let mut scans = 0usize;
+        loop {
+            let forward = set.iter().copied().collect::<Vec<_>>();
+            assert!(
+                forward.windows(2).all(|pair| pair[0] < pair[1]),
+                "forward scan not strictly increasing (duplicate or unordered yield)"
+            );
+            assert_eq!(
+                forward.iter().filter(|value| **value < BASELINE).count() as u64,
+                BASELINE,
+                "forward scan truncated: baseline keys missing"
+            );
+
+            let backward = set.iter().rev().copied().collect::<Vec<_>>();
+            assert!(
+                backward.windows(2).all(|pair| pair[0] > pair[1]),
+                "backward scan not strictly decreasing (duplicate or unordered yield)"
+            );
+            assert_eq!(
+                backward.iter().filter(|value| **value < BASELINE).count() as u64,
+                BASELINE,
+                "backward scan truncated: baseline keys missing"
+            );
+
+            scans += 1;
+            if done.load(AtomicOrdering::Acquire) || scans >= SCAN_BOUND {
+                break;
+            }
+        }
+
+        writer.join().unwrap();
+
+        let expected = (0..BASELINE + EXTRA).collect::<Vec<_>>();
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), expected);
+        assert_eq!(set.iter().rev().copied().collect::<Vec<_>>(), {
+            let mut reversed = expected;
+            reversed.reverse();
+            reversed
+        });
     }
 
     #[test]
