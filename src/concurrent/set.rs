@@ -2988,6 +2988,65 @@ mod tests {
     }
 
     #[test]
+    fn collected_owned_values_survive_arbitrary_concurrent_mutation() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        const BASELINE: u64 = 512;
+        const CHURN: u64 = 4_000;
+
+        // Small nodes so the churn constantly splits, re-keys, and unlinks
+        // the nodes the scans are walking.
+        let set = Arc::new(BTreeSet::<u64>::with_maximum_node_size(8));
+        for value in 0..BASELINE {
+            set.insert(value);
+        }
+
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let set = Arc::clone(&set);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                for value in BASELINE..BASELINE + CHURN {
+                    assert!(set.insert(value));
+                    assert_eq!(set.remove(&value), Some(value));
+                }
+                done.store(true, AtomicOrdering::Release);
+            })
+        };
+
+        // The type annotation is the point: collect() yields owned values,
+        // not references tied to node storage. Under the previous borrowed
+        // design this collected Vec<&u64> whose referents were unlocked node
+        // slots, a use-after-free under exactly this churn.
+        let mut snapshots: Vec<Vec<u64>> = Vec::new();
+        loop {
+            let snapshot: Vec<u64> = set.iter().collect();
+            snapshots.push(snapshot);
+            if done.load(AtomicOrdering::Acquire) {
+                break;
+            }
+        }
+        writer.join().unwrap();
+
+        // Mutate the set arbitrarily after the snapshots were taken; the
+        // snapshots must remain fully usable because they own their values.
+        set.remove_range(..);
+        assert!(set.is_empty());
+
+        for snapshot in snapshots {
+            assert!(
+                snapshot.windows(2).all(|pair| pair[0] < pair[1]),
+                "snapshot not strictly increasing"
+            );
+            assert_eq!(
+                snapshot.iter().filter(|value| **value < BASELINE).count() as u64,
+                BASELINE,
+                "snapshot lost baseline keys"
+            );
+        }
+    }
+
+    #[test]
     fn parallel_iter_and_mut() {
         let set = Arc::new(BTreeSet::<i32>::new());
         for i in 0..10_000 {
