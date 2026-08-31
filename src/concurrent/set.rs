@@ -241,11 +241,21 @@ where
                         return Ok((None, cdc));
                     }
 
-                    if let Some(old_max) = old_max {
-                        operation = Some(Operation::UpdateMax(target_node_entry.value().clone(), old_max))
-                    } else {
-                        return Ok((None, cdc));
-                    }
+                    // The node's maximum changed, so its index entry must be
+                    // re-keyed. Address the repair by the entry's CURRENT key,
+                    // not the observed maximum: during a stale-key window (a
+                    // concurrent writer changed the maximum but its own repair
+                    // has not committed, or a remove emptied the node before
+                    // this insert refilled it, leaving `old_max` as `None`)
+                    // the two differ, and a repair addressed by the maximum
+                    // misses the entry at commit time and is silently dropped,
+                    // leaving the entry permanently stale (unreachable values,
+                    // and a pending `MakeUnreachable` could unlink the node
+                    // containing this acknowledged insert).
+                    operation = Some(Operation::UpdateMax(
+                        target_node_entry.value().clone(),
+                        target_node_entry.key().clone(),
+                    ));
                 } else {
                     return Err((node_guard, idx, old_max.unwrap()));
                 }
@@ -459,14 +469,18 @@ where
                     return (Some(deleted), cdc);
                 }
 
+                // Address the repair by the entry's current key, not by the
+                // observed old maximum: see `put_checked_inner`. In a
+                // stale-key window they differ, and a repair addressed by the
+                // maximum is dropped at commit time, leaving the entry stale.
                 Some(Operation::UpdateMax(
                     target_node_entry.value().clone(),
-                    old_max.unwrap(),
+                    target_node_entry.key().clone(),
                 ))
             } else {
                 Some(Operation::MakeUnreachable(
                     target_node_entry.value().clone(),
-                    old_max.unwrap(),
+                    target_node_entry.key().clone(),
                 ))
             };
 
@@ -1940,6 +1954,43 @@ mod tests {
     }
 
     #[test]
+    fn remove_reaches_value_above_every_index_key() {
+        let set = BTreeSet::<u64>::new();
+        for value in [1u64, 2, 3] {
+            set.insert(value);
+        }
+
+        // Simulate a stale-key window: the last node's maximum grows past its
+        // index key before the UpdateMax repair commits. `contains` already
+        // reaches such a value through the back-node fallback; `remove` must
+        // reach it the same way.
+        {
+            let node = set.index.back().expect("node must exist").value().clone();
+            let mut guard = node.lock();
+            NodeLike::insert(&mut *guard, 5u64);
+        }
+
+        assert!(set.contains(&5));
+        assert_eq!(set.remove(&5), Some(5), "value above every index key must be removable");
+        assert!(!set.contains(&5));
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    // Simulates the first phase of a remove that empties a node: the elements
+    // are deleted under the node lock, leaving the index entry with a stale
+    // key, and the caller receives the not-yet-committed MakeUnreachable.
+    fn drain_node_with_pending_unlink(set: &BTreeSet<u64>, values: &[u64], stale_key: u64) -> Operation<u64, Vec<u64>> {
+        let node = set.index.back().expect("node must exist").value().clone();
+        {
+            let mut guard = node.lock();
+            for value in values {
+                NodeLike::delete(&mut *guard, value).expect("seeded value must be present");
+            }
+        }
+        Operation::MakeUnreachable(node, stale_key)
+    }
+
+    #[test]
     fn split_commit_against_drained_node_fails_instead_of_dropping_insert() {
         let set = BTreeSet::<u64>::new();
         for seeded in [10u64, 20, 30] {
@@ -1998,26 +2049,122 @@ mod tests {
     }
 
     #[test]
-    fn remove_reaches_value_above_every_index_key() {
-        let set = BTreeSet::<u64>::new();
-        for value in [1u64, 2, 3] {
-            set.insert(value);
-        }
+    fn insert_into_emptied_node_survives_stale_make_unreachable() {
+        // One value below and one above the stale index key.
+        for value in [5u64, 40u64] {
+            let set = BTreeSet::<u64>::new();
+            for seeded in [10u64, 20, 30] {
+                set.insert(seeded);
+            }
+            let pending_unlink = drain_node_with_pending_unlink(&set, &[10, 20, 30], 30);
 
-        // Simulate a stale-key window: the last node's maximum grows past its
-        // index key before the UpdateMax repair commits. `contains` already
-        // reaches such a value through the back-node fallback; `remove` must
-        // reach it the same way.
-        {
+            // The insert lands in the emptied node and must repair the stale
+            // index key immediately.
+            assert!(set.insert(value));
+
+            // The stale unlink then commits: it must not remove the node that
+            // now contains the acknowledged insert.
+            let _ = pending_unlink.commit::<false>(&set.index);
+
+            assert!(set.contains(&value), "value {value} lost after stale unlink");
+            assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![value]);
+            assert_eq!(set.remove(&value), Some(value));
+            assert!(!set.contains(&value));
+            assert_eq!(set.len(), 0);
+        }
+    }
+
+    #[test]
+    fn stale_make_unreachable_rekeys_refilled_node_instead_of_unlinking() {
+        for value in [5u64, 40u64] {
+            let set = BTreeSet::<u64>::new();
+            for seeded in [10u64, 20, 30] {
+                set.insert(seeded);
+            }
             let node = set.index.back().expect("node must exist").value().clone();
-            let mut guard = node.lock();
-            NodeLike::insert(&mut *guard, 5u64);
+            let pending_unlink = drain_node_with_pending_unlink(&set, &[10, 20, 30], 30);
+
+            // First phase of a concurrent insert: the value lands in the
+            // routed (empty) node under the node lock; the UpdateMax repair
+            // has not committed yet.
+            {
+                let mut guard = node.lock();
+                NodeLike::insert(&mut *guard, value);
+            }
+            let pending_repair = Operation::UpdateMax(node.clone(), 30u64);
+
+            // The remove's stale unlink commits first: it must observe the
+            // refilled node and re-key it rather than unlink it.
+            assert!(pending_unlink.commit::<false>(&set.index).is_ok());
+            // The insert's repair then finds the entry already re-keyed.
+            let _ = pending_repair.commit::<false>(&set.index);
+
+            assert!(set.contains(&value), "value {value} lost to stale unlink");
+            assert_eq!(set.remove(&value), Some(value));
+            assert!(set.is_empty());
+        }
+    }
+
+    #[test]
+    fn concurrent_remove_reinsert_over_emptying_nodes_preserves_all_keys() {
+        const THREADS: u64 = 4;
+        const ITERATIONS: u64 = 1_000;
+
+        // Tiny nodes over adjacent keys: removes empty nodes constantly, so
+        // inserts keep racing pending MakeUnreachable repairs.
+        let set = Arc::new(BTreeSet::<u64>::with_maximum_node_size(2));
+        for key in 0..THREADS {
+            set.insert(key);
         }
 
-        assert!(set.contains(&5));
-        assert_eq!(set.remove(&5), Some(5), "value above every index key must be removable");
-        assert!(!set.contains(&5));
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        let start = Arc::new(Barrier::new(THREADS as usize));
+        let (done_tx, done_rx) = mpsc::channel();
+        let handles = (0..THREADS)
+            .map(|key| {
+                let set = Arc::clone(&set);
+                let start = Arc::clone(&start);
+                let done_tx = done_tx.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..ITERATIONS {
+                        // A point remove may transiently miss while another
+                        // writer's index repair is still in flight, but the
+                        // acknowledged insert must never be LOST: under a
+                        // stable snapshot the key must still be somewhere, and
+                        // the self-healing repairs must make it removable
+                        // again promptly.
+                        let mut attempts = 0;
+                        while set.remove(&key).is_none() {
+                            let stable_guard = set.index_lock.write();
+                            let present = set.index.iter().any(|e| e.value().lock().contains(&key));
+                            drop(stable_guard);
+                            assert!(present, "acknowledged insert of {key} was lost");
+                            attempts += 1;
+                            assert!(attempts < 10_000, "key {key} present but never became removable");
+                            std::hint::spin_loop();
+                        }
+                        assert!(set.insert(key), "{key} still present after acknowledged remove");
+                    }
+                    done_tx.send(()).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(done_tx);
+
+        for _ in 0..THREADS {
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("remove/reinsert workload did not complete in time");
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for key in 0..THREADS {
+            assert!(set.contains(&key), "key {key} lost after churn");
+            assert_eq!(set.remove(&key), Some(key));
+        }
+        assert!(set.is_empty());
     }
 
     #[test]

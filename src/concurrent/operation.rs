@@ -133,27 +133,43 @@ where
             }
             Operation::UpdateMax(node, old_max) => {
                 let guard = node.lock_arc();
-                if guard.max().is_none() {
-                    return Ok((None, vec![]));
-                }
-                let new_max = guard.max().unwrap();
                 if let Some(entry) = index.get(&old_max) {
                     if Arc::ptr_eq(entry.value(), &node) {
-                        let cdc = vec![];
-                        return Ok(match new_max.cmp(&old_max) {
-                            std::cmp::Ordering::Equal => (None, cdc),
-                            std::cmp::Ordering::Greater => {
+                        let mut cdc = vec![];
+                        return Ok(match guard.max() {
+                            // The node was drained by a concurrent remove
+                            // after this repair was scheduled. Returning
+                            // without unlinking would leave a stale entry
+                            // pointing at an empty node: a routing black hole
+                            // whose pending `MakeUnreachable` (addressed by
+                            // the node's drained maximum, not this entry key)
+                            // can never remove it. Unlink it here; a racing
+                            // refill either completed before this commit (the
+                            // maximum is visible under the node lock) or will
+                            // route after it and no longer see this entry.
+                            None => {
+                                #[cfg(feature = "cdc")]
+                                if EMIT_CDC {
+                                    let node_removal = ChangeEventUnassigned::RemoveNode {
+                                        max_value: old_max.clone(),
+                                    };
+                                    cdc.push(node_removal);
+                                }
                                 index.remove(&old_max);
-                                index.insert(new_max.clone(), node.clone());
 
                                 (None, cdc)
                             }
-                            std::cmp::Ordering::Less => {
+                            // Re-key the entry to the node's current maximum,
+                            // in either direction.
+                            Some(new_max) if *new_max != old_max => {
+                                let new_max = new_max.clone();
                                 index.remove(&old_max);
-                                index.insert(new_max.clone(), node.clone());
+                                index.insert(new_max, node.clone());
 
                                 (None, cdc)
                             }
+                            // The entry key already matches the maximum.
+                            _ => (None, cdc),
                         });
                     }
                 }
@@ -162,11 +178,11 @@ where
             }
             Operation::MakeUnreachable(node, old_max) => {
                 let guard = node.lock_arc();
-                let new_max = guard.max();
                 if let Some(entry) = index.get(&old_max) {
                     if Arc::ptr_eq(entry.value(), &node) {
-                        return match new_max.cmp(&Some(&old_max)) {
-                            std::cmp::Ordering::Less => {
+                        return match guard.max() {
+                            // Still empty: unlink the node as requested.
+                            None => {
                                 let mut cdc = vec![];
 
                                 #[cfg(feature = "cdc")]
@@ -180,6 +196,20 @@ where
 
                                 Ok((None, cdc))
                             }
+                            // The node was refilled under the stale key by a
+                            // concurrent insert before this unlink committed.
+                            // Unlinking would silently drop the acknowledged
+                            // insert, so re-key the entry to the fresh maximum
+                            // instead (in either direction).
+                            Some(new_max) if *new_max != old_max => {
+                                let new_max = new_max.clone();
+                                index.remove(&old_max);
+                                index.insert(new_max, node.clone());
+
+                                Ok((None, vec![]))
+                            }
+                            // Refilled and the maximum matches the entry key:
+                            // nothing to repair.
                             _ => Err(()),
                         };
                     }
