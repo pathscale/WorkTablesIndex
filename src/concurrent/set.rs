@@ -827,23 +827,32 @@ where
     }
 }
 
+/// An owned-yield iterator over a concurrent `BTreeSet`.
+///
+/// The iterator clones one node's remaining elements into an owned batch
+/// while holding that node's mutex, releases the mutex, and then yields the
+/// clones. No node lock and no structural lock is ever held between calls to
+/// `next`/`next_back`, and every yielded `T` is an independent clone: items
+/// collected from this iterator stay valid under arbitrary concurrent
+/// mutation of the set.
+///
+/// The scan is weakly consistent, exactly like iterating any concurrent
+/// collection: elements inserted or removed while the scan is in flight may
+/// or may not be observed, but elements present for the whole scan are
+/// yielded exactly once, in order.
 pub struct Iter<'a, T, Node>
 where
     T: Debug + Ord + Clone + Send + 'static,
     Node: NodeLike<T> + Send + 'static,
 {
     tree: &'a BTreeSet<T, Node>,
-    // The node the installed iterator reads from; after exhaustion it is
-    // kept (with the exhausted flag set) so the next install can step past
-    // it by identity when the cursor lookup lands on it again.
-    current_front_node: Option<Arc<Mutex<Node>>>,
-    current_front_node_guard: Option<ArcMutexGuard<RawMutex, Node>>,
-    current_front_node_iter: Option<std::slice::Iter<'a, T>>,
-    front_node_exhausted: bool,
-    current_back_node: Option<Arc<Mutex<Node>>>,
-    current_back_node_guard: Option<ArcMutexGuard<RawMutex, Node>>,
-    current_back_node_iter: Option<std::slice::Iter<'a, T>>,
-    back_node_exhausted: bool,
+    current_front_batch: Option<std::vec::IntoIter<T>>,
+    current_back_batch: Option<std::vec::IntoIter<T>>,
+    // Identity of the node the last batch in each direction was cloned from,
+    // so the next install can step past it when the cursor lookup lands on
+    // it again (its entry key can sit past every element it still holds).
+    exhausted_front_node: Option<Arc<Mutex<Node>>>,
+    exhausted_back_node: Option<Arc<Mutex<Node>>>,
     current_front_value: Option<T>,
     current_back_value: Option<T>,
     met: bool,
@@ -856,219 +865,116 @@ where
 {
     pub fn new(btree: &'a BTreeSet<T, Node>) -> Self {
         // No node is chosen here: each direction positions itself from its
-        // cursor when it installs a node iterator, atomically with locking
-        // the node. Choosing a node ahead of time and locking it later left
-        // a window in which a split could migrate not-yet-yielded elements
-        // into a new node past the resume point (see `install_front`).
+        // cursor when it installs a batch, atomically with reading the node.
+        // Choosing a node ahead of time and locking it later reintroduces
+        // the split-migration window closed in `install_front_batch`.
         Self {
             tree: btree,
-            current_front_node: None,
-            current_front_node_guard: None,
-            current_front_node_iter: None,
-            front_node_exhausted: false,
-            current_back_node: None,
-            current_back_node_guard: None,
-            current_back_node_iter: None,
-            back_node_exhausted: false,
+            current_front_batch: None,
+            current_back_batch: None,
+            exhausted_front_node: None,
+            exhausted_back_node: None,
             current_front_value: None,
             current_back_value: None,
             met: false,
         }
     }
 
-    // Select the node covering the forward cursor and lock it in ONE atomic
-    // step under the structural read guard, then install the node iterator
-    // positioned just past the cursor. Returns false when no node remains.
+    // Select the node covering the forward cursor and clone its remaining
+    // elements (strictly above the cursor) into an owned batch. Returns
+    // false when no node remains and the scan is complete.
     //
-    // Both split commits and re-keys take the structural write lock and the
-    // node lock, so a node selected and locked under one structural read
-    // guard cannot change contents or move in between. Selecting under one
-    // guard and locking later allowed a split to keep the node's lower half
-    // in the selected Arc and move the upper half to a new node: elements a
-    // backward scan had not yielded yet migrated above its resume point and
-    // were silently skipped (deterministically reproduced by
-    // `backward_scan_does_not_skip_values_split_away_after_positioning`).
+    // Selection and the content read are ONE atomic step: the node is
+    // locked while the structural read guard is still held. Both split
+    // commits and re-keys take the structural write lock and the node lock,
+    // so the chosen node cannot change contents or move between being
+    // chosen and being read. Choosing under one guard and locking later
+    // allowed a split to migrate not-yet-yielded elements into a new node
+    // past the resume point, silently truncating the scan (deterministically
+    // reproduced by `backward_scan_does_not_skip_values_split_away_after_positioning`).
     //
-    // Locking follows `lock_node_for_value`: try-lock while holding the
-    // structural read guard; on contention release the guard, wait for the
-    // holder without pinning the structural mapping, and re-derive. After
-    // repeated contention the documented `index_lock -> node` order is used
-    // as a bounded progress fallback. The caller must hold no node guard in
-    // either direction (writers take `index_lock` before node locks, so
-    // holding a node mutex while acquiring `index_lock` deadlocks ABBA
-    // against a committer).
-    fn install_front(&mut self) -> bool {
-        let mut contentions = 0;
+    // Lock order is `index_lock` then node, the same order every writer
+    // uses, so this cannot deadlock ABBA against committers; holding the
+    // node mutex alone pins its contents, so the structural guard is
+    // released before the clone. No lock is held once this returns.
+    //
+    // One batched clone per node replaces the old per-item guard-holding
+    // scheme: the previous design kept the node mutex alive inside the
+    // iterator and transmuted the guard's slice iterator to the iterator's
+    // lifetime, which let callers hold `&T` into node storage after the
+    // guard was released (a use-after-free under concurrent mutation).
+    // Owned batches make that impossible by construction.
+    fn install_front_batch(&mut self) -> bool {
+        let structural_guard = self.tree.index_lock.read();
+        let candidate = match self.current_front_value.as_ref() {
+            Some(last_yielded) => self.tree.index.lower_bound(Bound::Excluded(last_yielded)),
+            None => self.tree.index.front(),
+        };
+        // Advance by the scan cursor with one logarithmic lookup: it lands
+        // on whichever node now covers the cursor even after re-keys or
+        // removals, and the yield-path filters skip anything already
+        // yielded. Step past the just-exhausted node by identity so the
+        // scan always makes progress.
+        let entry = match (candidate, self.exhausted_front_node.as_ref()) {
+            (Some(entry), Some(exhausted)) if Arc::ptr_eq(entry.value(), exhausted) => entry.next(),
+            (candidate, _) => candidate,
+        };
+        let Some(entry) = entry else {
+            return false;
+        };
+        let node = entry.value().clone();
+        let guard = node.lock_arc();
+        drop(structural_guard);
 
-        loop {
-            let structural_guard = self.tree.index_lock.read();
-            let candidate = match self.current_front_value.as_ref() {
-                Some(last_yielded) => self.tree.index.lower_bound(Bound::Excluded(last_yielded)),
-                None => self.tree.index.front(),
-            };
-            // Advance by the scan cursor with one logarithmic lookup: it
-            // lands on whichever node now covers the cursor even after
-            // re-keys or removals, and the yield-path filters skip anything
-            // already yielded. Step past the just-exhausted node by identity
-            // (its entry key can sit above every element it still holds) so
-            // the scan always makes progress.
-            let entry = match candidate {
-                Some(entry)
-                    if self.front_node_exhausted
-                        && self
-                            .current_front_node
-                            .as_ref()
-                            .is_some_and(|exhausted| Arc::ptr_eq(entry.value(), exhausted)) =>
-                {
-                    entry.next()
-                }
-                candidate => candidate,
-            };
-            let Some(entry) = entry else {
-                return false;
-            };
-            let node = entry.value().clone();
+        let skip = self
+            .current_front_value
+            .as_ref()
+            .and_then(|value| guard.rank(Bound::Excluded(value), true))
+            .map_or(0, |rank| rank + 1);
+        let batch = guard.iter().skip(skip).cloned().collect::<Vec<_>>();
+        drop(guard);
 
-            let node_guard = if let Some(node_guard) = node.try_lock_arc() {
-                node_guard
-            } else {
-                contentions += 1;
-                if contentions >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
-                    node.lock_arc()
-                } else {
-                    drop(structural_guard);
-                    // Wait for the observed holder without pinning the
-                    // structural mapping, then retry so the installed node
-                    // always corresponds to a mapping observed while it was
-                    // already locked.
-                    drop(node.lock_arc());
-                    continue;
-                }
-            };
-            drop(structural_guard);
-
-            self.front_node_exhausted = false;
-            self.current_front_node = Some(node);
-            self.current_front_node_guard = Some(node_guard);
-            self.current_front_node_iter = Some(unsafe {
-                std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
-                    self.current_front_node_guard
-                        .as_ref()
-                        .expect("was just set before")
-                        .iter(),
-                )
-            });
-
-            // Skip everything at or below the cursor in one rank lookup;
-            // the yield-path filters keep this correct even when the rank
-            // finds nothing to skip.
-            if let Some(current_front_value) = self.current_front_value.as_ref() {
-                if let Some(rank) = self
-                    .current_front_node_guard
-                    .as_ref()
-                    .expect("was just set before")
-                    .rank(Bound::Excluded(current_front_value), true)
-                {
-                    let _ = self
-                        .current_front_node_iter
-                        .as_mut()
-                        .expect("was just set before")
-                        .nth(rank);
-                }
-            }
-
-            return true;
-        }
+        self.exhausted_front_node = Some(node);
+        self.current_front_batch = Some(batch.into_iter());
+        true
     }
 
-    // Mirror of `install_front` for the backward cursor: select the node
-    // covering the cursor (the last node when every entry key sits below
-    // it), lock it atomically, and skip everything at or above the cursor.
-    fn install_back(&mut self) -> bool {
-        let mut contentions = 0;
+    // Mirror of `install_front_batch` for the backward cursor: select the
+    // node covering the cursor (the last node when every entry key sits
+    // below it) and clone the elements strictly below the cursor.
+    fn install_back_batch(&mut self) -> bool {
+        let structural_guard = self.tree.index_lock.read();
+        let candidate = match self.current_back_value.as_ref() {
+            Some(last_yielded) => self
+                .tree
+                .index
+                .lower_bound(Bound::Included(last_yielded))
+                .or_else(|| self.tree.index.back()),
+            None => self.tree.index.back(),
+        };
+        let entry = match (candidate, self.exhausted_back_node.as_ref()) {
+            (Some(entry), Some(exhausted)) if Arc::ptr_eq(entry.value(), exhausted) => entry.prev(),
+            (candidate, _) => candidate,
+        };
+        let Some(entry) = entry else {
+            return false;
+        };
+        let node = entry.value().clone();
+        let guard = node.lock_arc();
+        drop(structural_guard);
 
-        loop {
-            let structural_guard = self.tree.index_lock.read();
-            let candidate = match self.current_back_value.as_ref() {
-                Some(last_yielded) => self
-                    .tree
-                    .index
-                    .lower_bound(Bound::Included(last_yielded))
-                    .or_else(|| self.tree.index.back()),
-                None => self.tree.index.back(),
-            };
-            let entry = match candidate {
-                Some(entry)
-                    if self.back_node_exhausted
-                        && self
-                            .current_back_node
-                            .as_ref()
-                            .is_some_and(|exhausted| Arc::ptr_eq(entry.value(), exhausted)) =>
-                {
-                    entry.prev()
-                }
-                candidate => candidate,
-            };
-            let Some(entry) = entry else {
-                return false;
-            };
-            let node = entry.value().clone();
+        let truncate = self
+            .current_back_value
+            .as_ref()
+            .and_then(|value| guard.rank(Bound::Excluded(value), false))
+            .map_or(0, |rank| rank + 1);
+        let keep = guard.len() - truncate;
+        let batch = guard.iter().take(keep).cloned().collect::<Vec<_>>();
+        drop(guard);
 
-            let node_guard = if let Some(node_guard) = node.try_lock_arc() {
-                node_guard
-            } else {
-                contentions += 1;
-                if contentions >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
-                    node.lock_arc()
-                } else {
-                    drop(structural_guard);
-                    // See `install_front`.
-                    drop(node.lock_arc());
-                    continue;
-                }
-            };
-            drop(structural_guard);
-
-            self.back_node_exhausted = false;
-            self.current_back_node = Some(node);
-            self.current_back_node_guard = Some(node_guard);
-            self.current_back_node_iter = Some(unsafe {
-                std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
-                    self.current_back_node_guard
-                        .as_ref()
-                        .expect("was just set before")
-                        .iter(),
-                )
-            });
-
-            if let Some(current_back_value) = self.current_back_value.as_ref() {
-                if let Some(rank) = self
-                    .current_back_node_guard
-                    .as_ref()
-                    .expect("was just set before")
-                    .rank(Bound::Excluded(current_back_value), false)
-                {
-                    let _ = self
-                        .current_back_node_iter
-                        .as_mut()
-                        .expect("was just set before")
-                        .nth_back(rank);
-                }
-            }
-
-            return true;
-        }
-    }
-
-    // The scan is finished: release every guard. A met iterator that stays
-    // alive must not keep a node pinned - that starves writers and
-    // self-deadlocks any same-thread lock of the node (including a second
-    // iterator).
-    fn release_all_guards(&mut self) {
-        self.current_front_node_iter = None;
-        self.current_front_node_guard = None;
-        self.current_back_node_iter = None;
-        self.current_back_node_guard = None;
+        self.exhausted_back_node = Some(node);
+        self.current_back_batch = Some(batch.into_iter());
+        true
     }
 }
 
@@ -1077,7 +983,7 @@ where
     T: Debug + Ord + Clone + Send + 'static,
     Node: NodeLike<T> + Send + 'static,
 {
-    type Item = &'a T;
+    type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -1085,24 +991,13 @@ where
                 return None;
             }
 
-            // Only one direction holds a node guard at a time: the opposite
-            // side is released before any structural-lock acquisition (its
-            // node and cursor survive; its next call re-locks through the
-            // cursor). Writers take `index_lock` and then node locks, so a
-            // scan holding a node mutex while acquiring `index_lock` would
-            // deadlock ABBA against a committer.
-            if self.current_back_node_guard.is_some() {
-                self.current_back_node_guard = None;
-                self.current_back_node_iter = None;
-            }
-
-            if self.current_front_node_iter.is_none() && !self.install_front() {
+            if self.current_front_batch.is_none() && !self.install_front_batch() {
                 return None;
             }
 
-            let iter = self.current_front_node_iter.as_mut().expect("installed above");
-            if let Some(value) = iter.next() {
-                // A node installed after repositioning can re-expose
+            let batch = self.current_front_batch.as_mut().expect("installed above");
+            if let Some(value) = batch.next() {
+                // A batch installed after repositioning can re-expose
                 // elements at or below the last yielded value (a split
                 // re-distributes the just-finished node, a repositioned node
                 // covers part of the scanned range). Skip them instead of
@@ -1115,16 +1010,13 @@ where
                 if let Some(current_back_value) = self.current_back_value.as_ref() {
                     if value.ge(current_back_value) {
                         self.met = true;
-                        self.release_all_guards();
                         return None;
                     }
                 }
                 self.current_front_value = Some(value.clone());
                 return Some(value);
             } else {
-                self.current_front_node_iter = None;
-                self.current_front_node_guard = None;
-                self.front_node_exhausted = true;
+                self.current_front_batch = None;
             }
         }
     }
@@ -1141,21 +1033,15 @@ where
                 return None;
             }
 
-            // See `next`: only one direction holds a node guard at a time.
-            if self.current_front_node_guard.is_some() {
-                self.current_front_node_guard = None;
-                self.current_front_node_iter = None;
-            }
-
-            if self.current_back_node_iter.is_none() && !self.install_back() {
+            if self.current_back_batch.is_none() && !self.install_back_batch() {
                 return None;
             }
 
-            let iter = self.current_back_node_iter.as_mut().expect("installed above");
-            if let Some(value) = iter.next_back() {
+            let batch = self.current_back_batch.as_mut().expect("installed above");
+            if let Some(value) = batch.next_back() {
                 // Mirror of the forward path: skip elements at or above the
                 // last value yielded from the back, which a freshly
-                // installed node iterator can re-expose after churn.
+                // installed batch can re-expose after churn.
                 if let Some(current_back_value) = self.current_back_value.as_ref() {
                     if value.ge(current_back_value) {
                         continue;
@@ -1164,16 +1050,13 @@ where
                 if let Some(current_front_value) = self.current_front_value.as_ref() {
                     if value.le(current_front_value) {
                         self.met = true;
-                        self.release_all_guards();
                         return None;
                     }
                 }
                 self.current_back_value = Some(value.clone());
                 return Some(value);
             } else {
-                self.current_back_node_iter = None;
-                self.current_back_node_guard = None;
-                self.back_node_exhausted = true;
+                self.current_back_batch = None;
             }
         }
     }
@@ -1186,7 +1069,7 @@ where
     T: Debug + Ord + Send + Clone,
     Node: NodeLike<T> + Send + 'static,
 {
-    type Item = &'a T;
+    type Item = T;
 
     type IntoIter = Iter<'a, T, Node>;
 
@@ -1195,6 +1078,8 @@ where
     }
 }
 
+/// An owned-yield double-ended range iterator; see [`Iter`] for the
+/// consistency and cloning semantics.
 pub struct Range<'a, T, Node>
 where
     T: Debug + Ord + Clone + Send + 'static,
@@ -1314,20 +1199,16 @@ where
         }
 
         // Only the cursor sentinels position the iterator: each direction
-        // selects and locks its node atomically at install time. Prewiring
-        // the entries' node Arcs here would reintroduce the select-then-lock
-        // split-migration window (see `Iter::install_front`).
+        // selects and reads its node atomically at install time. Prewiring
+        // the entries' node Arcs here would reintroduce the choose-then-lock
+        // split-migration window (see `Iter::install_front_batch`).
         Self {
             iter: Iter {
                 tree: btree,
-                current_front_node: None,
-                current_front_node_guard: None,
-                current_front_node_iter: None,
-                front_node_exhausted: false,
-                current_back_node: None,
-                current_back_node_guard: None,
-                current_back_node_iter: None,
-                back_node_exhausted: false,
+                current_front_batch: None,
+                current_back_batch: None,
+                exhausted_front_node: None,
+                exhausted_back_node: None,
                 current_front_value: front_value,
                 current_back_value: back_value,
                 met,
@@ -1341,7 +1222,7 @@ where
     T: Debug + Ord + Clone + Send + 'static,
     Node: NodeLike<T> + Send + 'static,
 {
-    type Item = &'a T;
+    type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next()
@@ -1373,6 +1254,10 @@ where
     /// Gets an iterator that visits the elements in the `BTreeSet` in ascending
     /// order.
     ///
+    /// The iterator yields owned clones of the stored elements (see [`Iter`]):
+    /// collected values remain valid under arbitrary concurrent mutation of
+    /// the set.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1380,9 +1265,9 @@ where
     ///
     /// let set = BTreeSet::from_iter([1, 2, 3]);
     /// let mut set_iter = set.iter();
-    /// assert_eq!(set_iter.next(), Some(&1));
-    /// assert_eq!(set_iter.next(), Some(&2));
-    /// assert_eq!(set_iter.next(), Some(&3));
+    /// assert_eq!(set_iter.next(), Some(1));
+    /// assert_eq!(set_iter.next(), Some(2));
+    /// assert_eq!(set_iter.next(), Some(3));
     /// assert_eq!(set_iter.next(), None);
     /// ```
     ///
@@ -1393,9 +1278,9 @@ where
     ///
     /// let set = BTreeSet::from_iter([3, 1, 2]);
     /// let mut set_iter = set.iter();
-    /// assert_eq!(set_iter.next(), Some(&1));
-    /// assert_eq!(set_iter.next(), Some(&2));
-    /// assert_eq!(set_iter.next(), Some(&3));
+    /// assert_eq!(set_iter.next(), Some(1));
+    /// assert_eq!(set_iter.next(), Some(2));
+    /// assert_eq!(set_iter.next(), Some(3));
     /// assert_eq!(set_iter.next(), None);
     /// ```
     pub fn iter(&'a self) -> Iter<'a, T, Node> {
@@ -1423,10 +1308,10 @@ where
     /// set.insert(3);
     /// set.insert(5);
     /// set.insert(8);
-    /// for &elem in set.range((Included(&4), Included(&8))) {
+    /// for elem in set.range((Included(&4), Included(&8))) {
     ///     println!("{elem}");
     /// }
-    /// assert_eq!(Some(&5), set.range(4..).next());
+    /// assert_eq!(Some(5), set.range(4..).next());
     /// ```
     pub fn range<Q, R>(&'a self, range: R) -> Range<'a, T, Node>
     where
@@ -1579,7 +1464,7 @@ mod tests {
             set.insert(value);
         }
 
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), (0..10).collect::<Vec<_>>());
+        assert_eq!(set.iter().collect::<Vec<_>>(), (0..10).collect::<Vec<_>>());
     }
 
     // Regression for https://github.com/lucidarium-systems/indexset/issues/57.
@@ -1591,7 +1476,7 @@ mod tests {
             set.insert(value);
         }
 
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), (0..20).collect::<Vec<_>>());
+        assert_eq!(set.iter().collect::<Vec<_>>(), (0..20).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1621,7 +1506,7 @@ mod tests {
 
         let expected = (0..WRITERS * VALUES_PER_WRITER).collect::<Vec<_>>();
         assert_eq!(set.len(), expected.len());
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), expected);
+        assert_eq!(set.iter().collect::<Vec<_>>(), expected);
     }
 
     #[test]
@@ -1779,7 +1664,7 @@ mod tests {
         let set = BTreeSet::<i32>::new();
         set.insert(1);
         let mut iter = set.into_iter();
-        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next(), Some(1));
         assert_eq!(iter.next(), None);
         assert_eq!(iter.next_back(), None);
     }
@@ -1791,9 +1676,9 @@ mod tests {
         set.insert(2);
         set.insert(3);
         let mut iter = set.into_iter();
-        assert_eq!(iter.next(), Some(&1));
-        assert_eq!(iter.next_back(), Some(&3));
-        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next(), Some(1));
+        assert_eq!(iter.next_back(), Some(3));
+        assert_eq!(iter.next(), Some(2));
         assert_eq!(iter.next(), None);
         assert_eq!(iter.next_back(), None);
     }
@@ -1811,11 +1696,11 @@ mod tests {
 
             let expected_next = i + 1;
             let actual_next = iter.next();
-            assert_eq!(actual_next, Some(&expected_next), "Tree: {:?}", tree);
+            assert_eq!(actual_next, Some(expected_next), "Tree: {:?}", tree);
 
             let expected_next_back = 20 - i;
             let actual_next_back = iter.next_back();
-            assert_eq!(actual_next_back, Some(&expected_next_back), "Tree: {:?}", tree);
+            assert_eq!(actual_next_back, Some(expected_next_back), "Tree: {:?}", tree);
         }
         assert_eq!(iter.next(), None);
         assert_eq!(iter.next_back(), None);
@@ -1826,7 +1711,7 @@ mod tests {
         let set = BTreeSet::<i32>::new();
         set.insert(1);
         let mut iter = set.into_iter();
-        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next(), Some(1));
         assert_eq!(iter.next(), None);
         assert_eq!(iter.next(), None);
     }
@@ -1836,7 +1721,7 @@ mod tests {
         let set = BTreeSet::<i32>::new();
         set.insert(1);
         let mut iter = set.into_iter();
-        assert_eq!(iter.next_back(), Some(&1));
+        assert_eq!(iter.next_back(), Some(1));
         assert_eq!(iter.next_back(), None);
         assert_eq!(iter.next_back(), None);
     }
@@ -1854,19 +1739,11 @@ mod tests {
     fn test_iterating_over_blocks() {
         let btree = BTreeSet::from_iter((0..(DEFAULT_INNER_SIZE + 10)).into_iter());
         assert_eq!(btree.iter().count(), (0..(DEFAULT_INNER_SIZE + 10)).count());
-        let start = btree
-            .range(0..DEFAULT_INNER_SIZE)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let start = btree.range(0..DEFAULT_INNER_SIZE).into_iter().collect::<Vec<_>>();
 
         assert_eq!(start, (0..DEFAULT_INNER_SIZE).collect::<Vec<_>>());
         assert_eq!(
-            btree
-                .range(0..=DEFAULT_INNER_SIZE)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>(),
+            btree.range(0..=DEFAULT_INNER_SIZE).into_iter().collect::<Vec<_>>(),
             (0..=DEFAULT_INNER_SIZE).collect::<Vec<_>>()
         );
         assert_eq!(
@@ -1989,7 +1866,7 @@ mod tests {
             set.insert(value);
         }
         set.remove_range(7..);
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), (0..7).collect::<Vec<_>>());
+        assert_eq!(set.iter().collect::<Vec<_>>(), (0..7).collect::<Vec<_>>());
 
         // `..` must clear every node, not only the first one.
         let set = BTreeSet::<u64>::with_maximum_node_size(4);
@@ -2006,7 +1883,7 @@ mod tests {
             set.insert(value);
         }
         set.remove_range(3..=5);
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 6, 7, 8, 9]);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 1, 2, 6, 7, 8, 9]);
 
         // `x..=x` must remove exactly x, not drain to the node end.
         let set = BTreeSet::<u64>::with_maximum_node_size(4);
@@ -2014,7 +1891,7 @@ mod tests {
             set.insert(value);
         }
         set.remove_range(2..=2);
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 1, 3, 4, 5, 6, 7, 8, 9]);
 
         // An exclusive end equal to a node maximum must not drain the
         // following node.
@@ -2025,7 +1902,7 @@ mod tests {
         let boundary = *set.index.front().expect("node must exist").key();
         set.remove_range(0..boundary);
         let expected = (0..9).filter(|value| *value >= boundary).collect::<Vec<_>>();
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), expected);
+        assert_eq!(set.iter().collect::<Vec<_>>(), expected);
     }
 
     #[test]
@@ -2044,7 +1921,7 @@ mod tests {
             set.remove_range(range);
 
             assert_eq!(
-                set.iter().copied().collect::<Vec<_>>(),
+                set.iter().collect::<Vec<_>>(),
                 oracle.iter().copied().collect::<Vec<_>>(),
                 "node_size={node_size}, start={start:?}, end={end:?}"
             );
@@ -2116,7 +1993,7 @@ mod tests {
         assert!(set.contains(&5));
         assert_eq!(set.remove(&5), Some(5), "value above every index key must be removable");
         assert!(!set.contains(&5));
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     // Simulates the first phase of a remove that empties a node: the elements
@@ -2214,7 +2091,7 @@ mod tests {
             let _ = pending_unlink.commit::<false>(&set.index, super::no_identity_adoption);
 
             assert!(set.contains(&value), "value {value} lost after stale unlink");
-            assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![value]);
+            assert_eq!(set.iter().collect::<Vec<_>>(), vec![value]);
             assert_eq!(set.remove(&value), Some(value));
             assert!(!set.contains(&value));
             assert_eq!(set.len(), 0);
@@ -2398,10 +2275,10 @@ mod tests {
         }
 
         assert_eq!(set.remove_where(|value| *value == 3), Some(3));
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
 
         assert!(set.insert(4));
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
     }
 
     #[cfg(feature = "multimap")]
@@ -2551,132 +2428,132 @@ mod tests {
         // [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
         // First value of the node only
-        assert_eq!(set.range(0..=0).collect::<Vec<_>>(), vec![&0]);
-        assert_eq!(set.range(0..1).collect::<Vec<_>>(), vec![&0]);
+        assert_eq!(set.range(0..=0).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(set.range(0..1).collect::<Vec<_>>(), vec![0]);
 
-        assert_eq!(set.range(5..=5).collect::<Vec<_>>(), vec![&5]);
-        assert_eq!(set.range(5..6).collect::<Vec<_>>(), vec![&5]);
+        assert_eq!(set.range(5..=5).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(set.range(5..6).collect::<Vec<_>>(), vec![5]);
 
-        assert_eq!(set.range(10..=10).collect::<Vec<_>>(), vec![&10]);
-        assert_eq!(set.range(10..11).collect::<Vec<_>>(), vec![&10]);
+        assert_eq!(set.range(10..=10).collect::<Vec<_>>(), vec![10]);
+        assert_eq!(set.range(10..11).collect::<Vec<_>>(), vec![10]);
 
         // From first value to middle
-        assert_eq!(set.range(0..=3).collect::<Vec<_>>(), vec![&0, &1, &2, &3]);
-        assert_eq!(set.range(0..3).collect::<Vec<_>>(), vec![&0, &1, &2]);
+        assert_eq!(set.range(0..=3).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(set.range(0..3).collect::<Vec<_>>(), vec![0, 1, 2]);
 
-        assert_eq!(set.range(5..=8).collect::<Vec<_>>(), vec![&5, &6, &7, &8]);
-        assert_eq!(set.range(5..8).collect::<Vec<_>>(), vec![&5, &6, &7]);
+        assert_eq!(set.range(5..=8).collect::<Vec<_>>(), vec![5, 6, 7, 8]);
+        assert_eq!(set.range(5..8).collect::<Vec<_>>(), vec![5, 6, 7]);
 
-        assert_eq!(set.range(10..=13).collect::<Vec<_>>(), vec![&10, &11, &12, &13]);
-        assert_eq!(set.range(10..13).collect::<Vec<_>>(), vec![&10, &11, &12]);
+        assert_eq!(set.range(10..=13).collect::<Vec<_>>(), vec![10, 11, 12, 13]);
+        assert_eq!(set.range(10..13).collect::<Vec<_>>(), vec![10, 11, 12]);
 
         // Last value of the node
-        assert_eq!(set.range(4..=4).collect::<Vec<_>>(), vec![&4]);
-        assert_eq!(set.range(4..5).collect::<Vec<_>>(), vec![&4]);
+        assert_eq!(set.range(4..=4).collect::<Vec<_>>(), vec![4]);
+        assert_eq!(set.range(4..5).collect::<Vec<_>>(), vec![4]);
 
-        assert_eq!(set.range(9..=9).collect::<Vec<_>>(), vec![&9]);
-        assert_eq!(set.range(9..10).collect::<Vec<_>>(), vec![&9]);
+        assert_eq!(set.range(9..=9).collect::<Vec<_>>(), vec![9]);
+        assert_eq!(set.range(9..10).collect::<Vec<_>>(), vec![9]);
 
-        assert_eq!(set.range(19..=19).collect::<Vec<_>>(), vec![&19]);
-        assert_eq!(set.range(19..20).collect::<Vec<_>>(), vec![&19]);
+        assert_eq!(set.range(19..=19).collect::<Vec<_>>(), vec![19]);
+        assert_eq!(set.range(19..20).collect::<Vec<_>>(), vec![19]);
 
         // From middle to last value of the node
-        assert_eq!(set.range(17..=19).collect::<Vec<_>>(), vec![&17, &18, &19]);
-        assert_eq!(set.range(17..20).collect::<Vec<_>>(), vec![&17, &18, &19]);
+        assert_eq!(set.range(17..=19).collect::<Vec<_>>(), vec![17, 18, 19]);
+        assert_eq!(set.range(17..20).collect::<Vec<_>>(), vec![17, 18, 19]);
 
-        assert_eq!(set.range(7..=9).collect::<Vec<_>>(), vec![&7, &8, &9]);
-        assert_eq!(set.range(7..10).collect::<Vec<_>>(), vec![&7, &8, &9]);
+        assert_eq!(set.range(7..=9).collect::<Vec<_>>(), vec![7, 8, 9]);
+        assert_eq!(set.range(7..10).collect::<Vec<_>>(), vec![7, 8, 9]);
 
-        assert_eq!(set.range(2..=4).collect::<Vec<_>>(), vec![&2, &3, &4]);
-        assert_eq!(set.range(2..5).collect::<Vec<_>>(), vec![&2, &3, &4]);
+        assert_eq!(set.range(2..=4).collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert_eq!(set.range(2..5).collect::<Vec<_>>(), vec![2, 3, 4]);
 
         // Full node
-        assert_eq!(set.range(0..=4).collect::<Vec<_>>(), vec![&0, &1, &2, &3, &4]);
-        assert_eq!(set.range(0..5).collect::<Vec<_>>(), vec![&0, &1, &2, &3, &4]);
+        assert_eq!(set.range(0..=4).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+        assert_eq!(set.range(0..5).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
 
-        assert_eq!(set.range(5..=9).collect::<Vec<_>>(), vec![&5, &6, &7, &8, &9]);
-        assert_eq!(set.range(5..10).collect::<Vec<_>>(), vec![&5, &6, &7, &8, &9]);
+        assert_eq!(set.range(5..=9).collect::<Vec<_>>(), vec![5, 6, 7, 8, 9]);
+        assert_eq!(set.range(5..10).collect::<Vec<_>>(), vec![5, 6, 7, 8, 9]);
 
         assert_eq!(
             set.range(10..=19).collect::<Vec<_>>(),
-            vec![&10, &11, &12, &13, &14, &15, &16, &17, &18, &19]
+            vec![10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
         assert_eq!(
             set.range(10..20).collect::<Vec<_>>(),
-            vec![&10, &11, &12, &13, &14, &15, &16, &17, &18, &19]
+            vec![10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
 
         // Node intersection
-        assert_eq!(set.range(3..=6).collect::<Vec<_>>(), vec![&3, &4, &5, &6]);
-        assert_eq!(set.range(3..7).collect::<Vec<_>>(), vec![&3, &4, &5, &6]);
+        assert_eq!(set.range(3..=6).collect::<Vec<_>>(), vec![3, 4, 5, 6]);
+        assert_eq!(set.range(3..7).collect::<Vec<_>>(), vec![3, 4, 5, 6]);
 
-        assert_eq!(set.range(8..=11).collect::<Vec<_>>(), vec![&8, &9, &10, &11]);
-        assert_eq!(set.range(8..12).collect::<Vec<_>>(), vec![&8, &9, &10, &11]);
+        assert_eq!(set.range(8..=11).collect::<Vec<_>>(), vec![8, 9, 10, 11]);
+        assert_eq!(set.range(8..12).collect::<Vec<_>>(), vec![8, 9, 10, 11]);
 
         // REVERSED
 
         // First value of the node only
-        assert_eq!(set.range(0..=0).rev().collect::<Vec<_>>(), vec![&0]);
-        assert_eq!(set.range(0..1).rev().collect::<Vec<_>>(), vec![&0]);
+        assert_eq!(set.range(0..=0).rev().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(set.range(0..1).rev().collect::<Vec<_>>(), vec![0]);
 
-        assert_eq!(set.range(5..=5).rev().collect::<Vec<_>>(), vec![&5]);
-        assert_eq!(set.range(5..6).rev().collect::<Vec<_>>(), vec![&5]);
+        assert_eq!(set.range(5..=5).rev().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(set.range(5..6).rev().collect::<Vec<_>>(), vec![5]);
 
-        assert_eq!(set.range(10..=10).rev().collect::<Vec<_>>(), vec![&10]);
-        assert_eq!(set.range(10..11).rev().collect::<Vec<_>>(), vec![&10]);
+        assert_eq!(set.range(10..=10).rev().collect::<Vec<_>>(), vec![10]);
+        assert_eq!(set.range(10..11).rev().collect::<Vec<_>>(), vec![10]);
 
         // From first value to middle
-        assert_eq!(set.range(0..=3).rev().collect::<Vec<_>>(), vec![&3, &2, &1, &0]);
-        assert_eq!(set.range(0..3).rev().collect::<Vec<_>>(), vec![&2, &1, &0]);
+        assert_eq!(set.range(0..=3).rev().collect::<Vec<_>>(), vec![3, 2, 1, 0]);
+        assert_eq!(set.range(0..3).rev().collect::<Vec<_>>(), vec![2, 1, 0]);
 
-        assert_eq!(set.range(5..=8).rev().collect::<Vec<_>>(), vec![&8, &7, &6, &5]);
-        assert_eq!(set.range(5..8).rev().collect::<Vec<_>>(), vec![&7, &6, &5]);
+        assert_eq!(set.range(5..=8).rev().collect::<Vec<_>>(), vec![8, 7, 6, 5]);
+        assert_eq!(set.range(5..8).rev().collect::<Vec<_>>(), vec![7, 6, 5]);
 
-        assert_eq!(set.range(10..=13).rev().collect::<Vec<_>>(), vec![&13, &12, &11, &10]);
-        assert_eq!(set.range(10..13).rev().collect::<Vec<_>>(), vec![&12, &11, &10]);
+        assert_eq!(set.range(10..=13).rev().collect::<Vec<_>>(), vec![13, 12, 11, 10]);
+        assert_eq!(set.range(10..13).rev().collect::<Vec<_>>(), vec![12, 11, 10]);
 
         // Last value of the node
-        assert_eq!(set.range(4..=4).rev().collect::<Vec<_>>(), vec![&4]);
-        assert_eq!(set.range(4..5).rev().collect::<Vec<_>>(), vec![&4]);
+        assert_eq!(set.range(4..=4).rev().collect::<Vec<_>>(), vec![4]);
+        assert_eq!(set.range(4..5).rev().collect::<Vec<_>>(), vec![4]);
 
-        assert_eq!(set.range(9..=9).rev().collect::<Vec<_>>(), vec![&9]);
-        assert_eq!(set.range(9..10).rev().collect::<Vec<_>>(), vec![&9]);
+        assert_eq!(set.range(9..=9).rev().collect::<Vec<_>>(), vec![9]);
+        assert_eq!(set.range(9..10).rev().collect::<Vec<_>>(), vec![9]);
 
-        assert_eq!(set.range(19..=19).rev().collect::<Vec<_>>(), vec![&19]);
-        assert_eq!(set.range(19..20).rev().collect::<Vec<_>>(), vec![&19]);
+        assert_eq!(set.range(19..=19).rev().collect::<Vec<_>>(), vec![19]);
+        assert_eq!(set.range(19..20).rev().collect::<Vec<_>>(), vec![19]);
 
         // From middle to last value of the node
-        assert_eq!(set.range(17..=19).rev().collect::<Vec<_>>(), vec![&19, &18, &17]);
-        assert_eq!(set.range(17..20).rev().collect::<Vec<_>>(), vec![&19, &18, &17]);
+        assert_eq!(set.range(17..=19).rev().collect::<Vec<_>>(), vec![19, 18, 17]);
+        assert_eq!(set.range(17..20).rev().collect::<Vec<_>>(), vec![19, 18, 17]);
 
-        assert_eq!(set.range(7..=9).rev().collect::<Vec<_>>(), vec![&9, &8, &7]);
-        assert_eq!(set.range(7..10).rev().collect::<Vec<_>>(), vec![&9, &8, &7]);
+        assert_eq!(set.range(7..=9).rev().collect::<Vec<_>>(), vec![9, 8, 7]);
+        assert_eq!(set.range(7..10).rev().collect::<Vec<_>>(), vec![9, 8, 7]);
 
-        assert_eq!(set.range(2..=4).rev().collect::<Vec<_>>(), vec![&4, &3, &2]);
-        assert_eq!(set.range(2..5).rev().collect::<Vec<_>>(), vec![&4, &3, &2]);
+        assert_eq!(set.range(2..=4).rev().collect::<Vec<_>>(), vec![4, 3, 2]);
+        assert_eq!(set.range(2..5).rev().collect::<Vec<_>>(), vec![4, 3, 2]);
 
         // Full node
-        assert_eq!(set.range(0..=4).rev().collect::<Vec<_>>(), vec![&4, &3, &2, &1, &0]);
-        assert_eq!(set.range(0..5).rev().collect::<Vec<_>>(), vec![&4, &3, &2, &1, &0]);
+        assert_eq!(set.range(0..=4).rev().collect::<Vec<_>>(), vec![4, 3, 2, 1, 0]);
+        assert_eq!(set.range(0..5).rev().collect::<Vec<_>>(), vec![4, 3, 2, 1, 0]);
 
-        assert_eq!(set.range(5..=9).rev().collect::<Vec<_>>(), vec![&9, &8, &7, &6, &5]);
-        assert_eq!(set.range(5..10).rev().collect::<Vec<_>>(), vec![&9, &8, &7, &6, &5]);
+        assert_eq!(set.range(5..=9).rev().collect::<Vec<_>>(), vec![9, 8, 7, 6, 5]);
+        assert_eq!(set.range(5..10).rev().collect::<Vec<_>>(), vec![9, 8, 7, 6, 5]);
 
         assert_eq!(
             set.range(10..=19).rev().collect::<Vec<_>>(),
-            vec![&19, &18, &17, &16, &15, &14, &13, &12, &11, &10]
+            vec![19, 18, 17, 16, 15, 14, 13, 12, 11, 10]
         );
         assert_eq!(
             set.range(10..20).rev().collect::<Vec<_>>(),
-            vec![&19, &18, &17, &16, &15, &14, &13, &12, &11, &10]
+            vec![19, 18, 17, 16, 15, 14, 13, 12, 11, 10]
         );
 
         // Node intersection
-        assert_eq!(set.range(3..=6).rev().collect::<Vec<_>>(), vec![&6, &5, &4, &3]);
-        assert_eq!(set.range(3..7).rev().collect::<Vec<_>>(), vec![&6, &5, &4, &3]);
+        assert_eq!(set.range(3..=6).rev().collect::<Vec<_>>(), vec![6, 5, 4, 3]);
+        assert_eq!(set.range(3..7).rev().collect::<Vec<_>>(), vec![6, 5, 4, 3]);
 
-        assert_eq!(set.range(8..=11).rev().collect::<Vec<_>>(), vec![&11, &10, &9, &8]);
-        assert_eq!(set.range(8..12).rev().collect::<Vec<_>>(), vec![&11, &10, &9, &8]);
+        assert_eq!(set.range(8..=11).rev().collect::<Vec<_>>(), vec![11, 10, 9, 8]);
+        assert_eq!(set.range(8..12).rev().collect::<Vec<_>>(), vec![11, 10, 9, 8]);
 
         // Non-existent range
         assert!(set.range(20..).collect::<Vec<_>>().is_empty());
@@ -2706,7 +2583,7 @@ mod tests {
             thread::spawn(move || {
                 for iteration in 0..THREAD_ITERATIONS {
                     let start = (iteration % 64) as u64;
-                    assert_eq!(set.range(start..).next(), Some(&start));
+                    assert_eq!(set.range(start..).next(), Some(start));
                 }
                 done_tx.send(()).unwrap();
             })
@@ -2717,7 +2594,7 @@ mod tests {
             thread::spawn(move || {
                 for iteration in 0..THREAD_ITERATIONS {
                     let end = (iteration % 64) as u64;
-                    assert_eq!(set.range(..=end).next_back(), Some(&end));
+                    assert_eq!(set.range(..=end).next_back(), Some(end));
                 }
                 done_tx.send(()).unwrap();
             })
@@ -2752,19 +2629,19 @@ mod tests {
         let set = three_node_set();
 
         let mut iter = set.iter();
-        assert_eq!(iter.next(), Some(&0));
-        assert_eq!(iter.next(), Some(&10));
-        assert_eq!(iter.next(), Some(&20));
+        assert_eq!(iter.next(), Some(0));
+        assert_eq!(iter.next(), Some(10));
+        assert_eq!(iter.next(), Some(20));
 
         // The node the iterator is parked in vanishes from the index, as
         // UpdateMax's remove-then-insert re-key does on every monotonic
         // insert. The scan must reposition, not end.
         set.index.get(&30).expect("fixture entry").remove();
 
-        assert_eq!(iter.next(), Some(&30));
-        assert_eq!(iter.next(), Some(&40));
-        assert_eq!(iter.next(), Some(&50));
-        assert_eq!(iter.next(), Some(&60));
+        assert_eq!(iter.next(), Some(30));
+        assert_eq!(iter.next(), Some(40));
+        assert_eq!(iter.next(), Some(50));
+        assert_eq!(iter.next(), Some(60));
         assert_eq!(iter.next(), None);
     }
 
@@ -2773,16 +2650,16 @@ mod tests {
         let set = three_node_set();
 
         let mut iter = set.iter();
-        assert_eq!(iter.next_back(), Some(&60));
-        assert_eq!(iter.next_back(), Some(&50));
+        assert_eq!(iter.next_back(), Some(60));
+        assert_eq!(iter.next_back(), Some(50));
 
         set.index.get(&60).expect("fixture entry").remove();
 
-        assert_eq!(iter.next_back(), Some(&40));
-        assert_eq!(iter.next_back(), Some(&30));
-        assert_eq!(iter.next_back(), Some(&20));
-        assert_eq!(iter.next_back(), Some(&10));
-        assert_eq!(iter.next_back(), Some(&0));
+        assert_eq!(iter.next_back(), Some(40));
+        assert_eq!(iter.next_back(), Some(30));
+        assert_eq!(iter.next_back(), Some(20));
+        assert_eq!(iter.next_back(), Some(10));
+        assert_eq!(iter.next_back(), Some(0));
         assert_eq!(iter.next_back(), None);
     }
 
@@ -2795,25 +2672,21 @@ mod tests {
             set.insert(value);
         }
 
-        // An iterator that had already yielded through 20 and just
-        // exhausted the pre-split lower half: advancing into the upper half
-        // must not re-yield 20.
+        // An iterator that had already yielded through 20 from the pre-split
+        // node and just exhausted the lower half: advancing into the upper
+        // half must not re-yield 20.
         let iter = Iter {
             tree: &set,
-            current_front_node: Some(set.index.front().expect("fixture node").value().clone()),
-            current_front_node_guard: None,
-            current_front_node_iter: None,
-            front_node_exhausted: true,
-            current_back_node: None,
-            current_back_node_guard: None,
-            current_back_node_iter: None,
-            back_node_exhausted: false,
+            current_front_batch: None,
+            current_back_batch: None,
+            exhausted_front_node: Some(set.index.front().expect("fixture node").value().clone()),
+            exhausted_back_node: None,
             current_front_value: Some(20),
             current_back_value: None,
             met: false,
         };
 
-        assert_eq!(iter.copied().collect::<Vec<_>>(), vec![30, 40]);
+        assert_eq!(iter.collect::<Vec<_>>(), vec![30, 40]);
     }
 
     #[test]
@@ -2832,14 +2705,10 @@ mod tests {
 
         let mut iter = Iter {
             tree: &set,
-            current_front_node: None,
-            current_front_node_guard: None,
-            current_front_node_iter: None,
-            front_node_exhausted: false,
-            current_back_node: Some(set.index.back().expect("fixture node").value().clone()),
-            current_back_node_guard: None,
-            current_back_node_iter: None,
-            back_node_exhausted: false,
+            current_front_batch: None,
+            current_back_batch: None,
+            exhausted_front_node: None,
+            exhausted_back_node: Some(set.index.back().expect("fixture node").value().clone()),
             current_front_value: None,
             current_back_value: Some(30),
             met: false,
@@ -2847,7 +2716,7 @@ mod tests {
 
         let mut collected = vec![];
         while let Some(value) = iter.next_back() {
-            collected.push(*value);
+            collected.push(value);
         }
         assert_eq!(collected, vec![10, 0]);
     }
@@ -2855,34 +2724,34 @@ mod tests {
     #[test]
     fn backward_scan_does_not_skip_values_split_away_after_positioning() {
         // The heavy-tier churn failure in deterministic form. A backward
-        // scan that chooses its node (at construction or when advancing) and
-        // only later locks it races splits: a split committed in that window
-        // keeps the node's LOWER half in the chosen Arc and moves the upper
-        // half to a new node, so values the scan has not yielded yet migrate
-        // above its resume point and are silently skipped. Node selection
-        // and locking must be one atomic step under the structural guard.
+        // scan chooses its node (at construction or when advancing) and only
+        // later locks it to read. A split committed in that window keeps the
+        // node's LOWER half in the chosen Arc and moves the upper half to a
+        // new node: values the scan has not yielded yet migrate above its
+        // resume point and are silently skipped. Node selection and the
+        // content read must be one atomic step under the structural guard.
         let set = BTreeSet::<u64>::with_maximum_node_size(4);
         for value in [0u64, 10, 20, 30] {
             set.insert(value);
         }
 
-        // Construct the scan first...
+        // Position the scan on the (single) node...
         let mut iter = set.iter();
-        // ...then let a writer split the only node before the scan locks
-        // anything: [0, 10] stays in the original Arc, [20, 30, 40] moves
-        // to a new node above it.
+        // ...then let a writer split it before the scan reads anything:
+        // [0, 10] stays in the original Arc, [20, 30, 40] moves to a new
+        // node above it.
         set.insert(40);
         assert!(set.node_count() > 1, "fixture must split");
 
         let mut collected = vec![];
         while let Some(value) = iter.next_back() {
-            collected.push(*value);
+            collected.push(value);
         }
 
         // 40 was inserted mid-scan, so a weakly consistent scan may or may
-        // not observe it; every baseline value must be yielded. (Linear scan
-        // on purpose: with NodeLike in scope, Vec::contains resolves to
-        // NodeLike's binary search, which is wrong on this descending
+        // not observe it; every baseline value must be yielded. (Linear
+        // scan on purpose: with NodeLike in scope, Vec::contains resolves
+        // to NodeLike's binary search, which is wrong on this descending
         // vector.)
         for baseline in [30u64, 20, 10, 0] {
             assert!(
@@ -2908,30 +2777,31 @@ mod tests {
         let handle = {
             let set = Arc::clone(&set);
             thread::spawn(move || {
-                // Back cursor takes the tail of the final node and retains
-                // that node's guard across calls; the forward end then
-                // exhausts the first node and must enter the back-held node
-                // to yield the middle. This must never double-lock the
-                // non-reentrant node mutex.
+                // The back cursor enters the final node, then the forward
+                // end exhausts the first node and must enter the node the
+                // back cursor is positioned in to yield the middle. Under
+                // the guard-holding design this double-locked the
+                // non-reentrant node mutex; owned batches must keep this
+                // lock-free.
                 let mut finished = set.iter();
-                assert_eq!(finished.next_back(), Some(&40));
-                assert_eq!(finished.next(), Some(&0));
-                assert_eq!(finished.next(), Some(&10));
-                assert_eq!(finished.next(), Some(&20));
-                assert_eq!(finished.next(), Some(&30));
+                assert_eq!(finished.next_back(), Some(40));
+                assert_eq!(finished.next(), Some(0));
+                assert_eq!(finished.next(), Some(10));
+                assert_eq!(finished.next(), Some(20));
+                assert_eq!(finished.next(), Some(30));
                 assert_eq!(finished.next(), None);
                 assert_eq!(finished.next_back(), None);
 
                 // `finished` met in the middle and stays alive: a finished
-                // iterator must have released every node guard, or the next
-                // lock of its final node (here by a second iterator on the
-                // same thread) self-deadlocks.
+                // iterator must hold no node locks, or the next lock of its
+                // final node (here by a second iterator on the same thread)
+                // self-deadlocks.
                 let mut iter = set.iter();
-                assert_eq!(iter.next(), Some(&0));
-                assert_eq!(iter.next_back(), Some(&40));
-                assert_eq!(iter.next_back(), Some(&30));
-                assert_eq!(iter.next_back(), Some(&20));
-                assert_eq!(iter.next_back(), Some(&10));
+                assert_eq!(iter.next(), Some(0));
+                assert_eq!(iter.next_back(), Some(40));
+                assert_eq!(iter.next_back(), Some(30));
+                assert_eq!(iter.next_back(), Some(20));
+                assert_eq!(iter.next_back(), Some(10));
                 assert_eq!(iter.next_back(), None);
                 assert_eq!(iter.next(), None);
                 drop(finished);
@@ -2947,7 +2817,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_commits_complete_against_scan_holding_a_node_guard() {
+    fn structural_commits_complete_against_paused_scan() {
         // Several tiny nodes; the scan will pin the first one.
         let set = Arc::new(BTreeSet::<u64>::with_maximum_node_size(2));
         for value in 0..8 {
@@ -2963,21 +2833,21 @@ mod tests {
             let done_tx = done_tx.clone();
             thread::spawn(move || {
                 let mut iter = set.iter();
-                // The forward guard on the first node stays held between
-                // calls.
-                assert_eq!(iter.next(), Some(&0));
+                // A paused scan must hold no node lock between calls;
+                // under the guard-holding design the first node's mutex
+                // stayed pinned here.
+                assert_eq!(iter.next(), Some(0));
                 scan_holds_guard.wait();
-                // Give the writer time to block on the pinned node while it
-                // holds the structural write lock.
+                // Give the writer time to take the structural write lock
+                // and the first node's mutex while the scan is parked.
                 thread::sleep(Duration::from_millis(100));
-                // Resuming in the opposite direction must release the held
-                // guard before any structural-lock acquisition, or this
-                // deadlocks ABBA against the writer (writer: index_lock ->
-                // node; a scan must never hold a node while acquiring
-                // index_lock).
+                // Resuming in the opposite direction acquires the
+                // structural read guard; if the scan still held a node
+                // mutex here it would deadlock ABBA against the writer
+                // (writer: index_lock -> node).
                 let mut collected = vec![];
                 while let Some(value) = iter.next_back() {
-                    collected.push(*value);
+                    collected.push(value);
                 }
                 assert_eq!(collected, vec![7, 6, 5, 4, 3, 2, 1]);
                 done_tx.send(()).unwrap();
@@ -3078,7 +2948,7 @@ mod tests {
 
         let mut scans = 0usize;
         loop {
-            let forward = set.iter().copied().collect::<Vec<_>>();
+            let forward = set.iter().collect::<Vec<_>>();
             assert!(
                 forward.windows(2).all(|pair| pair[0] < pair[1]),
                 "forward scan not strictly increasing (duplicate or unordered yield)"
@@ -3089,7 +2959,7 @@ mod tests {
                 "forward scan truncated: baseline keys missing"
             );
 
-            let backward = set.iter().rev().copied().collect::<Vec<_>>();
+            let backward = set.iter().rev().collect::<Vec<_>>();
             assert!(
                 backward.windows(2).all(|pair| pair[0] > pair[1]),
                 "backward scan not strictly decreasing (duplicate or unordered yield)"
@@ -3109,8 +2979,8 @@ mod tests {
         writer.join().unwrap();
 
         let expected = (0..BASELINE + EXTRA).collect::<Vec<_>>();
-        assert_eq!(set.iter().copied().collect::<Vec<_>>(), expected);
-        assert_eq!(set.iter().rev().copied().collect::<Vec<_>>(), {
+        assert_eq!(set.iter().collect::<Vec<_>>(), expected);
+        assert_eq!(set.iter().rev().collect::<Vec<_>>(), {
             let mut reversed = expected;
             reversed.reverse();
             reversed
@@ -3128,7 +2998,7 @@ mod tests {
         let handle = thread::spawn(move || {
             for _ in 0..1000 {
                 let mut _sum = 0;
-                for &value in set_clone.iter() {
+                for value in set_clone.iter() {
                     _sum += value;
                 }
             }

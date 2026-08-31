@@ -43,7 +43,7 @@ where
 /// map.insert(1, "b");
 /// map.insert(1, "a");
 ///
-/// assert_eq!(map.remove(&1, &"b"), Some((1, "b")));
+/// assert_eq!(map.remove(1, "b"), Some((1, "b")));
 /// ```
 pub type OrderedBTreeMultiMap<K, V> = BTreeMultiMap<K, V, Vec<OrdMultiPair<K, V>>, OrdMultiPair<K, V>>;
 
@@ -80,11 +80,11 @@ where
     M: MultiPairLike<K, V> + Debug + Clone + Send + 'static,
     Node: NodeLike<M> + Send + 'static,
 {
-    type Item = (&'a K, &'a V);
+    type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(entry) = self.inner.next() {
-            return Some((entry.key(), entry.value()));
+            return Some(entry.into());
         }
 
         None
@@ -100,7 +100,7 @@ where
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         if let Some(entry) = self.inner.next_back() {
-            return Some((entry.key(), entry.value()));
+            return Some(entry.into());
         }
 
         None
@@ -134,10 +134,10 @@ where
     M: MultiPairLike<K, V> + Debug + Clone + Send + 'static,
     Node: NodeLike<M> + Send + 'static,
 {
-    type Item = (&'a K, &'a V);
+    type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|entry| (entry.key(), entry.value()))
+        self.inner.next().map(Into::into)
     }
 }
 
@@ -149,7 +149,7 @@ where
     Node: NodeLike<M> + Send + 'static,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|entry| (entry.key(), entry.value()))
+        self.inner.next_back().map(Into::into)
     }
 }
 
@@ -265,7 +265,7 @@ where
     ///
     /// let all_with_key = map.get(&1).collect::<BTreeSet<_>>();
     /// assert_eq!(all_with_key.len(), 2);
-    /// assert_eq!(all_with_key, vec![(&1, &"a"), (&1, &"b")].into_iter().collect::<BTreeSet<_>>());
+    /// assert_eq!(all_with_key, vec![(1, "a"), (1, "b")].into_iter().collect::<BTreeSet<_>>());
     /// ```
     pub fn get(&self, key: &K) -> Range<'_, K, V, Node, M>
     where
@@ -481,10 +481,10 @@ where
     /// map.insert(3, "a");
     /// map.insert(5, "b");
     /// map.insert(8, "c");
-    /// for (&key, &value) in map.range((Included(&4), Included(&8))) {
+    /// for (key, value) in map.range((Included(&4), Included(&8))) {
     ///     println!("{key}: {value}");
     /// }
-    /// assert_eq!(Some((&5, &"b")), map.range(4..).next());
+    /// assert_eq!(Some((5, "b")), map.range(4..).next());
     /// ```
     pub fn range<R>(&self, range: R) -> Range<'_, K, V, Node, M>
     where
@@ -516,8 +516,8 @@ where
     /// map.insert(1, "b");
     /// map.insert(1, "a");
     ///
-    /// assert_eq!(map.remove(&1, &"a"), Some((1, "a")));
-    /// assert_eq!(map.remove(&1, &"b"), Some((1, "b")));
+    /// assert_eq!(map.remove(1, "a"), Some((1, "a")));
+    /// assert_eq!(map.remove(1, "b"), Some((1, "b")));
     /// ```
     pub fn remove(&self, key: &K, value: &V) -> Option<(K, V)> {
         M::remove_from(&self.set, key, value)
@@ -557,17 +557,9 @@ mod tests {
         multi_map.insert(4usize, "f");
         multi_map.insert(4usize, "g");
 
-        let expected_pairs = vec![
-            (&1, &"b"),
-            (&1, &"a"),
-            (&2, &"d"),
-            (&2, &"c"),
-            (&3, &"e"),
-            (&4, &"f"),
-            (&4, &"g"),
-        ]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+        let expected_pairs = vec![(1, "b"), (1, "a"), (2, "d"), (2, "c"), (3, "e"), (4, "f"), (4, "g")]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
 
         let all_pairs = multi_map.iter().collect::<BTreeSet<_>>();
         assert_eq!(all_pairs, expected_pairs);
@@ -585,13 +577,13 @@ mod tests {
         map.insert(1usize, "e");
         map.insert(1usize, "f");
 
-        let all_actual_pairs = map.iter().map(|(k, v)| (*k, *v)).collect::<BTreeSet<_>>();
+        let all_actual_pairs = map.iter().collect::<BTreeSet<_>>();
         let all_expected_pairs = vec![(1, "f"), (1, "e"), (1, "d"), (1, "c"), (1, "b"), (1, "a")]
             .into_iter()
             .collect::<BTreeSet<_>>();
         assert_eq!(all_actual_pairs, all_expected_pairs);
 
-        let all_ranged_pairs = map.range(1..2).map(|(k, v)| (*k, *v)).collect::<BTreeSet<_>>();
+        let all_ranged_pairs = map.range(1..2).collect::<BTreeSet<_>>();
         assert_eq!(all_ranged_pairs, all_expected_pairs);
         assert!(map.range(1..1).next().is_none());
     }
@@ -642,8 +634,8 @@ mod tests {
 
         let mut occurrences = vec![0usize; records];
         for (bucket, id) in map.iter() {
-            assert_eq!(*bucket, expected[*id].load(Ordering::Relaxed));
-            occurrences[*id] += 1;
+            assert_eq!(bucket, expected[id].load(Ordering::Relaxed));
+            occurrences[id] += 1;
         }
 
         assert_eq!(map.len(), records);
@@ -676,7 +668,7 @@ mod tests {
         let mid_range = map.range(2..3).collect::<BTreeSet<_>>();
         assert_eq!(
             mid_range,
-            vec![(&2, &"c"), (&2, &"d"),].into_iter().collect::<BTreeSet<_>>()
+            vec![(2, "c"), (2, "d"),].into_iter().collect::<BTreeSet<_>>()
         );
     }
 
@@ -702,13 +694,13 @@ mod tests {
         let mid_range = map.range(2..3).collect::<BTreeSet<_>>();
         assert_eq!(
             mid_range,
-            vec![(&2, &"c"), (&2, &"d"),].into_iter().collect::<BTreeSet<_>>()
+            vec![(2, "c"), (2, "d"),].into_iter().collect::<BTreeSet<_>>()
         );
 
         let reverse_range = map.range(1..4).rev().collect::<BTreeSet<_>>();
         assert_eq!(
             reverse_range,
-            vec![(&3, &"e"), (&2, &"d"), (&2, &"c"), (&1, &"b"), (&1, &"a"),]
+            vec![(3, "e"), (2, "d"), (2, "c"), (1, "b"), (1, "a"),]
                 .into_iter()
                 .collect::<BTreeSet<_>>()
         );
@@ -738,13 +730,13 @@ mod tests {
 
         assert_eq!(
             map.range((Excluded(&1), Unbounded)).collect::<BTreeSet<_>>(),
-            vec![(&2, &"c"), (&2, &"d"), (&3, &"e"), (&3, &"f")]
+            vec![(2, "c"), (2, "d"), (3, "e"), (3, "f")]
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
         );
         assert_eq!(
             map.range((Unbounded, Excluded(&3))).collect::<BTreeSet<_>>(),
-            vec![(&1, &"a"), (&1, &"b"), (&2, &"c"), (&2, &"d")]
+            vec![(1, "a"), (1, "b"), (2, "c"), (2, "d")]
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
         );
@@ -773,25 +765,16 @@ mod tests {
 
         let range = map.get(&1).collect::<BTreeSet<_>>();
 
-        assert_eq!(
-            range,
-            vec![(&1, &"b"), (&1, &"a"),].into_iter().collect::<BTreeSet<_>>()
-        );
+        assert_eq!(range, vec![(1, "b"), (1, "a"),].into_iter().collect::<BTreeSet<_>>());
 
         let range = map.get(&2).collect::<BTreeSet<_>>();
-        assert_eq!(
-            range,
-            vec![(&2, &"d"), (&2, &"c"),].into_iter().collect::<BTreeSet<_>>()
-        );
+        assert_eq!(range, vec![(2, "d"), (2, "c"),].into_iter().collect::<BTreeSet<_>>());
 
         let range = map.get(&3).collect::<BTreeSet<_>>();
-        assert_eq!(range, vec![(&3, &"e"),].into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(range, vec![(3, "e"),].into_iter().collect::<BTreeSet<_>>());
 
         let range = map.get(&4).collect::<BTreeSet<_>>();
-        assert_eq!(
-            range,
-            vec![(&4, &"g"), (&4, &"f"),].into_iter().collect::<BTreeSet<_>>()
-        );
+        assert_eq!(range, vec![(4, "g"), (4, "f"),].into_iter().collect::<BTreeSet<_>>());
     }
 
     #[test]
@@ -813,7 +796,7 @@ mod tests {
             let range = map.get(&format!("ValueNum{}", i)).collect::<BTreeSet<_>>();
             assert_eq!(
                 range,
-                vec![(&format!("ValueNum{}", i), &i),]
+                vec![(format!("ValueNum{}", i), i),]
                     .into_iter()
                     .collect::<BTreeSet<_>>()
             );

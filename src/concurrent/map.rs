@@ -94,11 +94,11 @@ where
     V: Debug + Send + Clone + 'static,
     Node: NodeLike<Pair<K, V>> + Send + 'static,
 {
-    type Item = (&'a K, &'a V);
+    type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(entry) = self.inner.next() {
-            return Some((&entry.key, &entry.value));
+            return Some((entry.key, entry.value));
         }
 
         None
@@ -113,7 +113,7 @@ where
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         if let Some(entry) = self.inner.next_back() {
-            return Some((&entry.key, &entry.value));
+            return Some((entry.key, entry.value));
         }
 
         None
@@ -143,11 +143,11 @@ where
     V: Debug + Send + Clone + 'static,
     Node: NodeLike<Pair<K, V>> + Send + 'static,
 {
-    type Item = (&'a K, &'a V);
+    type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(entry) = self.inner.next() {
-            return Some((&entry.key, &entry.value));
+            return Some((entry.key, entry.value));
         }
 
         None
@@ -162,7 +162,7 @@ where
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         if let Some(entry) = self.inner.next_back() {
-            return Some((&entry.key, &entry.value));
+            return Some((entry.key, entry.value));
         }
 
         None
@@ -543,7 +543,7 @@ where
     /// }
     ///
     /// let (first_key, first_value) = map.iter().next().unwrap();
-    /// assert_eq!((*first_key, *first_value), (1, "a"));
+    /// assert_eq!((first_key, first_value), (1, "a"));
     /// ```
     pub fn iter(&self) -> Iter<'_, K, V, Node> {
         Iter { inner: self.set.iter() }
@@ -572,10 +572,10 @@ where
     /// map.insert(3, "a");
     /// map.insert(5, "b");
     /// map.insert(8, "c");
-    /// for (&key, &value) in map.range::<i32, _>((Included(&4), Included(&8))) {
+    /// for (key, value) in map.range::<i32, _>((Included(&4), Included(&8))) {
     ///     println!("{key}: {value}");
     /// }
-    /// assert_eq!(Some((&5, &"b")), map.range(4..).next());
+    /// assert_eq!(Some((5, "b")), map.range(4..).next());
     /// ```
     pub fn range<Q, R>(&self, range: R) -> Range<'_, K, V, Node>
     where
@@ -618,7 +618,7 @@ mod tests {
 
         assert_eq!(restored.export_topology(), topology);
         assert_eq!(
-            restored.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+            restored.iter().collect::<Vec<_>>(),
             (0..37).map(|k| (k, k * 10)).collect::<Vec<_>>()
         );
     }
@@ -656,9 +656,7 @@ mod tests {
         let mid_range = map.range::<usize, _>(3..5).collect::<BTreeSet<_>>();
         assert_eq!(
             mid_range,
-            vec![(&3usize, &"c"), (&4usize, &"d"),]
-                .into_iter()
-                .collect::<BTreeSet<_>>()
+            vec![(3usize, "c"), (4usize, "d"),].into_iter().collect::<BTreeSet<_>>()
         );
     }
 
@@ -676,7 +674,7 @@ mod tests {
         assert_eq!(map.insert(split_left_max, "new"), Some("old"));
         assert_eq!(map.len(), maximum_node_size);
         assert_eq!(map.get(&split_left_max).map(|entry| entry.get().value), Some("new"));
-        assert_eq!(map.iter().filter(|(key, _)| **key == split_left_max).count(), 1);
+        assert_eq!(map.iter().filter(|(key, _)| *key == split_left_max).count(), 1);
     }
 
     #[derive(Debug, Default)]

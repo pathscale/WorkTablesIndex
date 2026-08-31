@@ -129,8 +129,7 @@ where
     {
         let pair_to_remove = set
             .range::<K, _>((Bound::Included(key), Bound::Included(key)))
-            .find(|pair| pair.key == *key && pair.value == *value)
-            .cloned();
+            .find(|pair| pair.key == *key && pair.value == *value);
 
         if let Some(pair_to_remove) = pair_to_remove {
             if let Some(removed) = set.remove(&pair_to_remove) {
@@ -155,8 +154,7 @@ where
     {
         let pair_to_remove = set
             .range::<K, _>((Bound::Included(key), Bound::Included(key)))
-            .find(|pair| pair.key == *key && pair.value == *value)
-            .cloned();
+            .find(|pair| pair.key == *key && pair.value == *value);
 
         if let Some(pair_to_remove) = pair_to_remove {
             let (res, evs) = set.remove_cdc(&pair_to_remove);
