@@ -937,7 +937,16 @@ where
                     }
                     if let Some(current_back_value) = self.current_back_value.as_ref() {
                         if value.ge(current_back_value) {
+                            // The scan is finished: release every guard.
+                            // A met iterator that stays alive must not keep a
+                            // node pinned - that starves writers and
+                            // self-deadlocks any same-thread lock of the node
+                            // (including a second iterator).
                             self.met = true;
+                            self.current_front_node_iter = None;
+                            self.current_front_node_guard = None;
+                            self.current_back_node_iter = None;
+                            self.current_back_node_guard = None;
                             return None;
                         }
                     }
@@ -962,13 +971,23 @@ where
                         .current_front_node
                         .take()
                         .expect("set whenever a front node iterator was installed");
+                    // Invariant: no node mutex is ever held while acquiring
+                    // `index_lock`. Writers take `index_lock` first and node
+                    // locks second, so a violation deadlocks ABBA against a
+                    // committer. The advancing side's guard was released
+                    // above and the opposite side's in the loop preamble;
+                    // release the opposite side's explicitly as well so the
+                    // invariant survives any reordering of the preamble (the
+                    // opposite side keeps its node and cursor, and its next
+                    // call re-locks and re-filters through the cursor).
+                    self.current_back_node_iter = None;
+                    self.current_back_node_guard = None;
                     let next_node = {
                         // Structural commits (split, re-key, unlink) briefly
                         // remove an entry before reinserting it; a lock-free
                         // lookup landing inside that window would skip the
                         // node. Commits run under the structural write lock,
-                        // so a short read guard makes the lookup sound. No
-                        // node lock is held here, respecting the lock order.
+                        // so a short read guard makes the lookup sound.
                         let _structural_guard = self.tree.index_lock.read();
                         let candidate = match self.current_front_value.as_ref() {
                             Some(last_yielded) => self.tree.index.lower_bound(Bound::Excluded(last_yielded)),
@@ -1010,7 +1029,13 @@ where
                         if let Some(v) = i.nth(rank + 1) {
                             if let Some(current_back_value) = self.current_back_value.as_ref() {
                                 if v.ge(current_back_value) {
+                                    // See the yield path: a met iterator
+                                    // releases every guard.
                                     self.met = true;
+                                    self.current_front_node_iter = None;
+                                    self.current_front_node_guard = None;
+                                    self.current_back_node_iter = None;
+                                    self.current_back_node_guard = None;
                                     return None;
                                 }
                             }
@@ -1084,7 +1109,13 @@ where
                     }
                     if let Some(current_front_value) = self.current_front_value.as_ref() {
                         if value.le(current_front_value) {
+                            // See `next`: a met iterator releases every
+                            // guard.
                             self.met = true;
+                            self.current_front_node_iter = None;
+                            self.current_front_node_guard = None;
+                            self.current_back_node_iter = None;
+                            self.current_back_node_guard = None;
                             return None;
                         }
                     }
@@ -1103,6 +1134,10 @@ where
                         .current_back_node
                         .take()
                         .expect("set whenever a back node iterator was installed");
+                    // See `next`: never hold a node mutex while acquiring
+                    // `index_lock`; release the opposite side explicitly.
+                    self.current_front_node_iter = None;
+                    self.current_front_node_guard = None;
                     let prev_node = {
                         // See the forward path: guard against mid-commit
                         // entry windows.
@@ -1147,7 +1182,13 @@ where
                         if let Some(v) = i.nth_back(rank + 1) {
                             if let Some(current_front_value) = self.current_front_value.as_ref() {
                                 if v.le(current_front_value) {
+                                    // See `next`: a met iterator releases
+                                    // every guard.
                                     self.met = true;
+                                    self.current_front_node_iter = None;
+                                    self.current_front_node_guard = None;
+                                    self.current_back_node_iter = None;
+                                    self.current_back_node_guard = None;
                                     return None;
                                 }
                             }
@@ -2824,6 +2865,119 @@ mod tests {
             collected.push(*value);
         }
         assert_eq!(collected, vec![10, 0]);
+    }
+
+    #[test]
+    fn bidirectional_meet_into_opposite_held_node_does_not_self_deadlock() {
+        // Nodes [0, 10] (key 10) and [20, 30, 40] (key 40).
+        let set = Arc::new(BTreeSet::<u64>::with_maximum_node_size(4));
+        for value in [0u64, 10, 20, 30, 40] {
+            set.insert(value);
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = {
+            let set = Arc::clone(&set);
+            thread::spawn(move || {
+                // Back cursor takes the tail of the final node and retains
+                // that node's guard across calls; the forward end then
+                // exhausts the first node and must enter the back-held node
+                // to yield the middle. This must never double-lock the
+                // non-reentrant node mutex.
+                let mut finished = set.iter();
+                assert_eq!(finished.next_back(), Some(&40));
+                assert_eq!(finished.next(), Some(&0));
+                assert_eq!(finished.next(), Some(&10));
+                assert_eq!(finished.next(), Some(&20));
+                assert_eq!(finished.next(), Some(&30));
+                assert_eq!(finished.next(), None);
+                assert_eq!(finished.next_back(), None);
+
+                // `finished` met in the middle and stays alive: a finished
+                // iterator must have released every node guard, or the next
+                // lock of its final node (here by a second iterator on the
+                // same thread) self-deadlocks.
+                let mut iter = set.iter();
+                assert_eq!(iter.next(), Some(&0));
+                assert_eq!(iter.next_back(), Some(&40));
+                assert_eq!(iter.next_back(), Some(&30));
+                assert_eq!(iter.next_back(), Some(&20));
+                assert_eq!(iter.next_back(), Some(&10));
+                assert_eq!(iter.next_back(), None);
+                assert_eq!(iter.next(), None);
+                drop(finished);
+
+                done_tx.send(()).unwrap();
+            })
+        };
+
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bidirectional meet-in-the-middle deadlocked");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn structural_commits_complete_against_scan_holding_a_node_guard() {
+        // Several tiny nodes; the scan will pin the first one.
+        let set = Arc::new(BTreeSet::<u64>::with_maximum_node_size(2));
+        for value in 0..8 {
+            set.insert(value);
+        }
+
+        let scan_holds_guard = Arc::new(Barrier::new(3));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let scanner = {
+            let set = Arc::clone(&set);
+            let scan_holds_guard = Arc::clone(&scan_holds_guard);
+            let done_tx = done_tx.clone();
+            thread::spawn(move || {
+                let mut iter = set.iter();
+                // The forward guard on the first node stays held between
+                // calls.
+                assert_eq!(iter.next(), Some(&0));
+                scan_holds_guard.wait();
+                // Give the writer time to block on the pinned node while it
+                // holds the structural write lock.
+                thread::sleep(Duration::from_millis(100));
+                // Resuming in the opposite direction must release the held
+                // guard before any structural-lock acquisition, or this
+                // deadlocks ABBA against the writer (writer: index_lock ->
+                // node; a scan must never hold a node while acquiring
+                // index_lock).
+                let mut collected = vec![];
+                while let Some(value) = iter.next_back() {
+                    collected.push(*value);
+                }
+                assert_eq!(collected, vec![7, 6, 5, 4, 3, 2, 1]);
+                done_tx.send(()).unwrap();
+            })
+        };
+
+        let writer = {
+            let set = Arc::clone(&set);
+            let scan_holds_guard = Arc::clone(&scan_holds_guard);
+            let done_tx = done_tx.clone();
+            thread::spawn(move || {
+                scan_holds_guard.wait();
+                // remove_range acquires the structural write lock and then
+                // locks the node pinned by the scanner.
+                set.remove_range(0..=0);
+                done_tx.send(()).unwrap();
+            })
+        };
+        drop(done_tx);
+        scan_holds_guard.wait();
+
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("scan or structural commit deadlocked");
+        }
+        scanner.join().unwrap();
+        writer.join().unwrap();
+        assert!(!set.contains(&0));
     }
 
     #[test]
