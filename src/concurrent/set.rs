@@ -1494,6 +1494,7 @@ where
 mod tests {
     #[cfg(feature = "cdc")]
     use crate::cdc::change::ChangeEvent;
+    use crate::concurrent::operation::Operation;
     use crate::concurrent::set::{BTreeSet, DEFAULT_INNER_SIZE};
     #[cfg(feature = "multimap")]
     use crate::core::multipair::RandomMultiPair;
@@ -1936,6 +1937,64 @@ mod tests {
 
         assert!(detached.lock().is_empty());
         assert!(detached_values.iter().all(|value| !set.contains(value)));
+    }
+
+    #[test]
+    fn split_commit_against_drained_node_fails_instead_of_dropping_insert() {
+        let set = BTreeSet::<u64>::new();
+        for seeded in [10u64, 20, 30] {
+            set.insert(seeded);
+        }
+        let node = set.index.back().expect("node must exist").value().clone();
+        // A split is scheduled with a pending insert riding on it...
+        let pending_split = Operation::Split(node.clone(), 30u64, 15u64);
+        // ...then a concurrent remove drains the node before the commit.
+        {
+            let mut guard = node.lock();
+            for seeded in [10u64, 20, 30] {
+                NodeLike::delete(&mut *guard, &seeded).expect("seeded value must be present");
+            }
+        }
+
+        // The commit must fail so the insert retries; it must neither drop
+        // the pending value silently nor unlink the still-indexed node.
+        assert!(pending_split.commit::<false>(&set.index).is_err());
+        assert!(
+            set.index.get(&30).is_some(),
+            "drained node must stay linked for the retry"
+        );
+
+        // The retried insert lands and repairs the index.
+        assert!(set.insert(15));
+        assert!(set.contains(&15));
+        assert_eq!(set.remove(&15), Some(15));
+        assert!(set.is_empty());
+    }
+
+    #[cfg(feature = "cdc")]
+    #[test]
+    fn split_commit_against_drained_node_does_not_panic_in_cdc_build() {
+        let set = BTreeSet::<u64>::new();
+        for seeded in [10u64, 20, 30] {
+            set.insert(seeded);
+        }
+        let node = set.index.back().expect("node must exist").value().clone();
+        let pending_split = Operation::Split(node.clone(), 30u64, 15u64);
+        {
+            let mut guard = node.lock();
+            for seeded in [10u64, 20, 30] {
+                NodeLike::delete(&mut *guard, &seeded).expect("seeded value must be present");
+            }
+        }
+
+        // The cdc-emitting commit used to panic reading the drained node's
+        // maximum while holding the structural write lock.
+        assert!(pending_split.commit::<true>(&set.index).is_err());
+        assert!(set.index.get(&30).is_some());
+
+        let (old, _events) = set.put_cdc(15);
+        assert!(old.is_none());
+        assert!(set.contains(&15));
     }
 
     #[test]

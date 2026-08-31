@@ -32,6 +32,16 @@ where
                 let mut guard = old_node.lock_arc();
                 if let Some(entry) = index.get(&old_max) {
                     if Arc::ptr_eq(entry.value(), &old_node) {
+                        // The node was drained by a concurrent remove after
+                        // this split was scheduled. Halving an empty node
+                        // would unlink it while silently dropping the pending
+                        // insert (and the cdc build would panic reading the
+                        // vanished maximum). Fail the commit instead so the
+                        // insert retries against the current topology.
+                        if guard.max().is_none() {
+                            return Err(());
+                        }
+
                         let mut cdc = vec![];
                         #[cfg(feature = "cdc")]
                         let max_value =
