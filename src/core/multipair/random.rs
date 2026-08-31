@@ -335,7 +335,57 @@ mod test {
     // discriminator, which made it non-transitive (a == b and b == c with
     // a < c was reachable), broke binary search, and let index entry keys
     // compare Equal.
-        #[test]
+    #[test]
+    fn ord_is_a_lawful_total_order() {
+        use core::cmp::Ordering;
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let mut pairs = Vec::new();
+        for key in 0usize..4 {
+            for value in 0usize..4 {
+                for discriminator in 0u64..4 {
+                    pairs.push(RandomMultiPair {
+                        key,
+                        value,
+                        discriminator,
+                    });
+                }
+            }
+        }
+
+        let hash_of = |pair: &RandomMultiPair<usize, usize>| {
+            let mut hasher = DefaultHasher::new();
+            pair.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        for a in &pairs {
+            assert_eq!(a.cmp(a), Ordering::Equal, "reflexivity: {a:?}");
+            for b in &pairs {
+                let ab = a.cmp(b);
+                let ba = b.cmp(a);
+                // Antisymmetry / duality.
+                assert_eq!(ab, ba.reverse(), "antisymmetry: {a:?} vs {b:?}");
+                // Eq consistency with Ord, and Hash consistency with Eq.
+                assert_eq!(ab == Ordering::Equal, a == b, "Eq/Ord consistency: {a:?} vs {b:?}");
+                assert_eq!(a.partial_cmp(b), Some(ab), "PartialOrd/Ord consistency");
+                if a == b {
+                    assert_eq!(hash_of(a), hash_of(b), "Hash/Eq consistency: {a:?} vs {b:?}");
+                }
+                for c in &pairs {
+                    let bc = b.cmp(c);
+                    if ab == bc {
+                        assert_eq!(a.cmp(c), ab, "transitivity: {a:?}, {b:?}, {c:?}");
+                    }
+                    if ab != Ordering::Greater && bc != Ordering::Greater {
+                        assert_ne!(a.cmp(c), Ordering::Greater, "transitivity of <=: {a:?}, {b:?}, {c:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn replace_of_logically_equal_pair_preserves_discriminator_and_position() {
         let set = BTreeSet::<RandomMultiPair<usize, &'static str>>::new();
         set.attach_node(vec![

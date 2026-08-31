@@ -664,13 +664,58 @@ mod tests {
     // The 250-insert churn that measured 55 live pairs under the old
     // value-consulting Ord: cycling 5 logical pairs through insert must keep
     // the logical pair count exact, with every repeat reported as a replace.
-        // Split-livelock regression: many values under one key force nodes whose
+    #[test]
+    fn same_key_churn_keeps_logical_pair_count_exact() {
+        let map = BTreeMultiMap::<usize, usize>::with_maximum_node_size(4);
+
+        for i in 0..250 {
+            let replaced = map.insert(1, i % 5);
+            if i < 5 {
+                assert_eq!(replaced, None, "first insert of value {} must be fresh", i % 5);
+            } else {
+                assert_eq!(replaced, Some(i % 5), "repeat insert of value {} must replace", i % 5);
+            }
+        }
+
+        assert_eq!(map.len(), 5, "same-key churn must not accumulate duplicates");
+        let mut values = map.get(&1).map(|(_, value)| value).collect::<Vec<_>>();
+        values.sort();
+        assert_eq!(values, vec![0, 1, 2, 3, 4]);
+
+        for value in 0..5 {
+            assert_eq!(map.remove(&1, &value), Some((1, value)));
+        }
+        assert!(map.is_empty());
+    }
+
+    // Split-livelock regression: many values under one key force nodes whose
     // maxima share the key to split. Under the old Ord the split maxima
     // compared Equal as skip-map entry keys, corrupting routing and
     // livelocking the split retry loop (reproduced on master). With
     // (key, discriminator) identity every entry key is unique, so this must
     // terminate with every pair reachable and removable.
-        #[test]
+    #[test]
+    fn same_key_node_splits_keep_routing_lawful() {
+        let map = BTreeMultiMap::<usize, usize>::with_maximum_node_size(4);
+
+        for value in 0..200 {
+            assert_eq!(map.insert(7, value), None);
+        }
+
+        assert_eq!(map.len(), 200);
+        assert!(map.node_count() > 1, "fixture must actually split");
+
+        let mut values = map.get(&7).map(|(_, value)| value).collect::<Vec<_>>();
+        values.sort();
+        assert_eq!(values, (0..200).collect::<Vec<_>>());
+
+        for value in 0..200 {
+            assert_eq!(map.remove(&7, &value), Some((7, value)));
+        }
+        assert!(map.is_empty());
+    }
+
+    #[test]
     fn test_range_edge_cast() {
         let maximum_node_size = 3;
         let map = BTreeMultiMap::<usize, &str>::with_maximum_node_size(maximum_node_size);
