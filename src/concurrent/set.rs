@@ -1392,114 +1392,100 @@ where
 
         let start_bound = range.start_bound();
         let end_bound = range.end_bound();
-        let potential_front_entry = self.index.lower_bound(start_bound);
-        let potential_back_entry = self.index.lower_bound(end_bound);
 
-        let (potential_front_entry_guard, potential_front_position) =
-            if let Some(front_entry) = potential_front_entry.clone() {
-                let mut front_position = 0;
+        // First node that can contain an element within the start bound. If
+        // no index key reaches the start bound, nothing qualifies.
+        let Some(front_entry) = self.index.lower_bound(start_bound) else {
+            return;
+        };
 
-                let guard = front_entry.value().lock_arc();
-                if let Some(position) = guard.rank(start_bound, true) {
-                    front_position = position.wrapping_add(1);
-                }
+        // Last node that can contain an element within the end bound. Both an
+        // inclusive and an exclusive end resolve to the first node whose key
+        // is >= the bound value: a node keyed exactly at an exclusive bound
+        // still holds elements below it. Past the last key, the last node is
+        // the only candidate.
+        let back_entry = match end_bound {
+            Bound::Included(end) | Bound::Excluded(end) => self
+                .index
+                .lower_bound(Bound::Included(end))
+                .or_else(|| self.index.back()),
+            Bound::Unbounded => self.index.back(),
+        };
+        let Some(back_entry) = back_entry else {
+            return;
+        };
+        if back_entry.key() < front_entry.key() {
+            // The end bound resolves before the start bound: empty range.
+            return;
+        }
 
-                (Some(guard), front_position)
-            } else {
-                (None, 0)
-            };
-
-        let (potential_back_entry_guard, potential_back_position) =
-            if let Some(back_entry) = potential_back_entry.clone() {
-                let mut back_position = 0;
-                let mut guard = None;
-
-                if let Some(front_entry) = potential_front_entry.as_ref() {
-                    if !Arc::ptr_eq(back_entry.value(), front_entry.value()) {
-                        let new_guard = back_entry.value().lock_arc();
-                        let position = new_guard.rank(end_bound, true);
-                        if let Some(position) = position {
-                            back_position = position;
-                        } else {
-                            back_position = new_guard.len()
-                        }
-
-                        guard = Some(new_guard);
-                    } else if let Some((len, position)) = potential_front_entry_guard
-                        .as_ref()
-                        .map(|g| (g.len(), g.rank(end_bound, true)))
-                    {
-                        if let Some(position) = position {
-                            back_position = position;
-                        } else {
-                            back_position = len;
-                        }
-                    }
-                }
-
-                (guard, back_position)
-            } else {
-                (None, 0)
-            };
-
-        // If there is a front entry
-        if let Some(mut front_entry_guard) = potential_front_entry_guard {
-            let front_entry = potential_front_entry.unwrap();
-            // But no back entry
-            if potential_back_entry_guard.is_none() {
-                // Then we drain the front entry
-                let adjusted_back_position = {
-                    if potential_front_position > potential_back_position {
-                        front_entry_guard.len()
-                    } else {
-                        potential_back_position
-                    }
-                };
-                front_entry_guard.drain(potential_front_position..adjusted_back_position);
-                // Clone the mutex
-                let old_entry_value = front_entry.value().clone();
-                // Remove the entry
-                front_entry.remove();
-                // If it is empty, that's it
-                if front_entry_guard.is_empty() {
-                    return;
-                }
-                // Otherwise we insert it again with a new max
-                let new_max = front_entry_guard.last().unwrap().clone();
-                self.index.insert(new_max, old_entry_value);
-            } else if let Some(mut back_entry_guard) = potential_back_entry_guard {
-                let back_entry = potential_back_entry.unwrap();
-                // Otherwise we remove every single node between them
-                while let Some(next_entry) = front_entry.next() {
-                    if next_entry.key().eq(back_entry.key()) {
-                        break;
-                    }
-
-                    let mut removed_node = next_entry.value().lock_arc();
-                    // `ArcMutexGuard` owns an Arc to the node, so removing the
-                    // skip-list entry cannot invalidate the guarded storage.
-                    next_entry.remove();
-                    detached_nodes.push(std::mem::take(&mut *removed_node));
-                }
-
-                // And then trim the front from the left
-                front_entry.remove();
-                front_entry_guard.drain(potential_front_position..);
-                if !front_entry_guard.is_empty() {
-                    let new_front_max = front_entry_guard.last().unwrap().clone();
-                    self.index.insert(new_front_max, front_entry.value().clone());
-                }
-
-                // The back from the right
-                back_entry.remove();
-                back_entry_guard.drain(..potential_back_position);
-                if !back_entry_guard.is_empty() {
-                    let new_back_max = back_entry_guard.last().unwrap().clone();
-                    self.index.insert(new_back_max, back_entry.value().clone());
-                }
-
-                // And that's it
+        // Number of leading elements of the back node that fall within the
+        // end bound (inclusive end: elements <= bound; exclusive: < bound).
+        let removed_prefix_len = |guard: &Vec<T>| -> usize {
+            match end_bound {
+                Bound::Included(end) => guard.rank(Bound::Excluded(end), true).map_or(0, |last| last + 1),
+                Bound::Excluded(end) => guard.rank(Bound::Included(end), true).map_or(0, |last| last + 1),
+                Bound::Unbounded => guard.len(),
             }
+        };
+
+        if Arc::ptr_eq(front_entry.value(), back_entry.value()) {
+            // The whole range lives in one node.
+            let mut guard = front_entry.value().lock_arc();
+            let front_position = guard.rank(start_bound, true).map_or(0, |last| last + 1);
+            let back_position = removed_prefix_len(&guard);
+            if back_position <= front_position {
+                return;
+            }
+
+            let original_len = guard.len();
+            guard.drain(front_position..back_position);
+            if back_position == original_len {
+                // The node's maximum was removed: re-key the entry, or drop
+                // it when the node was fully drained.
+                let node = front_entry.value().clone();
+                front_entry.remove();
+                if let Some(new_max) = guard.last().cloned() {
+                    self.index.insert(new_max, node);
+                }
+            }
+            return;
+        }
+
+        let mut front_guard = front_entry.value().lock_arc();
+        let mut back_guard = back_entry.value().lock_arc();
+        let front_position = front_guard.rank(start_bound, true).map_or(0, |last| last + 1);
+        let back_position = removed_prefix_len(&back_guard);
+
+        // Remove every node strictly between the front and the back one.
+        while let Some(next_entry) = front_entry.next() {
+            if next_entry.key() >= back_entry.key() {
+                break;
+            }
+
+            let mut removed_node = next_entry.value().lock_arc();
+            // `ArcMutexGuard` owns an Arc to the node, so removing the
+            // skip-list entry cannot invalidate the guarded storage.
+            next_entry.remove();
+            detached_nodes.push(std::mem::take(&mut *removed_node));
+        }
+
+        // Trim the front node from the start position: its maximum goes away,
+        // so its entry must be re-keyed (or dropped when the node empties).
+        front_entry.remove();
+        front_guard.drain(front_position..);
+        if !front_guard.is_empty() {
+            let new_front_max = front_guard.last().unwrap().clone();
+            self.index.insert(new_front_max, front_entry.value().clone());
+        }
+
+        // Trim the back node's prefix: its maximum survives unless the whole
+        // node drains, so the entry only changes when the node empties.
+        if back_position >= back_guard.len() {
+            back_entry.remove();
+            back_guard.drain(..);
+        } else if back_position > 0 {
+            back_guard.drain(..back_position);
         }
     }
 }
@@ -1886,10 +1872,11 @@ mod tests {
         let actual_len = btree.len();
         assert_eq!(expected_len, actual_len);
 
-        // And then more (512 * 3) / 2
+        // And then everything from (512 * 3) / 2 to the end, which is
+        // exactly the upper 512 values.
         let from = (DEFAULT_INNER_SIZE * 3) / 2;
         btree.remove_range(from..);
-        let expected_len = expected_len - (DEFAULT_INNER_SIZE) - 5 + 10;
+        let expected_len = expected_len - DEFAULT_INNER_SIZE / 2;
         let actual_len = btree.len();
         assert_eq!(expected_len, actual_len);
 
@@ -1929,6 +1916,99 @@ mod tests {
         let expected_len = expected_len - 5;
         let actual_len = btree.len();
         assert_eq!(expected_len, actual_len);
+    }
+
+    #[test]
+    fn remove_range_end_bound_regressions() {
+        // `x..` must remove only the suffix, not also drain the first node.
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        for value in 0..10 {
+            set.insert(value);
+        }
+        set.remove_range(7..);
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), (0..7).collect::<Vec<_>>());
+
+        // `..` must clear every node, not only the first one.
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        for value in 0..10 {
+            set.insert(value);
+        }
+        set.remove_range(..);
+        assert_eq!(set.len(), 0);
+        assert!(set.is_empty());
+
+        // An inclusive end must remove every element up to and including it.
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        for value in 0..10 {
+            set.insert(value);
+        }
+        set.remove_range(3..=5);
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 6, 7, 8, 9]);
+
+        // `x..=x` must remove exactly x, not drain to the node end.
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        for value in 0..10 {
+            set.insert(value);
+        }
+        set.remove_range(2..=2);
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![0, 1, 3, 4, 5, 6, 7, 8, 9]);
+
+        // An exclusive end equal to a node maximum must not drain the
+        // following node.
+        let set = BTreeSet::<u64>::with_maximum_node_size(3);
+        for value in 0..9 {
+            set.insert(value);
+        }
+        let boundary = *set.index.front().expect("node must exist").key();
+        set.remove_range(0..boundary);
+        let expected = (0..9).filter(|value| *value >= boundary).collect::<Vec<_>>();
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn remove_range_matches_btreeset_oracle() {
+        use std::ops::Bound;
+
+        fn oracle_case(node_size: usize, values: &[u64], start: Bound<u64>, end: Bound<u64>) {
+            let set = BTreeSet::<u64>::with_maximum_node_size(node_size);
+            for &value in values {
+                set.insert(value);
+            }
+            let mut oracle = values.iter().copied().collect::<std::collections::BTreeSet<_>>();
+
+            let range = (start, end);
+            oracle.retain(|value| !std::ops::RangeBounds::contains(&range, value));
+            set.remove_range(range);
+
+            assert_eq!(
+                set.iter().copied().collect::<Vec<_>>(),
+                oracle.iter().copied().collect::<Vec<_>>(),
+                "node_size={node_size}, start={start:?}, end={end:?}"
+            );
+            assert_eq!(
+                set.len(),
+                oracle.len(),
+                "node_size={node_size}, start={start:?}, end={end:?}"
+            );
+        }
+
+        // Even values only, so probes hit present values, absent values, and
+        // both sides of every node boundary.
+        let values = (0..15u64).map(|value| value * 2).collect::<Vec<_>>();
+        let mut bounds = vec![Bound::Unbounded];
+        for probe in 0..=30u64 {
+            bounds.push(Bound::Included(probe));
+            bounds.push(Bound::Excluded(probe));
+        }
+
+        // Single-node and multi-node geometries, on and off node boundaries.
+        for node_size in [4usize, 7, 64] {
+            for &start in &bounds {
+                for &end in &bounds {
+                    oracle_case(node_size, &values, start, end);
+                }
+            }
+        }
     }
 
     #[test]
