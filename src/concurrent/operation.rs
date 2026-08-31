@@ -23,9 +23,12 @@ where
 {
     // `EMIT_CDC` is a compile-time switch so event construction disappears
     // from ordinary insert and remove monomorphizations.
+    // `adopt` runs when the riding insert replaces a stored, logically equal
+    // value in place: see `MultiPairLike::adopt_stored_identity`.
     pub fn commit<const EMIT_CDC: bool>(
         self,
         index: &SkipMap<T, Arc<Mutex<Node>>>,
+        adopt: fn(&T, &mut T),
     ) -> Result<(Option<T>, Vec<ChangeEventUnassigned<T>>), ()> {
         match self {
             Operation::Split(old_node, old_max, value) => {
@@ -64,8 +67,12 @@ where
                             if max >= value {
                                 let (inserted, idx) = NodeLike::insert(&mut *guard, value.clone());
                                 insert_attempted = true;
+                                let mut committed_value = value.clone();
                                 if !inserted {
-                                    old_value = NodeLike::replace(&mut *guard, idx, value.clone());
+                                    if let Some(stored) = guard.get_ith(idx) {
+                                        adopt(stored, &mut committed_value);
+                                    }
+                                    old_value = NodeLike::replace(&mut *guard, idx, committed_value.clone());
                                     #[cfg(feature = "cdc")]
                                     if EMIT_CDC {
                                         let value_insertion = ChangeEventUnassigned::RemoveAt {
@@ -81,7 +88,7 @@ where
                                     let value_insertion = ChangeEventUnassigned::InsertAt {
                                         max_value: max.clone(),
                                         index: idx,
-                                        value: value.clone(),
+                                        value: committed_value,
                                     };
                                     cdc.push(value_insertion);
                                 }
@@ -94,12 +101,16 @@ where
                             if !insert_attempted {
                                 let (inserted, idx) = NodeLike::insert(&mut new_vec, value.clone());
                                 let old_max = max.clone();
+                                let mut committed_value = value.clone();
                                 if inserted {
                                     if value > max {
                                         max = value.clone()
                                     }
                                 } else {
-                                    old_value = NodeLike::replace(&mut new_vec, idx, value.clone());
+                                    if let Some(stored) = new_vec.get_ith(idx) {
+                                        adopt(stored, &mut committed_value);
+                                    }
+                                    old_value = NodeLike::replace(&mut new_vec, idx, committed_value.clone());
                                     #[cfg(feature = "cdc")]
                                     if EMIT_CDC {
                                         let value_insertion = ChangeEventUnassigned::RemoveAt {
@@ -115,7 +126,7 @@ where
                                     let value_insertion = ChangeEventUnassigned::InsertAt {
                                         max_value: old_max.clone(),
                                         index: idx,
-                                        value: value.clone(),
+                                        value: committed_value,
                                     };
                                     cdc.push(value_insertion);
                                 }

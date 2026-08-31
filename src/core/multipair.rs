@@ -19,6 +19,13 @@ pub trait MultiPairLike<K, V>: Into<(K, V)> + Ord {
     fn new(key: K, value: V) -> Self;
     fn key(&self) -> &K;
     fn value(&self) -> &V;
+    /// Called before an incoming pair replaces a stored, logically equal pair
+    /// in place. Implementations whose `Ord` refines equal keys with hidden
+    /// state (e.g. a random discriminator) must copy that state from the
+    /// stored pair onto the incoming one: the replacement position was
+    /// determined by the stored pair's state, so replacing it with fresh
+    /// state would break the node's sort invariant.
+    fn adopt_stored_identity(_stored: &Self, _incoming: &mut Self) {}
 }
 
 /// Pair-specific exact-removal strategy used by `BTreeMultiMap`.

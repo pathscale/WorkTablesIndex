@@ -23,6 +23,11 @@ use super::r#ref::Ref;
 const STABLE_READ_BLOCKING_FALLBACK_AFTER: usize = 2;
 const ROOT_PUBLICATION_SPIN_LIMIT: usize = 16;
 
+// Default identity-adoption hook for replace-on-equality: plain sets and maps
+// have no hidden ordering state to carry over. See
+// `MultiPairLike::adopt_stored_identity`.
+pub(crate) fn no_identity_adoption<T>(_stored: &T, _incoming: &mut T) {}
+
 /// A **persistent** concurrent ordered set based on a B-Tree.
 ///
 /// See [`BTreeMap`]'s documentation for a detailed discussion of this collection's performance
@@ -164,6 +169,7 @@ where
     fn put_checked_inner<const EMIT_CDC: bool>(
         &self,
         value: T,
+        adopt: fn(&T, &mut T),
     ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcMutexGuard<RawMutex, Node>, usize, T)> {
         loop {
             let mut cdc = vec![];
@@ -275,7 +281,7 @@ where
             let op = operation.unwrap();
             match &op {
                 Operation::Split(_, _, _) => {
-                    if let Ok((value, value_cdc)) = op.commit::<EMIT_CDC>(&self.index) {
+                    if let Ok((value, value_cdc)) = op.commit::<EMIT_CDC>(&self.index, adopt) {
                         #[cfg(feature = "cdc")]
                         if EMIT_CDC {
                             for unassigned_event in value_cdc {
@@ -289,7 +295,7 @@ where
                     }
                 }
                 Operation::UpdateMax(_, _) => {
-                    return if let Ok((value, value_cdc)) = op.commit::<EMIT_CDC>(&self.index) {
+                    return if let Ok((value, value_cdc)) = op.commit::<EMIT_CDC>(&self.index, adopt) {
                         #[cfg(feature = "cdc")]
                         if EMIT_CDC {
                             for unassigned_event in value_cdc {
@@ -306,10 +312,17 @@ where
             }
         }
     }
-    fn put_inner<const EMIT_CDC: bool>(&self, value: T) -> (Option<T>, Vec<ChangeEvent<T>>) {
-        match self.put_checked_inner::<EMIT_CDC>(value.clone()) {
+    fn put_inner<const EMIT_CDC: bool>(&self, value: T, adopt: fn(&T, &mut T)) -> (Option<T>, Vec<ChangeEvent<T>>) {
+        match self.put_checked_inner::<EMIT_CDC>(value.clone(), adopt) {
             Ok(res) => res,
             Err((mut node_guard, idx, max)) => {
+                // Replace-on-logical-equality: let the incoming value adopt
+                // the stored value's hidden ordering state before it takes
+                // the stored position (see MultiPairLike::adopt_stored_identity).
+                let mut value = value;
+                if let Some(stored) = node_guard.get_ith(idx) {
+                    adopt(stored, &mut value);
+                }
                 let mut cdc = vec![];
                 #[cfg(feature = "cdc")]
                 if EMIT_CDC {
@@ -377,7 +390,12 @@ where
     }
 
     pub(crate) fn put(&self, value: T) -> Option<T> {
-        self.put_inner::<false>(value).0
+        self.put_inner::<false>(value, no_identity_adoption).0
+    }
+
+    #[cfg(feature = "multimap")]
+    pub(crate) fn put_with(&self, value: T, adopt: fn(&T, &mut T)) -> Option<T> {
+        self.put_inner::<false>(value, adopt).0
     }
 
     #[allow(clippy::type_complexity)]
@@ -385,11 +403,16 @@ where
         &self,
         value: T,
     ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcMutexGuard<RawMutex, Node>, usize, T)> {
-        self.put_checked_inner::<false>(value)
+        self.put_checked_inner::<false>(value, no_identity_adoption)
     }
 
     pub(crate) fn put_cdc(&self, value: T) -> (Option<T>, Vec<ChangeEvent<T>>) {
-        self.put_inner::<true>(value)
+        self.put_inner::<true>(value, no_identity_adoption)
+    }
+
+    #[cfg(all(feature = "multimap", feature = "cdc"))]
+    pub(crate) fn put_cdc_with(&self, value: T, adopt: fn(&T, &mut T)) -> (Option<T>, Vec<ChangeEvent<T>>) {
+        self.put_inner::<true>(value, adopt)
     }
 
     #[allow(clippy::type_complexity)]
@@ -397,7 +420,7 @@ where
         &self,
         value: T,
     ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcMutexGuard<RawMutex, Node>, usize, T)> {
-        self.put_checked_inner::<true>(value)
+        self.put_checked_inner::<true>(value, no_identity_adoption)
     }
 
     /// Adds a value to the set.
@@ -489,7 +512,8 @@ where
 
             let _global_guard = self.index_lock.write();
 
-            return if let Ok((_, value_cdc)) = operation.unwrap().commit::<EMIT_CDC>(&self.index) {
+            return if let Ok((_, value_cdc)) = operation.unwrap().commit::<EMIT_CDC>(&self.index, no_identity_adoption)
+            {
                 #[cfg(feature = "cdc")]
                 if EMIT_CDC {
                     for unassigned_event in value_cdc {
@@ -2142,7 +2166,9 @@ mod tests {
 
         // The commit must fail so the insert retries; it must neither drop
         // the pending value silently nor unlink the still-indexed node.
-        assert!(pending_split.commit::<false>(&set.index).is_err());
+        assert!(pending_split
+            .commit::<false>(&set.index, super::no_identity_adoption)
+            .is_err());
         assert!(
             set.index.get(&30).is_some(),
             "drained node must stay linked for the retry"
@@ -2173,7 +2199,9 @@ mod tests {
 
         // The cdc-emitting commit used to panic reading the drained node's
         // maximum while holding the structural write lock.
-        assert!(pending_split.commit::<true>(&set.index).is_err());
+        assert!(pending_split
+            .commit::<true>(&set.index, super::no_identity_adoption)
+            .is_err());
         assert!(set.index.get(&30).is_some());
 
         let (old, _events) = set.put_cdc(15);
@@ -2197,7 +2225,7 @@ mod tests {
 
             // The stale unlink then commits: it must not remove the node that
             // now contains the acknowledged insert.
-            let _ = pending_unlink.commit::<false>(&set.index);
+            let _ = pending_unlink.commit::<false>(&set.index, super::no_identity_adoption);
 
             assert!(set.contains(&value), "value {value} lost after stale unlink");
             assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![value]);
@@ -2228,9 +2256,11 @@ mod tests {
 
             // The remove's stale unlink commits first: it must observe the
             // refilled node and re-key it rather than unlink it.
-            assert!(pending_unlink.commit::<false>(&set.index).is_ok());
+            assert!(pending_unlink
+                .commit::<false>(&set.index, super::no_identity_adoption)
+                .is_ok());
             // The insert's repair then finds the entry already re-keyed.
-            let _ = pending_repair.commit::<false>(&set.index);
+            let _ = pending_repair.commit::<false>(&set.index, super::no_identity_adoption);
 
             assert!(set.contains(&value), "value {value} lost to stale unlink");
             assert_eq!(set.remove(&value), Some(value));
@@ -2308,6 +2338,69 @@ mod tests {
         assert!(set.remove(&5).is_some());
         assert!(!set.contains(&5));
         assert!(!set.remove(&5).is_some());
+    }
+
+    #[cfg(feature = "multimap")]
+    #[test]
+    fn replace_of_logically_equal_pair_preserves_discriminator_order() {
+        use crate::core::multipair::MultiPairLike;
+
+        let set = BTreeSet::<RandomMultiPair<usize, &'static str>>::new();
+        set.attach_node(vec![
+            RandomMultiPair {
+                key: 1,
+                value: "a",
+                discriminator: 10,
+            },
+            RandomMultiPair {
+                key: 1,
+                value: "b",
+                discriminator: 20,
+            },
+            RandomMultiPair {
+                key: 1,
+                value: "c",
+                discriminator: 30,
+            },
+        ]);
+
+        // A logical replace: the incoming pair carries a fresh discriminator.
+        // The stored pair's position among equal-key neighbors was determined
+        // by ITS discriminator, so the replacement must adopt it; keeping the
+        // fresh one is what scrambled node order under random draws (a fresh
+        // discriminator outside the neighbor range breaks the sort invariant,
+        // and with an inconsistent Ord such a pair is not even reliably
+        // findable). The fixture discriminator sits between the neighbors so
+        // that every search backend's probe sequence reaches the stored pair.
+        let incoming = RandomMultiPair {
+            key: 1,
+            value: "b",
+            discriminator: 25,
+        };
+        let replaced = set.put_with(incoming, RandomMultiPair::adopt_stored_identity);
+        assert!(replaced.is_some(), "logically equal pair must replace, not duplicate");
+
+        {
+            let node = set.index.back().expect("node must exist").value().clone();
+            let guard = node.lock();
+            assert!(
+                guard.windows(2).all(|pair| pair[0] < pair[1]),
+                "node sort invariant broken: {:?}",
+                *guard
+            );
+            assert_eq!(guard[1].discriminator, 20, "stored discriminator must be preserved");
+        }
+
+        // Every live pair stays reachable and removable afterwards.
+        for (value, discriminator) in [("a", 10), ("b", 20), ("c", 30)] {
+            let probe = RandomMultiPair {
+                key: 1,
+                value,
+                discriminator,
+            };
+            assert!(set.remove(&probe).is_some(), "pair (1, {value}) unreachable");
+        }
+        assert!(set.is_empty());
     }
 
     #[cfg(feature = "multimap")]

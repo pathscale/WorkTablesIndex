@@ -84,6 +84,12 @@ impl<K: Ord, V: PartialEq> MultiPairLike<K, V> for RandomMultiPair<K, V> {
     fn value(&self) -> &V {
         &self.value
     }
+
+    // The stored pair's position among equal-key neighbors is determined by
+    // its discriminator; keeping it on replace keeps the node sorted.
+    fn adopt_stored_identity(stored: &Self, incoming: &mut Self) {
+        incoming.discriminator = stored.discriminator;
+    }
 }
 
 impl<K, V> From<Pair<K, V>> for RandomMultiPair<K, V> {

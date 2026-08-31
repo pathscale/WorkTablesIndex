@@ -292,7 +292,11 @@ where
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let new_entry = M::new(key, value);
 
-        self.set.put(new_entry).map(|pair| pair.into().1)
+        // A logical replace must keep the stored pair's ordering identity
+        // (e.g. its discriminator) or the node's sort invariant breaks.
+        self.set
+            .put_with(new_entry, M::adopt_stored_identity)
+            .map(|pair| pair.into().1)
     }
     /// Inserts a key-value pair into the map and returns old value (if it was
     /// already in set) with [`ChangeEvent`]'s that describes this insert
@@ -301,7 +305,7 @@ where
     pub fn insert_cdc(&self, key: K, value: V) -> (Option<V>, Vec<ChangeEvent<M>>) {
         let new_entry = M::new(key, value);
 
-        let (old_value, cdc) = self.set.put_cdc(new_entry);
+        let (old_value, cdc) = self.set.put_cdc_with(new_entry, M::adopt_stored_identity);
 
         (old_value.map(|pair| pair.into().1), cdc)
     }
