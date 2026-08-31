@@ -422,7 +422,17 @@ where
     {
         let mut cdc = vec![];
         let _global_guard = self.index_lock.read();
-        if let Some(target_node_entry) = self.index.lower_bound(std::ops::Bound::Included(value)) {
+        // Fall back to the last node when the value sorts above every index
+        // key, exactly like `put` and `lock_node_for_value`: during a stale-key
+        // window (a node whose maximum grew before its UpdateMax repair
+        // committed) the value lives in the last node even though no index key
+        // covers it. Without the fallback such a value is un-removable while
+        // `contains` still finds it.
+        if let Some(target_node_entry) = self
+            .index
+            .lower_bound(std::ops::Bound::Included(value))
+            .or_else(|| self.index.back())
+        {
             let mut node_guard = target_node_entry.value().lock_arc();
             let old_max = node_guard.max().cloned();
             let deleted = NodeLike::delete(&mut *node_guard, value);
@@ -1487,6 +1497,7 @@ mod tests {
     use crate::concurrent::set::{BTreeSet, DEFAULT_INNER_SIZE};
     #[cfg(feature = "multimap")]
     use crate::core::multipair::RandomMultiPair;
+    use crate::core::node::NodeLike;
     use rand::Rng;
     use std::collections::HashSet;
     use std::ops::Bound::Included;
@@ -1925,6 +1936,29 @@ mod tests {
 
         assert!(detached.lock().is_empty());
         assert!(detached_values.iter().all(|value| !set.contains(value)));
+    }
+
+    #[test]
+    fn remove_reaches_value_above_every_index_key() {
+        let set = BTreeSet::<u64>::new();
+        for value in [1u64, 2, 3] {
+            set.insert(value);
+        }
+
+        // Simulate a stale-key window: the last node's maximum grows past its
+        // index key before the UpdateMax repair commits. `contains` already
+        // reaches such a value through the back-node fallback; `remove` must
+        // reach it the same way.
+        {
+            let node = set.index.back().expect("node must exist").value().clone();
+            let mut guard = node.lock();
+            NodeLike::insert(&mut *guard, 5u64);
+        }
+
+        assert!(set.contains(&5));
+        assert_eq!(set.remove(&5), Some(5), "value above every index key must be removable");
+        assert!(!set.contains(&5));
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     #[test]
