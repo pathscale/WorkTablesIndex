@@ -850,6 +850,10 @@ where
     Node: NodeLike<T> + Send + 'static,
 {
     pub fn new(btree: &'a BTreeSet<T, Node>) -> Self {
+        // Capture the endpoints under the structural read guard so the
+        // lookup cannot land inside another writer's mid-commit
+        // remove-then-insert window (split or re-key) and miss a node.
+        let _structural_guard = btree.index_lock.read();
         let current_front_node = btree.index.front().map(|e| e.value().clone());
         let current_back_node = btree.index.back().map(|e| e.value().clone());
         Self {
@@ -943,66 +947,45 @@ where
                     self.current_front_node_iter = None;
                     self.current_front_node_guard = None;
 
-                    if let Some(current_node_entry) = self.tree.index.iter().find(|e| {
-                        Arc::ptr_eq(
-                            e.value(),
-                            self.current_front_node.as_ref().expect("was just set before"),
-                        )
-                    }) {
-                        if let Some(next_node_entry) = current_node_entry.next() {
-                            self.current_front_node = Some(next_node_entry.value().clone());
-
-                            if let Some(back_entry) = self.current_back_node.as_ref() {
-                                if Arc::ptr_eq(next_node_entry.value(), back_entry) {
-                                    self.current_front_node_guard = self.current_back_node_guard.take();
-                                    self.current_front_node_iter = self.current_back_node_iter.take();
-                                }
-                                continue;
-                            }
-
-                            self.current_front_node_guard = Some(
-                                self.current_front_node
-                                    .as_ref()
-                                    .expect("was just set before")
-                                    .lock_arc(),
-                            );
-                            self.current_front_node_iter = Some(unsafe {
-                                std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
-                                    self.current_front_node_guard
-                                        .as_ref()
-                                        .expect("was just set before")
-                                        .iter(),
-                                )
-                            });
-                            continue;
-                        } else {
-                            self.current_front_node = None;
-                            self.current_front_node_guard = None;
-                            self.current_front_node_iter = None;
-                            return None;
-                        }
-                    } else {
-                        // The just-finished node is no longer in the index (it
-                        // was re-keyed by an UpdateMax repair or removed).
-                        // Ending the scan here would silently truncate it;
-                        // reposition after the last yielded value instead. The
-                        // resume path below skips anything already yielded.
-                        let repositioned = match self.current_front_value.as_ref() {
+                    // Advance by the scan cursor with one logarithmic lookup
+                    // instead of relocating the exhausted node by identity
+                    // with a linear scan from the front of the index (which
+                    // made a full scan quadratic in the node count). This
+                    // also transparently covers the node having been re-keyed
+                    // by an UpdateMax repair or removed: the lookup lands on
+                    // whichever node now covers the cursor, and the resume
+                    // paths skip anything already yielded. When the lookup
+                    // lands back on the just-exhausted node (its entry key
+                    // can sit above every element it still holds), step past
+                    // it by identity so the scan always makes progress.
+                    let exhausted = self
+                        .current_front_node
+                        .take()
+                        .expect("set whenever a front node iterator was installed");
+                    let next_node = {
+                        // Structural commits (split, re-key, unlink) briefly
+                        // remove an entry before reinserting it; a lock-free
+                        // lookup landing inside that window would skip the
+                        // node. Commits run under the structural write lock,
+                        // so a short read guard makes the lookup sound. No
+                        // node lock is held here, respecting the lock order.
+                        let _structural_guard = self.tree.index_lock.read();
+                        let candidate = match self.current_front_value.as_ref() {
                             Some(last_yielded) => self.tree.index.lower_bound(Bound::Excluded(last_yielded)),
                             None => self.tree.index.front(),
                         };
-                        if let Some(entry) = repositioned {
-                            self.current_front_node = Some(entry.value().clone());
-                            self.current_front_node_guard = None;
-                            self.current_front_node_iter = None;
-                            continue;
-                        }
-
-                        self.current_front_node = None;
-                        self.current_front_node_guard = None;
-                        self.current_front_node_iter = None;
-                        return None;
+                        let next_entry = match candidate {
+                            Some(entry) if Arc::ptr_eq(entry.value(), &exhausted) => entry.next(),
+                            other => other,
+                        };
+                        next_entry.map(|entry| entry.value().clone())
+                    };
+                    if let Some(node) = next_node {
+                        self.current_front_node = Some(node);
+                        continue;
                     }
+
+                    return None;
                 }
             } else {
                 self.current_front_node_guard = Some(
@@ -1111,45 +1094,20 @@ where
                     self.current_back_node_iter = None;
                     self.current_back_node_guard = None;
 
-                    if let Some(current_node_entry) =
-                        self.tree.index.iter().find(|e| {
-                            Arc::ptr_eq(e.value(), self.current_back_node.as_ref().expect("was just set before"))
-                        })
-                    {
-                        if let Some(prev_node_entry) = current_node_entry.prev() {
-                            self.current_back_node = Some(prev_node_entry.value().clone());
-
-                            if let Some(front_entry) = self.current_front_node.as_ref() {
-                                if Arc::ptr_eq(prev_node_entry.value(), front_entry) {
-                                    self.current_back_node_guard = self.current_front_node_guard.take();
-                                    self.current_back_node_iter = self.current_front_node_iter.take();
-                                }
-                                continue;
-                            }
-
-                            self.current_back_node_guard =
-                                Some(self.current_back_node.as_ref().expect("was just set before").lock_arc());
-                            self.current_back_node_iter = Some(unsafe {
-                                std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
-                                    self.current_back_node_guard
-                                        .as_ref()
-                                        .expect("was just set before")
-                                        .iter(),
-                                )
-                            });
-                            continue;
-                        } else {
-                            self.current_back_node = None;
-                            self.current_back_node_guard = None;
-                            self.current_back_node_iter = None;
-                            return None;
-                        }
-                    } else {
-                        // Mirror of the forward path: the just-finished node
-                        // vanished from the index, so reposition on the node
-                        // covering the last value yielded from the back
-                        // instead of truncating the scan.
-                        let repositioned = match self.current_back_value.as_ref() {
+                    // Mirror of the forward path: advance by the scan cursor
+                    // with one logarithmic lookup (the node covering the last
+                    // value yielded from the back) instead of a linear
+                    // identity scan of the index, stepping past the exhausted
+                    // node by identity when the lookup lands back on it.
+                    let exhausted = self
+                        .current_back_node
+                        .take()
+                        .expect("set whenever a back node iterator was installed");
+                    let prev_node = {
+                        // See the forward path: guard against mid-commit
+                        // entry windows.
+                        let _structural_guard = self.tree.index_lock.read();
+                        let candidate = match self.current_back_value.as_ref() {
                             Some(last_yielded) => self
                                 .tree
                                 .index
@@ -1157,18 +1115,18 @@ where
                                 .or_else(|| self.tree.index.back()),
                             None => self.tree.index.back(),
                         };
-                        if let Some(entry) = repositioned {
-                            self.current_back_node = Some(entry.value().clone());
-                            self.current_back_node_guard = None;
-                            self.current_back_node_iter = None;
-                            continue;
-                        }
-
-                        self.current_back_node = None;
-                        self.current_back_node_guard = None;
-                        self.current_back_node_iter = None;
-                        return None;
+                        let prev_entry = match candidate {
+                            Some(entry) if Arc::ptr_eq(entry.value(), &exhausted) => entry.prev(),
+                            other => other,
+                        };
+                        prev_entry.map(|entry| entry.value().clone())
+                    };
+                    if let Some(node) = prev_node {
+                        self.current_back_node = Some(node);
+                        continue;
                     }
+
+                    return None;
                 }
             } else {
                 self.current_back_node_guard =
@@ -2866,6 +2824,46 @@ mod tests {
             collected.push(*value);
         }
         assert_eq!(collected, vec![10, 0]);
+    }
+
+    #[test]
+    fn full_scans_do_not_degrade_quadratically_with_node_count() {
+        use std::time::Instant;
+
+        // Many tiny nodes: the node-advance cost dominates the scan.
+        const VALUES: u64 = 30_000;
+        let set = BTreeSet::<u64>::with_maximum_node_size(2);
+        for value in 0..VALUES {
+            set.insert(value);
+        }
+        assert!(
+            set.node_count() >= (VALUES / 4) as usize,
+            "fixture must be a many-node tree, got {} nodes",
+            set.node_count()
+        );
+
+        let started = Instant::now();
+        assert_eq!(set.iter().count(), VALUES as usize);
+        let forward = started.elapsed();
+
+        let started = Instant::now();
+        assert_eq!(set.iter().rev().count(), VALUES as usize);
+        let backward = started.elapsed();
+
+        // Advancing between nodes costs one logarithmic index lookup, so both
+        // scans finish in milliseconds even in a debug build. The removed
+        // linear identity relocation made each advance walk the index from
+        // the front (~N^2/2 entry visits per scan, well over a minute at this
+        // node count), so the generous budget still fails it decisively.
+        let budget = Duration::from_secs(10);
+        assert!(
+            forward < budget,
+            "forward scan took {forward:?}, node advance is not logarithmic"
+        );
+        assert!(
+            backward < budget,
+            "backward scan took {backward:?}, node advance is not logarithmic"
+        );
     }
 
     #[test]
