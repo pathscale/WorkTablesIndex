@@ -1445,7 +1445,7 @@ mod tests {
     use crate::concurrent::operation::Operation;
     use crate::concurrent::set::{BTreeSet, Iter, DEFAULT_INNER_SIZE};
     #[cfg(feature = "multimap")]
-    use crate::core::multipair::RandomMultiPair;
+    use crate::core::multipair::OrdMultiPair;
     use crate::core::node::NodeLike;
     use rand::Rng;
     use std::collections::HashSet;
@@ -2204,67 +2204,6 @@ mod tests {
     }
 
     #[cfg(feature = "multimap")]
-    #[test]
-    fn replace_of_logically_equal_pair_preserves_discriminator_and_position() {
-        use crate::core::multipair::MultiPairInsertHelper;
-
-        let set = BTreeSet::<RandomMultiPair<usize, &'static str>>::new();
-        set.attach_node(vec![
-            RandomMultiPair {
-                key: 1,
-                value: "a",
-                discriminator: 10,
-            },
-            RandomMultiPair {
-                key: 1,
-                value: "b",
-                discriminator: 20,
-            },
-            RandomMultiPair {
-                key: 1,
-                value: "c",
-                discriminator: 30,
-            },
-        ]);
-
-        // A logical replace: inserting a (key, value) that is already
-        // present must locate the stored pair by value equality and replace
-        // it in place under its stored discriminator. The stored pair's
-        // position among equal-key neighbors was determined by ITS
-        // discriminator; a replacement under a fresh random discriminator
-        // would be a duplicate, which is what accumulated under the old
-        // value-consulting Ord.
-        let replaced = RandomMultiPair::insert_into(&set, 1, "b");
-        assert_eq!(
-            replaced,
-            Some((1, "b")),
-            "logically equal pair must replace, not duplicate"
-        );
-
-        {
-            let node = set.index.back().expect("node must exist").value().clone();
-            let guard = node.lock();
-            assert_eq!(guard.len(), 3, "logical replace must not change the pair count");
-            assert!(
-                guard.windows(2).all(|pair| pair[0] < pair[1]),
-                "node sort invariant broken: {:?}",
-                *guard
-            );
-            assert_eq!(guard[1].discriminator, 20, "stored discriminator must be preserved");
-        }
-
-        // Every live pair stays reachable and removable afterwards.
-        for (value, discriminator) in [("a", 10), ("b", 20), ("c", 30)] {
-            let probe = RandomMultiPair {
-                key: 1,
-                value,
-                discriminator,
-            };
-            assert!(set.remove(&probe).is_some(), "pair (1, {value}) unreachable");
-        }
-        assert!(set.is_empty());
-    }
-
     #[cfg(feature = "multimap")]
     #[test]
     fn test_remove_where_reindexes_changed_node_maximum() {
@@ -2283,22 +2222,21 @@ mod tests {
     #[cfg(feature = "multimap")]
     #[test]
     fn test_remove_where_deletes_the_position_found_under_the_node_lock() {
-        let set = BTreeSet::<RandomMultiPair<usize, &'static str>>::new();
+        let set = BTreeSet::<OrdMultiPair<usize, &'static str>>::new();
+        // Entries are ordered by `(key, value)`, so an attached node has to be in that
+        // order. It used to be built in discriminator order, which no longer exists.
         set.attach_node(vec![
-            RandomMultiPair {
+            OrdMultiPair {
+                key: 1,
+                value: "first",
+            },
+            OrdMultiPair {
+                key: 1,
+                value: "second",
+            },
+            OrdMultiPair {
                 key: 1,
                 value: "target",
-                discriminator: 5,
-            },
-            RandomMultiPair {
-                key: 1,
-                value: "middle",
-                discriminator: 20,
-            },
-            RandomMultiPair {
-                key: 1,
-                value: "last",
-                discriminator: 30,
             },
         ]);
 
@@ -2307,7 +2245,7 @@ mod tests {
         assert_eq!(removed.map(Into::<(usize, &'static str)>::into), Some((1, "target")));
         assert_eq!(
             set.iter().map(|pair| pair.value).collect::<Vec<_>>(),
-            vec!["middle", "last"]
+            vec!["first", "second"]
         );
     }
 

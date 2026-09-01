@@ -544,7 +544,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::BTreeMultiMap;
-    use crate::core::multipair::{MultiPairLike, OrdMultiPair, RandomMultiPair};
+    use crate::core::multipair::{MultiPairLike, OrdMultiPair};
     use crate::BTreeSet;
     use std::borrow::Borrow;
     use std::fmt::Debug;
@@ -780,7 +780,6 @@ mod tests {
 
     #[test]
     fn test_range_works_as_expected() {
-        assert_range_works_as_expected::<RandomMultiPair<usize, &'static str>>();
         assert_range_works_as_expected::<OrdMultiPair<usize, &'static str>>();
     }
 
@@ -819,7 +818,6 @@ mod tests {
 
     #[test]
     fn test_range_excludes_all_values_at_bounds() {
-        assert_range_excludes_values_at_bounds::<RandomMultiPair<usize, &'static str>>();
         assert_range_excludes_values_at_bounds::<OrdMultiPair<usize, &'static str>>();
     }
 
@@ -860,7 +858,6 @@ mod tests {
 
     #[test]
     fn test_get_works_as_expected() {
-        assert_get_works_as_expected::<RandomMultiPair<usize, &'static str>>();
         assert_get_works_as_expected::<OrdMultiPair<usize, &'static str>>();
     }
 

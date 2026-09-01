@@ -4,12 +4,30 @@ use crate::core::node::NodeLike;
 use std::fmt::Debug;
 
 pub mod ord;
-pub mod random;
-
 pub use ord::OrdMultiPair;
-pub use random::RandomMultiPair;
 
-pub type MultiPair<K, V> = RandomMultiPair<K, V>;
+/// The multimap entry representation.
+///
+/// Identity is the `(key, value)` pair itself, lexicographically ordered, so a stored
+/// entry is located by binary search.
+///
+/// A `RandomMultiPair` variant used to exist alongside this one, ordering by
+/// `(key, random discriminator)` so that a `V` that was only `PartialEq` could still be
+/// stored. It was removed in 0.0.9 and should not be reintroduced. Two things were wrong
+/// with it and both were inherent, not bugs to be fixed:
+///
+/// - Its `Ord` consulted value equality before the discriminator, which is not
+///   transitive, so binary search over nodes was unreliable and same-key node splits
+///   could corrupt routing and livelock the split retry loop.
+/// - Making the order lawful meant the value no longer participated in it, so a stored
+///   entry could not be found by its value. `insert` had to scan every entry sharing the
+///   key, which is O(n) per insert and quadratic to fill one key: 356 us per insert at
+///   16,000 values against 358 ns here, and it never won at any size, not even two
+///   values per key.
+///
+/// The niche it served, a `V` that is `PartialEq` but not `Ord`, is not worth a second
+/// representation. Wrap such a value in a newtype with a total order.
+pub type MultiPair<K, V> = OrdMultiPair<K, V>;
 
 /// Common contract for key-value pairs stored by `BTreeMultiMap`.
 ///

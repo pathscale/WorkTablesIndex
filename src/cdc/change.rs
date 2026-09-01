@@ -1,6 +1,6 @@
 #[cfg(feature = "multimap")]
 use {
-    crate::core::multipair::{OrdMultiPair, RandomMultiPair},
+    crate::core::multipair::OrdMultiPair,
     crate::core::pair::Pair,
 };
 
@@ -187,13 +187,6 @@ where
             max_value: max_value.into(),
             split_index,
         },
-    }
-}
-
-#[cfg(feature = "multimap")]
-impl<K, V> From<ChangeEvent<RandomMultiPair<K, V>>> for ChangeEvent<Pair<K, V>> {
-    fn from(ev: ChangeEvent<RandomMultiPair<K, V>>) -> Self {
-        multipair_change_event_into_pair(ev)
     }
 }
 
