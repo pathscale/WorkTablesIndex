@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.8] - 2026-09-01
+
+### Changed (breaking)
+- Concurrent iterators yield owned clones instead of borrowed references, eliminating a reachable use-after-free: `concurrent::set::{Iter, Range}` yield `T` (previously `&T`), `IntoIterator for &concurrent::set::BTreeSet` yields `T`, and `concurrent::map` / `concurrent::multimap` `Iter`/`Range` yield `(K, V)` (previously `(&K, &V)`). Items are cloned per node batch inside the atomic select-and-lock install from 0.0.7; no lock is held between iterator calls, and collected items survive arbitrary concurrent mutation. Point lookups keep borrowed access through the guard-holding `Ref` returned by `get`.
+- `RandomMultiPair`'s identity and total order are `(key, discriminator)` only; the value no longer participates in `Ord`, `Eq`, or `Hash`. The previous value-consulting order was not transitive: it broke binary search, accumulated duplicate logical pairs under same-key churn, and let split entry keys compare `Equal`, corrupting skip-map routing and livelocking the split retry loop.
+- `BTreeMultiMap::insert`/`insert_cdc` require the new `MultiPairInsertHelper` strategy (implemented by both `RandomMultiPair` and `OrdMultiPair`; for the default `RandomMultiPair` representation this adds a `V: PartialEq` bound). Inserting an existing `(key, value)` pair now replaces it in place, preserving its stored position, and returns the old value instead of accumulating a duplicate.
+- `RandomMultiPair`'s `Eq`/`Ord`/`Hash` impls drop their `V: PartialEq` / `V: Hash` bounds
+
+### Added
+- `MultiPairInsertHelper`, the pair-specific insert-or-replace strategy: a logical match is located by scanning the key's range with value equality and replaced under its stored discriminator; a fresh insert re-rolls its random discriminator on an identity collision
+- Ord-laws property test for `RandomMultiPair`, a same-key churn test asserting exact logical pair counts, a same-key split routing regression, and an owned-iteration survival test under concurrent churn
+
 ## [0.0.7] - 2026-09-01
 
 ### Fixed
