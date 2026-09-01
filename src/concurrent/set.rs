@@ -833,12 +833,17 @@ where
     Node: NodeLike<T> + Send + 'static,
 {
     tree: &'a BTreeSet<T, Node>,
+    // The node the installed iterator reads from; after exhaustion it is
+    // kept (with the exhausted flag set) so the next install can step past
+    // it by identity when the cursor lookup lands on it again.
     current_front_node: Option<Arc<Mutex<Node>>>,
     current_front_node_guard: Option<ArcMutexGuard<RawMutex, Node>>,
     current_front_node_iter: Option<std::slice::Iter<'a, T>>,
+    front_node_exhausted: bool,
     current_back_node: Option<Arc<Mutex<Node>>>,
     current_back_node_guard: Option<ArcMutexGuard<RawMutex, Node>>,
     current_back_node_iter: Option<std::slice::Iter<'a, T>>,
+    back_node_exhausted: bool,
     current_front_value: Option<T>,
     current_back_value: Option<T>,
     met: bool,
@@ -850,24 +855,220 @@ where
     Node: NodeLike<T> + Send + 'static,
 {
     pub fn new(btree: &'a BTreeSet<T, Node>) -> Self {
-        // Capture the endpoints under the structural read guard so the
-        // lookup cannot land inside another writer's mid-commit
-        // remove-then-insert window (split or re-key) and miss a node.
-        let _structural_guard = btree.index_lock.read();
-        let current_front_node = btree.index.front().map(|e| e.value().clone());
-        let current_back_node = btree.index.back().map(|e| e.value().clone());
+        // No node is chosen here: each direction positions itself from its
+        // cursor when it installs a node iterator, atomically with locking
+        // the node. Choosing a node ahead of time and locking it later left
+        // a window in which a split could migrate not-yet-yielded elements
+        // into a new node past the resume point (see `install_front`).
         Self {
             tree: btree,
-            current_front_node,
+            current_front_node: None,
             current_front_node_guard: None,
             current_front_node_iter: None,
-            current_back_node,
+            front_node_exhausted: false,
+            current_back_node: None,
             current_back_node_guard: None,
             current_back_node_iter: None,
+            back_node_exhausted: false,
             current_front_value: None,
             current_back_value: None,
             met: false,
         }
+    }
+
+    // Select the node covering the forward cursor and lock it in ONE atomic
+    // step under the structural read guard, then install the node iterator
+    // positioned just past the cursor. Returns false when no node remains.
+    //
+    // Both split commits and re-keys take the structural write lock and the
+    // node lock, so a node selected and locked under one structural read
+    // guard cannot change contents or move in between. Selecting under one
+    // guard and locking later allowed a split to keep the node's lower half
+    // in the selected Arc and move the upper half to a new node: elements a
+    // backward scan had not yielded yet migrated above its resume point and
+    // were silently skipped (deterministically reproduced by
+    // `backward_scan_does_not_skip_values_split_away_after_positioning`).
+    //
+    // Locking follows `lock_node_for_value`: try-lock while holding the
+    // structural read guard; on contention release the guard, wait for the
+    // holder without pinning the structural mapping, and re-derive. After
+    // repeated contention the documented `index_lock -> node` order is used
+    // as a bounded progress fallback. The caller must hold no node guard in
+    // either direction (writers take `index_lock` before node locks, so
+    // holding a node mutex while acquiring `index_lock` deadlocks ABBA
+    // against a committer).
+    fn install_front(&mut self) -> bool {
+        let mut contentions = 0;
+
+        loop {
+            let structural_guard = self.tree.index_lock.read();
+            let candidate = match self.current_front_value.as_ref() {
+                Some(last_yielded) => self.tree.index.lower_bound(Bound::Excluded(last_yielded)),
+                None => self.tree.index.front(),
+            };
+            // Advance by the scan cursor with one logarithmic lookup: it
+            // lands on whichever node now covers the cursor even after
+            // re-keys or removals, and the yield-path filters skip anything
+            // already yielded. Step past the just-exhausted node by identity
+            // (its entry key can sit above every element it still holds) so
+            // the scan always makes progress.
+            let entry = match candidate {
+                Some(entry)
+                    if self.front_node_exhausted
+                        && self
+                            .current_front_node
+                            .as_ref()
+                            .is_some_and(|exhausted| Arc::ptr_eq(entry.value(), exhausted)) =>
+                {
+                    entry.next()
+                }
+                candidate => candidate,
+            };
+            let Some(entry) = entry else {
+                return false;
+            };
+            let node = entry.value().clone();
+
+            let node_guard = if let Some(node_guard) = node.try_lock_arc() {
+                node_guard
+            } else {
+                contentions += 1;
+                if contentions >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
+                    node.lock_arc()
+                } else {
+                    drop(structural_guard);
+                    // Wait for the observed holder without pinning the
+                    // structural mapping, then retry so the installed node
+                    // always corresponds to a mapping observed while it was
+                    // already locked.
+                    drop(node.lock_arc());
+                    continue;
+                }
+            };
+            drop(structural_guard);
+
+            self.front_node_exhausted = false;
+            self.current_front_node = Some(node);
+            self.current_front_node_guard = Some(node_guard);
+            self.current_front_node_iter = Some(unsafe {
+                std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
+                    self.current_front_node_guard
+                        .as_ref()
+                        .expect("was just set before")
+                        .iter(),
+                )
+            });
+
+            // Skip everything at or below the cursor in one rank lookup;
+            // the yield-path filters keep this correct even when the rank
+            // finds nothing to skip.
+            if let Some(current_front_value) = self.current_front_value.as_ref() {
+                if let Some(rank) = self
+                    .current_front_node_guard
+                    .as_ref()
+                    .expect("was just set before")
+                    .rank(Bound::Excluded(current_front_value), true)
+                {
+                    let _ = self
+                        .current_front_node_iter
+                        .as_mut()
+                        .expect("was just set before")
+                        .nth(rank);
+                }
+            }
+
+            return true;
+        }
+    }
+
+    // Mirror of `install_front` for the backward cursor: select the node
+    // covering the cursor (the last node when every entry key sits below
+    // it), lock it atomically, and skip everything at or above the cursor.
+    fn install_back(&mut self) -> bool {
+        let mut contentions = 0;
+
+        loop {
+            let structural_guard = self.tree.index_lock.read();
+            let candidate = match self.current_back_value.as_ref() {
+                Some(last_yielded) => self
+                    .tree
+                    .index
+                    .lower_bound(Bound::Included(last_yielded))
+                    .or_else(|| self.tree.index.back()),
+                None => self.tree.index.back(),
+            };
+            let entry = match candidate {
+                Some(entry)
+                    if self.back_node_exhausted
+                        && self
+                            .current_back_node
+                            .as_ref()
+                            .is_some_and(|exhausted| Arc::ptr_eq(entry.value(), exhausted)) =>
+                {
+                    entry.prev()
+                }
+                candidate => candidate,
+            };
+            let Some(entry) = entry else {
+                return false;
+            };
+            let node = entry.value().clone();
+
+            let node_guard = if let Some(node_guard) = node.try_lock_arc() {
+                node_guard
+            } else {
+                contentions += 1;
+                if contentions >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
+                    node.lock_arc()
+                } else {
+                    drop(structural_guard);
+                    // See `install_front`.
+                    drop(node.lock_arc());
+                    continue;
+                }
+            };
+            drop(structural_guard);
+
+            self.back_node_exhausted = false;
+            self.current_back_node = Some(node);
+            self.current_back_node_guard = Some(node_guard);
+            self.current_back_node_iter = Some(unsafe {
+                std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
+                    self.current_back_node_guard
+                        .as_ref()
+                        .expect("was just set before")
+                        .iter(),
+                )
+            });
+
+            if let Some(current_back_value) = self.current_back_value.as_ref() {
+                if let Some(rank) = self
+                    .current_back_node_guard
+                    .as_ref()
+                    .expect("was just set before")
+                    .rank(Bound::Excluded(current_back_value), false)
+                {
+                    let _ = self
+                        .current_back_node_iter
+                        .as_mut()
+                        .expect("was just set before")
+                        .nth_back(rank);
+                }
+            }
+
+            return true;
+        }
+    }
+
+    // The scan is finished: release every guard. A met iterator that stays
+    // alive must not keep a node pinned - that starves writers and
+    // self-deadlocks any same-thread lock of the node (including a second
+    // iterator).
+    fn release_all_guards(&mut self) {
+        self.current_front_node_iter = None;
+        self.current_front_node_guard = None;
+        self.current_back_node_iter = None;
+        self.current_back_node_guard = None;
     }
 }
 
@@ -884,168 +1085,46 @@ where
                 return None;
             }
 
-            if self.current_front_node.is_none() {
-                match self.tree.index.front() {
-                    Some(e) => {
-                        self.current_front_node = Some(e.value().clone());
-
-                        if let Some(back_entry) = self.current_back_node.as_ref() {
-                            if Arc::ptr_eq(e.value(), back_entry) {
-                                self.current_front_node_guard = self.current_back_node_guard.take();
-                                self.current_front_node_iter = self.current_back_node_iter.take();
-                            }
-                            continue;
-                        }
-
-                        self.current_front_node_guard = Some(
-                            self.current_front_node
-                                .as_ref()
-                                .expect("was just set before")
-                                .lock_arc(),
-                        );
-                        self.current_front_node_iter = Some(unsafe {
-                            std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
-                                self.current_front_node_guard
-                                    .as_ref()
-                                    .expect("was just set before")
-                                    .iter(),
-                            )
-                        });
-                    }
-                    None => {
-                        return None;
-                    }
-                }
-            }
-
+            // Only one direction holds a node guard at a time: the opposite
+            // side is released before any structural-lock acquisition (its
+            // node and cursor survive; its next call re-locks through the
+            // cursor). Writers take `index_lock` and then node locks, so a
+            // scan holding a node mutex while acquiring `index_lock` would
+            // deadlock ABBA against a committer.
             if self.current_back_node_guard.is_some() {
                 self.current_back_node_guard = None;
                 self.current_back_node_iter = None;
             }
 
-            if let Some(iter) = self.current_front_node_iter.as_mut() {
-                if let Some(value) = iter.next() {
-                    // A node installed after advancing or repositioning can
-                    // re-expose elements at or below the last yielded value
-                    // (a split re-distributes the just-finished node, a
-                    // repositioned node covers part of the scanned range).
-                    // Skip them instead of yielding duplicates.
-                    if let Some(current_front_value) = self.current_front_value.as_ref() {
-                        if value.le(current_front_value) {
-                            continue;
-                        }
-                    }
-                    if let Some(current_back_value) = self.current_back_value.as_ref() {
-                        if value.ge(current_back_value) {
-                            // The scan is finished: release every guard.
-                            // A met iterator that stays alive must not keep a
-                            // node pinned - that starves writers and
-                            // self-deadlocks any same-thread lock of the node
-                            // (including a second iterator).
-                            self.met = true;
-                            self.current_front_node_iter = None;
-                            self.current_front_node_guard = None;
-                            self.current_back_node_iter = None;
-                            self.current_back_node_guard = None;
-                            return None;
-                        }
-                    }
-                    self.current_front_value = Some(value.clone());
-                    return Some(value);
-                } else {
-                    self.current_front_node_iter = None;
-                    self.current_front_node_guard = None;
+            if self.current_front_node_iter.is_none() && !self.install_front() {
+                return None;
+            }
 
-                    // Advance by the scan cursor with one logarithmic lookup
-                    // instead of relocating the exhausted node by identity
-                    // with a linear scan from the front of the index (which
-                    // made a full scan quadratic in the node count). This
-                    // also transparently covers the node having been re-keyed
-                    // by an UpdateMax repair or removed: the lookup lands on
-                    // whichever node now covers the cursor, and the resume
-                    // paths skip anything already yielded. When the lookup
-                    // lands back on the just-exhausted node (its entry key
-                    // can sit above every element it still holds), step past
-                    // it by identity so the scan always makes progress.
-                    let exhausted = self
-                        .current_front_node
-                        .take()
-                        .expect("set whenever a front node iterator was installed");
-                    // Invariant: no node mutex is ever held while acquiring
-                    // `index_lock`. Writers take `index_lock` first and node
-                    // locks second, so a violation deadlocks ABBA against a
-                    // committer. The advancing side's guard was released
-                    // above and the opposite side's in the loop preamble;
-                    // release the opposite side's explicitly as well so the
-                    // invariant survives any reordering of the preamble (the
-                    // opposite side keeps its node and cursor, and its next
-                    // call re-locks and re-filters through the cursor).
-                    self.current_back_node_iter = None;
-                    self.current_back_node_guard = None;
-                    let next_node = {
-                        // Structural commits (split, re-key, unlink) briefly
-                        // remove an entry before reinserting it; a lock-free
-                        // lookup landing inside that window would skip the
-                        // node. Commits run under the structural write lock,
-                        // so a short read guard makes the lookup sound.
-                        let _structural_guard = self.tree.index_lock.read();
-                        let candidate = match self.current_front_value.as_ref() {
-                            Some(last_yielded) => self.tree.index.lower_bound(Bound::Excluded(last_yielded)),
-                            None => self.tree.index.front(),
-                        };
-                        let next_entry = match candidate {
-                            Some(entry) if Arc::ptr_eq(entry.value(), &exhausted) => entry.next(),
-                            other => other,
-                        };
-                        next_entry.map(|entry| entry.value().clone())
-                    };
-                    if let Some(node) = next_node {
-                        self.current_front_node = Some(node);
+            let iter = self.current_front_node_iter.as_mut().expect("installed above");
+            if let Some(value) = iter.next() {
+                // A node installed after repositioning can re-expose
+                // elements at or below the last yielded value (a split
+                // re-distributes the just-finished node, a repositioned node
+                // covers part of the scanned range). Skip them instead of
+                // yielding duplicates.
+                if let Some(current_front_value) = self.current_front_value.as_ref() {
+                    if value.le(current_front_value) {
                         continue;
                     }
-
-                    return None;
                 }
-            } else {
-                self.current_front_node_guard = Some(
-                    self.current_front_node
-                        .as_ref()
-                        .expect("was just set before")
-                        .lock_arc(),
-                );
-                self.current_front_node_iter = Some(unsafe {
-                    std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
-                        self.current_front_node_guard
-                            .as_ref()
-                            .expect("was just set before")
-                            .iter(),
-                    )
-                });
-
-                if let Some(current_front_value) = self.current_front_value.as_ref() {
-                    let g = self.current_front_node_guard.as_mut().expect("was just set before");
-                    if let Some(rank) = g.rank(Bound::Excluded(current_front_value), true) {
-                        let i = self.current_front_node_iter.as_mut().expect("was just set before");
-                        if let Some(v) = i.nth(rank + 1) {
-                            if let Some(current_back_value) = self.current_back_value.as_ref() {
-                                if v.ge(current_back_value) {
-                                    // See the yield path: a met iterator
-                                    // releases every guard.
-                                    self.met = true;
-                                    self.current_front_node_iter = None;
-                                    self.current_front_node_guard = None;
-                                    self.current_back_node_iter = None;
-                                    self.current_back_node_guard = None;
-                                    return None;
-                                }
-                            }
-                            self.current_front_value = Some(v.clone());
-                            return Some(v);
-                        }
+                if let Some(current_back_value) = self.current_back_value.as_ref() {
+                    if value.ge(current_back_value) {
+                        self.met = true;
+                        self.release_all_guards();
+                        return None;
                     }
-                    // else iter is exhausted, will continue in next loop iteration.
-                    continue;
                 }
+                self.current_front_value = Some(value.clone());
+                return Some(value);
+            } else {
+                self.current_front_node_iter = None;
+                self.current_front_node_guard = None;
+                self.front_node_exhausted = true;
             }
         }
     }
@@ -1062,143 +1141,39 @@ where
                 return None;
             }
 
-            if self.current_back_node.is_none() {
-                match self.tree.index.back() {
-                    Some(e) => {
-                        self.current_back_node = Some(e.value().clone());
-
-                        if let Some(front_entry) = self.current_front_node.as_ref() {
-                            if Arc::ptr_eq(e.value(), front_entry) {
-                                self.current_back_node_guard = self.current_front_node_guard.take();
-                                self.current_back_node_iter = self.current_front_node_iter.take();
-                            }
-                            continue;
-                        }
-
-                        self.current_back_node_guard =
-                            Some(self.current_back_node.as_ref().expect("was just set before").lock_arc());
-                        self.current_back_node_iter = Some(unsafe {
-                            std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
-                                self.current_back_node_guard
-                                    .as_ref()
-                                    .expect("was just set before")
-                                    .iter(),
-                            )
-                        });
-                    }
-                    None => {
-                        return None;
-                    }
-                }
-            }
-
+            // See `next`: only one direction holds a node guard at a time.
             if self.current_front_node_guard.is_some() {
                 self.current_front_node_guard = None;
                 self.current_front_node_iter = None;
             }
 
-            if let Some(iter) = self.current_back_node_iter.as_mut() {
-                if let Some(value) = iter.next_back() {
-                    // Mirror of the forward path: skip elements at or above
-                    // the last value yielded from the back, which a freshly
-                    // installed node iterator can re-expose after churn.
-                    if let Some(current_back_value) = self.current_back_value.as_ref() {
-                        if value.ge(current_back_value) {
-                            continue;
-                        }
-                    }
-                    if let Some(current_front_value) = self.current_front_value.as_ref() {
-                        if value.le(current_front_value) {
-                            // See `next`: a met iterator releases every
-                            // guard.
-                            self.met = true;
-                            self.current_front_node_iter = None;
-                            self.current_front_node_guard = None;
-                            self.current_back_node_iter = None;
-                            self.current_back_node_guard = None;
-                            return None;
-                        }
-                    }
-                    self.current_back_value = Some(value.clone());
-                    return Some(value);
-                } else {
-                    self.current_back_node_iter = None;
-                    self.current_back_node_guard = None;
+            if self.current_back_node_iter.is_none() && !self.install_back() {
+                return None;
+            }
 
-                    // Mirror of the forward path: advance by the scan cursor
-                    // with one logarithmic lookup (the node covering the last
-                    // value yielded from the back) instead of a linear
-                    // identity scan of the index, stepping past the exhausted
-                    // node by identity when the lookup lands back on it.
-                    let exhausted = self
-                        .current_back_node
-                        .take()
-                        .expect("set whenever a back node iterator was installed");
-                    // See `next`: never hold a node mutex while acquiring
-                    // `index_lock`; release the opposite side explicitly.
-                    self.current_front_node_iter = None;
-                    self.current_front_node_guard = None;
-                    let prev_node = {
-                        // See the forward path: guard against mid-commit
-                        // entry windows.
-                        let _structural_guard = self.tree.index_lock.read();
-                        let candidate = match self.current_back_value.as_ref() {
-                            Some(last_yielded) => self
-                                .tree
-                                .index
-                                .lower_bound(Bound::Included(last_yielded))
-                                .or_else(|| self.tree.index.back()),
-                            None => self.tree.index.back(),
-                        };
-                        let prev_entry = match candidate {
-                            Some(entry) if Arc::ptr_eq(entry.value(), &exhausted) => entry.prev(),
-                            other => other,
-                        };
-                        prev_entry.map(|entry| entry.value().clone())
-                    };
-                    if let Some(node) = prev_node {
-                        self.current_back_node = Some(node);
+            let iter = self.current_back_node_iter.as_mut().expect("installed above");
+            if let Some(value) = iter.next_back() {
+                // Mirror of the forward path: skip elements at or above the
+                // last value yielded from the back, which a freshly
+                // installed node iterator can re-expose after churn.
+                if let Some(current_back_value) = self.current_back_value.as_ref() {
+                    if value.ge(current_back_value) {
                         continue;
                     }
-
-                    return None;
                 }
-            } else {
-                self.current_back_node_guard =
-                    Some(self.current_back_node.as_ref().expect("was just set before").lock_arc());
-                self.current_back_node_iter = Some(unsafe {
-                    std::mem::transmute::<std::slice::Iter<'_, T>, std::slice::Iter<'a, T>>(
-                        self.current_back_node_guard
-                            .as_ref()
-                            .expect("was just set before")
-                            .iter(),
-                    )
-                });
-
-                if let Some(current_back_value) = self.current_back_value.as_ref() {
-                    let g = self.current_back_node_guard.as_mut().expect("was just set before");
-                    if let Some(rank) = g.rank(Bound::Excluded(current_back_value), false) {
-                        let i = self.current_back_node_iter.as_mut().expect("was just set before");
-                        if let Some(v) = i.nth_back(rank + 1) {
-                            if let Some(current_front_value) = self.current_front_value.as_ref() {
-                                if v.le(current_front_value) {
-                                    // See `next`: a met iterator releases
-                                    // every guard.
-                                    self.met = true;
-                                    self.current_front_node_iter = None;
-                                    self.current_front_node_guard = None;
-                                    self.current_back_node_iter = None;
-                                    self.current_back_node_guard = None;
-                                    return None;
-                                }
-                            }
-                            self.current_back_value = Some(v.clone());
-                            return Some(v);
-                        }
+                if let Some(current_front_value) = self.current_front_value.as_ref() {
+                    if value.le(current_front_value) {
+                        self.met = true;
+                        self.release_all_guards();
+                        return None;
                     }
-                    // else iter is exhausted, will continue in next loop iteration.
-                    continue;
                 }
+                self.current_back_value = Some(value.clone());
+                return Some(value);
+            } else {
+                self.current_back_node_iter = None;
+                self.current_back_node_guard = None;
+                self.back_node_exhausted = true;
             }
         }
     }
@@ -1338,15 +1313,21 @@ where
             }
         }
 
+        // Only the cursor sentinels position the iterator: each direction
+        // selects and locks its node atomically at install time. Prewiring
+        // the entries' node Arcs here would reintroduce the select-then-lock
+        // split-migration window (see `Iter::install_front`).
         Self {
             iter: Iter {
                 tree: btree,
-                current_front_node: current_front_entry.map(|e| e.value().clone()),
+                current_front_node: None,
                 current_front_node_guard: None,
                 current_front_node_iter: None,
-                current_back_node: current_back_entry.map(|e| e.value().clone()),
+                front_node_exhausted: false,
+                current_back_node: None,
                 current_back_node_guard: None,
                 current_back_node_iter: None,
+                back_node_exhausted: false,
                 current_front_value: front_value,
                 current_back_value: back_value,
                 met,
@@ -2814,17 +2795,19 @@ mod tests {
             set.insert(value);
         }
 
-        // An iterator that had already yielded through 20 from the pre-split
-        // node and resumes positioned on the lower half: advancing into the
-        // upper half must not re-yield 20.
+        // An iterator that had already yielded through 20 and just
+        // exhausted the pre-split lower half: advancing into the upper half
+        // must not re-yield 20.
         let iter = Iter {
             tree: &set,
             current_front_node: Some(set.index.front().expect("fixture node").value().clone()),
             current_front_node_guard: None,
             current_front_node_iter: None,
+            front_node_exhausted: true,
             current_back_node: None,
             current_back_node_guard: None,
             current_back_node_iter: None,
+            back_node_exhausted: false,
             current_front_value: Some(20),
             current_back_value: None,
             met: false,
@@ -2852,9 +2835,11 @@ mod tests {
             current_front_node: None,
             current_front_node_guard: None,
             current_front_node_iter: None,
+            front_node_exhausted: false,
             current_back_node: Some(set.index.back().expect("fixture node").value().clone()),
             current_back_node_guard: None,
             current_back_node_iter: None,
+            back_node_exhausted: false,
             current_front_value: None,
             current_back_value: Some(30),
             met: false,
@@ -2865,6 +2850,50 @@ mod tests {
             collected.push(*value);
         }
         assert_eq!(collected, vec![10, 0]);
+    }
+
+    #[test]
+    fn backward_scan_does_not_skip_values_split_away_after_positioning() {
+        // The heavy-tier churn failure in deterministic form. A backward
+        // scan that chooses its node (at construction or when advancing) and
+        // only later locks it races splits: a split committed in that window
+        // keeps the node's LOWER half in the chosen Arc and moves the upper
+        // half to a new node, so values the scan has not yielded yet migrate
+        // above its resume point and are silently skipped. Node selection
+        // and locking must be one atomic step under the structural guard.
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        for value in [0u64, 10, 20, 30] {
+            set.insert(value);
+        }
+
+        // Construct the scan first...
+        let mut iter = set.iter();
+        // ...then let a writer split the only node before the scan locks
+        // anything: [0, 10] stays in the original Arc, [20, 30, 40] moves
+        // to a new node above it.
+        set.insert(40);
+        assert!(set.node_count() > 1, "fixture must split");
+
+        let mut collected = vec![];
+        while let Some(value) = iter.next_back() {
+            collected.push(*value);
+        }
+
+        // 40 was inserted mid-scan, so a weakly consistent scan may or may
+        // not observe it; every baseline value must be yielded. (Linear scan
+        // on purpose: with NodeLike in scope, Vec::contains resolves to
+        // NodeLike's binary search, which is wrong on this descending
+        // vector.)
+        for baseline in [30u64, 20, 10, 0] {
+            assert!(
+                collected.iter().any(|value| *value == baseline),
+                "baseline value {baseline} skipped by backward scan (yielded: {collected:?})"
+            );
+        }
+        assert!(
+            collected.windows(2).all(|pair| pair[0] > pair[1]),
+            "backward scan not strictly decreasing: {collected:?}"
+        );
     }
 
     #[test]
