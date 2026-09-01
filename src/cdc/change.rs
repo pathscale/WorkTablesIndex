@@ -1,8 +1,5 @@
 #[cfg(feature = "multimap")]
-use {
-    crate::core::multipair::OrdMultiPair,
-    crate::core::pair::Pair,
-};
+use {crate::core::multipair::OrdMultiPair, crate::core::pair::Pair};
 
 /// Unique event identifier.
 ///

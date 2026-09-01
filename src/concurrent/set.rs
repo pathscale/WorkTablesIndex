@@ -1372,12 +1372,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "cdc")]
-    use crate::cdc::change::ChangeEvent;
     use crate::concurrent::operation::Operation;
     use crate::concurrent::set::{BTreeSet, Iter, DEFAULT_INNER_SIZE};
-    #[cfg(feature = "multimap")]
-    use crate::core::multipair::OrdMultiPair;
     use crate::core::node::NodeLike;
     use rand::Rng;
     use std::collections::HashSet;
