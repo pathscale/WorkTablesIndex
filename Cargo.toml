@@ -16,6 +16,15 @@ rand = "0.9.0"
 scc = { version = "2.2.5" }
 uuid = { version = "1.17.0", features = ["v7"]}
 
+# The crate is a fork of `indexset`, published under a different package name
+# to avoid colliding with upstream on the registry, and consumed everywhere as
+# `indexset` (WorkTable writes `indexset = { package = "WorkTablesIndex", .. }`).
+# Without this the library is named after the package instead, and all 105
+# doctests, which say `use indexset::..` like a consumer does, fail to resolve
+# the crate. They have been failing since the rename.
+[lib]
+name = "indexset"
+
 [dependencies]
 serde = { version = "1.0.151", optional = true, features = ["derive"] }
 ftree = { version = "1.3.0", features = ["serde"] }
