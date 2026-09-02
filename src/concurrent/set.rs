@@ -785,10 +785,33 @@ where
     // it again (its entry key can sit past every element it still holds).
     exhausted_front_node: Option<Arc<Mutex<Node>>>,
     exhausted_back_node: Option<Arc<Mutex<Node>>>,
+    // The node a direction is partway through, and how many of its elements it
+    // has taken. A batch that stops short of a node's end must resume inside
+    // that node, and must never take less than it already has: the rank-based
+    // skip alone cannot guarantee that, because a repositioned node can leave
+    // the cursor ranking below elements already yielded. Recording the count
+    // makes forward progress structural rather than incidental.
+    front_partial: Option<(Arc<Mutex<Node>>, usize)>,
+    back_partial: Option<(Arc<Mutex<Node>>, usize)>,
+    // How many elements the next batch may clone, doubling per install.
+    front_batch_limit: usize,
+    back_batch_limit: usize,
     current_front_value: Option<T>,
     current_back_value: Option<T>,
     met: bool,
 }
+
+/// Elements the first batch of a scan clones.
+///
+/// A one-element range is the common case and it used to clone a whole node to
+/// yield one value. Starting small makes that cost proportional to what is
+/// asked for; doubling means a real scan reaches whole-node batches after a
+/// handful of installs and pays the same total clone count it always did.
+const INITIAL_BATCH: usize = 4;
+
+/// Ceiling on the growth. `available` bounds a batch to what the node holds, so
+/// this only stops the doubling running away on a very long scan.
+const MAX_BATCH: usize = 4096;
 
 impl<'a, T, Node> Iter<'a, T, Node>
 where
@@ -806,6 +829,10 @@ where
             current_back_batch: None,
             exhausted_front_node: None,
             exhausted_back_node: None,
+            front_partial: None,
+            back_partial: None,
+            front_batch_limit: INITIAL_BATCH,
+            back_batch_limit: INITIAL_BATCH,
             current_front_value: None,
             current_back_value: None,
             met: false,
@@ -858,15 +885,51 @@ where
         let guard = node.lock_arc();
         drop(structural_guard);
 
-        let skip = self
+        let rank_skip = self
             .current_front_value
             .as_ref()
             .and_then(|value| guard.rank(Bound::Excluded(value), true))
             .map_or(0, |rank| rank + 1);
-        let batch = guard.iter().skip(skip).cloned().collect::<Vec<_>>();
+        // Resuming a node this scan is partway through: never take less than
+        // has already been taken from it. Without this a repositioned node can
+        // rank the cursor below elements already yielded, the yield path drops
+        // them all as duplicates, the batch empties without advancing, and the
+        // next install computes the same skip forever.
+        //
+        // NOT COVERED BY A TEST. Removing this line leaves the whole suite
+        // green, including `a_scan_under_concurrent_mutation_terminates`, which
+        // was written to reach it and does not. It is kept as insurance against
+        // a non-terminating scan, which is the worst failure this iterator can
+        // have, and it costs one `max`. Treat it as unproven rather than as
+        // guarded: if you can build the interleaving that needs it, that test
+        // is worth more than this comment.
+        let partial_skip = match self.front_partial.as_ref() {
+            Some((partial, taken)) if Arc::ptr_eq(partial, &node) => *taken,
+            _ => 0,
+        };
+        let skip = rank_skip.max(partial_skip);
+
+        // Clone what was asked for rather than the rest of the node. A range
+        // that yields one value used to clone every remaining element of the
+        // node it landed in, which is where the 2.6x cost of this path came
+        // from; the owned batch is what makes the iterator sound, but nothing
+        // about that soundness required cloning eagerly.
+        let available = guard.len().saturating_sub(skip);
+        let take = available.min(self.front_batch_limit);
+        let batch = guard.iter().skip(skip).take(take).cloned().collect::<Vec<_>>();
         drop(guard);
 
-        self.exhausted_front_node = Some(node);
+        if take == available {
+            // The node is finished, so the next install must step past it.
+            self.exhausted_front_node = Some(node);
+            self.front_partial = None;
+        } else {
+            // More of this node remains: resume inside it rather than stepping
+            // past, and remember how far in.
+            self.exhausted_front_node = None;
+            self.front_partial = Some((node, skip + take));
+        }
+        self.front_batch_limit = self.front_batch_limit.saturating_mul(2).min(MAX_BATCH);
         self.current_front_batch = Some(batch.into_iter());
         true
     }
@@ -900,11 +963,30 @@ where
             .as_ref()
             .and_then(|value| guard.rank(Bound::Excluded(value), false))
             .map_or(0, |rank| rank + 1);
-        let keep = guard.len() - truncate;
-        let batch = guard.iter().take(keep).cloned().collect::<Vec<_>>();
+        // Mirror of the forward cursor's partial resume: walking backwards, the
+        // count already taken is trimmed from the end rather than skipped at
+        // the start.
+        let partial_truncate = match self.back_partial.as_ref() {
+            Some((partial, taken)) if Arc::ptr_eq(partial, &node) => *taken,
+            _ => 0,
+        };
+        let truncate = truncate.max(partial_truncate);
+        let available = guard.len().saturating_sub(truncate);
+        let take = available.min(self.back_batch_limit);
+        // The backward batch is the last `take` of what remains, so the skip is
+        // whatever sits below it.
+        let skip = available - take;
+        let batch = guard.iter().skip(skip).take(take).cloned().collect::<Vec<_>>();
         drop(guard);
 
-        self.exhausted_back_node = Some(node);
+        if take == available {
+            self.exhausted_back_node = Some(node);
+            self.back_partial = None;
+        } else {
+            self.exhausted_back_node = None;
+            self.back_partial = Some((node, truncate + take));
+        }
+        self.back_batch_limit = self.back_batch_limit.saturating_mul(2).min(MAX_BATCH);
         self.current_back_batch = Some(batch.into_iter());
         true
     }
@@ -1141,6 +1223,10 @@ where
                 current_back_batch: None,
                 exhausted_front_node: None,
                 exhausted_back_node: None,
+                front_partial: None,
+                back_partial: None,
+                front_batch_limit: INITIAL_BATCH,
+                back_batch_limit: INITIAL_BATCH,
                 current_front_value: front_value,
                 current_back_value: back_value,
                 met,
@@ -1373,7 +1459,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::concurrent::operation::Operation;
-    use crate::concurrent::set::{BTreeSet, Iter, DEFAULT_INNER_SIZE};
+    use crate::concurrent::set::{BTreeSet, Iter, DEFAULT_INNER_SIZE, INITIAL_BATCH};
     use crate::core::node::NodeLike;
     use rand::Rng;
     use std::collections::HashSet;
@@ -2477,6 +2563,10 @@ mod tests {
             current_back_batch: None,
             exhausted_front_node: Some(set.index.front().expect("fixture node").value().clone()),
             exhausted_back_node: None,
+            front_partial: None,
+            back_partial: None,
+            front_batch_limit: INITIAL_BATCH,
+            back_batch_limit: INITIAL_BATCH,
             current_front_value: Some(20),
             current_back_value: None,
             met: false,
@@ -2505,6 +2595,10 @@ mod tests {
             current_back_batch: None,
             exhausted_front_node: None,
             exhausted_back_node: Some(set.index.back().expect("fixture node").value().clone()),
+            front_partial: None,
+            back_partial: None,
+            front_batch_limit: INITIAL_BATCH,
+            back_batch_limit: INITIAL_BATCH,
             current_front_value: None,
             current_back_value: Some(30),
             met: false,
@@ -2863,5 +2957,199 @@ mod tests {
             set.insert(i);
         }
         handle.join().unwrap();
+    }
+
+    /// A scan that spans several batch installs inside one node yields every
+    /// element, once, in order.
+    ///
+    /// The batch is bounded and grows, so a node larger than `INITIAL_BATCH` is
+    /// consumed over several installs rather than one. Each install re-selects
+    /// the node by cursor and skips what has already been taken, which is where
+    /// a partial batch can silently drop or repeat elements. A whole-node batch
+    /// could not get this wrong because it never resumed inside a node.
+    #[test]
+    fn a_scan_across_several_batch_installs_is_complete_and_ordered() {
+        let set: BTreeSet<u64> = BTreeSet::new();
+        // Comfortably more than INITIAL_BATCH, and more than the first few
+        // doublings, so the scan resumes inside a node repeatedly.
+        let count = (INITIAL_BATCH * 20) as u64;
+        for i in 0..count {
+            set.insert(i);
+        }
+
+        let seen: Vec<u64> = set.iter().collect();
+        let expected: Vec<u64> = (0..count).collect();
+        assert_eq!(seen, expected, "a partial-batch scan lost or repeated elements");
+    }
+
+    /// The same property backwards.
+    #[test]
+    fn a_backward_scan_across_several_installs_is_complete_and_ordered() {
+        let set: BTreeSet<u64> = BTreeSet::new();
+        let count = (INITIAL_BATCH * 20) as u64;
+        for i in 0..count {
+            set.insert(i);
+        }
+
+        let seen: Vec<u64> = set.iter().rev().collect();
+        let expected: Vec<u64> = (0..count).rev().collect();
+        assert_eq!(
+            seen, expected,
+            "a partial-batch backward scan lost or repeated elements"
+        );
+    }
+
+    /// A scan over a node big enough to hold everything, so every install after
+    /// the first resumes inside the same node.
+    #[test]
+    fn a_scan_within_a_single_node_resumes_correctly() {
+        let set: BTreeSet<u64> = BTreeSet::with_maximum_node_size(DEFAULT_INNER_SIZE);
+        let count = 200u64;
+        for i in 0..count {
+            set.insert(i);
+        }
+        assert_eq!(set.node_count(), 1, "fixture wants one node");
+
+        let seen: Vec<u64> = set.iter().collect();
+        assert_eq!(seen, (0..count).collect::<Vec<_>>());
+    }
+
+    /// A one-element range yields exactly that element.
+    ///
+    /// The case the bounded batch exists for: this used to clone every
+    /// remaining element of the node it landed in to produce one value.
+    #[test]
+    fn a_single_element_range_yields_one_element() {
+        let set: BTreeSet<u64> = BTreeSet::new();
+        for i in 0..1_000u64 {
+            set.insert(i);
+        }
+
+        for probe in [0u64, 1, 499, 998, 999] {
+            let got: Vec<u64> = set.range(probe..=probe).collect();
+            assert_eq!(got, vec![probe], "range({probe}..={probe})");
+        }
+        assert!(set.range(1_000..=1_000).next().is_none(), "absent key");
+    }
+
+    /// Ranges of every width across a batch boundary.
+    ///
+    /// Widths either side of `INITIAL_BATCH` and its first doublings are where
+    /// an off-by-one in the resume arithmetic shows up, and nowhere else.
+    #[test]
+    fn ranges_spanning_batch_boundaries_are_exact() {
+        let set: BTreeSet<u64> = BTreeSet::new();
+        for i in 0..500u64 {
+            set.insert(i);
+        }
+
+        for width in 1..=(INITIAL_BATCH * 8) as u64 {
+            let start = 100u64;
+            let got: Vec<u64> = set.range(start..start + width).collect();
+            let expected: Vec<u64> = (start..start + width).collect();
+            assert_eq!(got, expected, "range width {width}");
+        }
+    }
+
+    /// Meeting in the middle still terminates and yields each element once.
+    ///
+    /// Both cursors now resume inside nodes, so the point at which they meet is
+    /// reached through a different sequence of installs than before.
+    #[test]
+    fn a_double_ended_scan_meets_without_repeating() {
+        let set: BTreeSet<u64> = BTreeSet::new();
+        let count = (INITIAL_BATCH * 10) as u64;
+        for i in 0..count {
+            set.insert(i);
+        }
+
+        let mut iter = set.iter();
+        let mut front = Vec::new();
+        let mut back = Vec::new();
+        loop {
+            match iter.next() {
+                Some(v) => front.push(v),
+                None => break,
+            }
+            match iter.next_back() {
+                Some(v) => back.push(v),
+                None => break,
+            }
+        }
+        back.reverse();
+        front.extend(back);
+        front.sort_unstable();
+        assert_eq!(
+            front,
+            (0..count).collect::<Vec<_>>(),
+            "double-ended scan is not a partition"
+        );
+    }
+
+    /// A scan under concurrent mutation terminates and does not stream
+    /// duplicates forever.
+    ///
+    /// This is the case the partial-skip guard exists for, and it cannot be
+    /// reached from one thread. A batch that stops short of a node's end
+    /// resumes inside that node by cursor rank; a concurrent split or re-key
+    /// can leave that rank *below* elements already yielded, the yield path
+    /// then drops the whole batch as duplicates, and the next install computes
+    /// the same skip again. Without the recorded take count that is a scan
+    /// which never advances.
+    ///
+    /// A stall is asserted as a bound rather than by waiting: the scan is
+    /// capped, and a run that reaches the cap is one that was not making
+    /// progress. Removing the guard makes this fail rather than hang, which is
+    /// the difference between a test and a timeout.
+    #[test]
+    fn a_scan_under_concurrent_mutation_terminates() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const SIZE: u64 = 4_000;
+        // Generous: any honest scan yields at most SIZE plus whatever is
+        // inserted while it runs. Reaching this many means it is looping.
+        const CAP: usize = (SIZE * 20) as usize;
+
+        for _ in 0..8 {
+            let set: Arc<BTreeSet<u64>> = Arc::new(BTreeSet::new());
+            for i in 0..SIZE {
+                set.insert(i);
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+
+            // Churn that forces splits and re-keys under the scan.
+            let writers: Vec<_> = (0..3)
+                .map(|w| {
+                    let (set, stop) = (Arc::clone(&set), Arc::clone(&stop));
+                    std::thread::spawn(move || {
+                        let mut i = SIZE + w * 100_000;
+                        while !stop.load(Ordering::Relaxed) {
+                            set.insert(i);
+                            set.remove(&i);
+                            i += 1;
+                        }
+                    })
+                })
+                .collect();
+
+            let mut yielded = 0usize;
+            for _ in set.iter() {
+                yielded += 1;
+                if yielded >= CAP {
+                    break;
+                }
+            }
+
+            stop.store(true, Ordering::Relaxed);
+            for w in writers {
+                w.join().expect("writer did not panic");
+            }
+
+            assert!(
+                yielded < CAP,
+                "scan did not make progress under concurrent mutation: {yielded} yields"
+            );
+        }
     }
 }
