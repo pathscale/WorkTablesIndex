@@ -43,7 +43,7 @@ where
 /// map.insert(1, "b");
 /// map.insert(1, "a");
 ///
-/// assert_eq!(map.remove(1, "b"), Some((1, "b")));
+/// assert_eq!(map.remove(&1, &"b"), Some((1, "b")));
 /// ```
 pub type OrderedBTreeMultiMap<K, V> = BTreeMultiMap<K, V, Vec<OrdMultiPair<K, V>>, OrdMultiPair<K, V>>;
 
@@ -413,7 +413,7 @@ where
     /// }
     ///
     /// let (first_key, first_value) = map.iter().next().unwrap();
-    /// assert_eq!((*first_key, *first_value), (1, "a"));
+    /// assert_eq!((first_key, first_value), (1, "a"));
     /// ```
     pub fn iter(&self) -> Iter<'_, K, V, Node, M> {
         Iter {
@@ -525,8 +525,8 @@ where
     /// map.insert(1, "b");
     /// map.insert(1, "a");
     ///
-    /// assert_eq!(map.remove(1, "a"), Some((1, "a")));
-    /// assert_eq!(map.remove(1, "b"), Some((1, "b")));
+    /// assert_eq!(map.remove(&1, &"a"), Some((1, "a")));
+    /// assert_eq!(map.remove(&1, &"b"), Some((1, "b")));
     /// ```
     pub fn remove(&self, key: &K, value: &V) -> Option<(K, V)> {
         M::remove_from(&self.set, key, value)

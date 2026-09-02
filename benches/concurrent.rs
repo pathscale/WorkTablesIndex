@@ -6,7 +6,7 @@ use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use WorkTablesIndex::concurrent::multimap::{BTreeMultiMap, OrderedBTreeMultiMap};
+use indexset::concurrent::multimap::{BTreeMultiMap, OrderedBTreeMultiMap};
 
 #[derive(Clone)]
 enum Op {
@@ -121,8 +121,8 @@ fn bench_btreeset_with_ratio(c: &mut Criterion, write_ratio: f64) {
 
     group.bench_function(BenchmarkId::new("ConcurrentBTreeSet", write_ratio), |b| {
         b.iter(|| {
-            let set: Arc<WorkTablesIndex::concurrent::set::BTreeSet<usize>> =
-                Arc::new(WorkTablesIndex::concurrent::set::BTreeSet::new());
+            let set: Arc<indexset::concurrent::set::BTreeSet<usize>> =
+                Arc::new(indexset::concurrent::set::BTreeSet::new());
             let mut handles = vec![];
 
             for thread_ops in operations.iter() {
@@ -189,7 +189,7 @@ fn bench_concurrent_btreeset(c: &mut Criterion) {
 }
 
 fn bench_is_empty(c: &mut Criterion) {
-    let set = WorkTablesIndex::concurrent::set::BTreeSet::<usize>::new();
+    let set = indexset::concurrent::set::BTreeSet::<usize>::new();
     for value in 0..IS_EMPTY_ENTRIES {
         set.insert(value);
     }
@@ -200,7 +200,7 @@ fn bench_is_empty(c: &mut Criterion) {
 }
 
 fn bench_contains(c: &mut Criterion) {
-    let set = WorkTablesIndex::concurrent::set::BTreeSet::<usize>::new();
+    let set = indexset::concurrent::set::BTreeSet::<usize>::new();
     for value in 0..IS_EMPTY_ENTRIES {
         set.insert(value);
     }
@@ -214,7 +214,7 @@ fn bench_contains(c: &mut Criterion) {
 }
 
 fn bench_map_select(c: &mut Criterion) {
-    let map = WorkTablesIndex::concurrent::map::BTreeMap::<usize, usize>::new();
+    let map = indexset::concurrent::map::BTreeMap::<usize, usize>::new();
     for value in 0..IS_EMPTY_ENTRIES {
         map.insert(value, value);
     }
@@ -232,7 +232,7 @@ fn bench_map_select(c: &mut Criterion) {
 }
 
 fn bench_runtime_read_policy(c: &mut Criterion) {
-    let map = WorkTablesIndex::concurrent::map::BTreeMap::<usize, usize>::new();
+    let map = indexset::concurrent::map::BTreeMap::<usize, usize>::new();
     for value in 0..IS_EMPTY_ENTRIES {
         map.insert(value, value);
     }
@@ -283,8 +283,8 @@ fn point_lookup_string(value: usize) -> String {
 }
 
 fn bench_randomized_contains(c: &mut Criterion) {
-    let numeric = WorkTablesIndex::concurrent::set::BTreeSet::<usize>::new();
-    let strings = WorkTablesIndex::concurrent::set::BTreeSet::<String>::new();
+    let numeric = indexset::concurrent::set::BTreeSet::<usize>::new();
+    let strings = indexset::concurrent::set::BTreeSet::<String>::new();
     for value in 0..IS_EMPTY_ENTRIES {
         numeric.insert(value * 2);
         strings.insert(point_lookup_string(value * 2));
@@ -321,9 +321,9 @@ fn bench_randomized_contains(c: &mut Criterion) {
 }
 
 fn bench_map_update(c: &mut Criterion) {
-    let normal = WorkTablesIndex::concurrent::map::BTreeMap::<usize, usize>::new();
+    let normal = indexset::concurrent::map::BTreeMap::<usize, usize>::new();
     normal.insert(1, 1);
-    let with_cdc = WorkTablesIndex::concurrent::map::BTreeMap::<usize, usize>::new();
+    let with_cdc = indexset::concurrent::map::BTreeMap::<usize, usize>::new();
     with_cdc.insert_cdc(1, 1);
 
     let mut group = c.benchmark_group("ConcurrentBTreeMap update");
