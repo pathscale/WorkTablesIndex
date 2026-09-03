@@ -890,24 +890,34 @@ where
             .as_ref()
             .and_then(|value| guard.rank(Bound::Excluded(value), true))
             .map_or(0, |rank| rank + 1);
-        // Resuming a node this scan is partway through: never take less than
-        // has already been taken from it. Without this a repositioned node can
-        // rank the cursor below elements already yielded, the yield path drops
-        // them all as duplicates, the batch empties without advancing, and the
-        // next install computes the same skip forever.
+        // Resuming a node this scan is partway through. `front_partial` counts
+        // *positions*, and a position is not a stable cursor: deleting an
+        // element this scan already yielded shifts the unyielded tail left
+        // while the count stays put. Letting it win a `max` against the value
+        // rank steps over an element that was present for the whole scan,
+        // which is the one thing this iterator promises not to do. See
+        // `deleting_a_yielded_element_does_not_skip_a_live_one`.
         //
-        // NOT COVERED BY A TEST. Removing this line leaves the whole suite
-        // green, including `a_scan_under_concurrent_mutation_terminates`, which
-        // was written to reach it and does not. It is kept as insurance against
-        // a non-terminating scan, which is the worst failure this iterator can
-        // have, and it costs one `max`. Treat it as unproven rather than as
-        // guarded: if you can build the interleaving that needs it, that test
-        // is worth more than this comment.
+        // The value rank is authoritative wherever there is one: it counts the
+        // elements at or below the last yielded value, so the batch resumes
+        // strictly above the cursor. No duplicates, and progress every time.
+        // That is also what makes dropping the `max` safe -- the
+        // non-termination it guarded against was a batch that came back all
+        // duplicates and advanced nothing, and a value-ranked resume cannot
+        // produce one.
+        //
+        // The position still matters before anything has been yielded, where
+        // there is no value to rank against and it is the only record that this
+        // node was already drawn from.
         let partial_skip = match self.front_partial.as_ref() {
             Some((partial, taken)) if Arc::ptr_eq(partial, &node) => *taken,
             _ => 0,
         };
-        let skip = rank_skip.max(partial_skip);
+        let skip = if self.current_front_value.is_some() {
+            rank_skip
+        } else {
+            partial_skip
+        };
 
         // Clone what was asked for rather than the rest of the node. A range
         // that yields one value used to clone every remaining element of the
@@ -963,14 +973,21 @@ where
             .as_ref()
             .and_then(|value| guard.rank(Bound::Excluded(value), false))
             .map_or(0, |rank| rank + 1);
-        // Mirror of the forward cursor's partial resume: walking backwards, the
-        // count already taken is trimmed from the end rather than skipped at
-        // the start.
+        // Mirror of the forward cursor's partial resume, defect included:
+        // walking backwards the count already taken is trimmed from the end
+        // rather than skipped at the start, and removing an already-yielded
+        // high element shifts the unyielded head right while the count stays
+        // put. The value rank wins here for the same reason it wins there. See
+        // `deleting_a_yielded_element_backwards_does_not_skip_a_live_one`.
         let partial_truncate = match self.back_partial.as_ref() {
             Some((partial, taken)) if Arc::ptr_eq(partial, &node) => *taken,
             _ => 0,
         };
-        let truncate = truncate.max(partial_truncate);
+        let truncate = if self.current_back_value.is_some() {
+            truncate
+        } else {
+            partial_truncate
+        };
         let available = guard.len().saturating_sub(truncate);
         let take = available.min(self.back_batch_limit);
         // The backward batch is the last `take` of what remains, so the skip is
@@ -3150,6 +3167,83 @@ mod tests {
                 yielded < CAP,
                 "scan did not make progress under concurrent mutation: {yielded} yields"
             );
+        }
+    }
+
+    /// `Vec::contains` is not usable in this module: `NodeLike` is in scope and
+    /// its `contains` for `Vec<T>` is a *binary search*, which silently answers
+    /// nonsense for any sequence that is not sorted ascending. A scan's output
+    /// is exactly such a sequence when it runs backwards.
+    // Clippy suggests `seen.contains(&value)` here. Taking that suggestion
+    // reintroduces the exact bug this helper exists to avoid, which is why the
+    // lint is silenced rather than followed.
+    #[allow(clippy::manual_contains)]
+    fn yielded(seen: &[u64], value: u64) -> bool {
+        seen.iter().any(|item| *item == value)
+    }
+
+    /// WTI-1: `front_partial` counts *positions*, and a position is not a
+    /// stable cursor under deletion.
+    ///
+    /// Deleting an element the scan already yielded shifts the unyielded tail
+    /// left while the recorded count stays put, so the stale position wins the
+    /// `max` and steps over a live element. Key `0` is removed after it has
+    /// been yielded; every key above it was present for the whole scan and must
+    /// still appear, which is what the iterator promises.
+    ///
+    /// The prefix is swept because the defect only bites when the deletion
+    /// lands while the scan is partway through a node, and where that boundary
+    /// falls depends on the doubling batch limit.
+    #[test]
+    fn deleting_a_yielded_element_does_not_skip_a_live_one() {
+        for prefix in 1..12usize {
+            let set: BTreeSet<u64> = BTreeSet::new();
+            for i in 0..256u64 {
+                set.insert(i);
+            }
+
+            let mut seen = Vec::new();
+            for value in set.iter() {
+                seen.push(value);
+                if seen.len() == prefix {
+                    set.remove(&0);
+                }
+            }
+
+            for expected in 1..256u64 {
+                assert!(
+                    yielded(&seen, expected),
+                    "prefix {prefix}: {expected} was present for the whole scan but was never yielded"
+                );
+            }
+        }
+    }
+
+    /// The backward mirror. `back_partial` trims from the end rather than
+    /// skipping from the start, so the same staleness would drop an element off
+    /// the low end of the scan.
+    #[test]
+    fn deleting_a_yielded_element_backwards_does_not_skip_a_live_one() {
+        for prefix in 1..12usize {
+            let set: BTreeSet<u64> = BTreeSet::new();
+            for i in 0..256u64 {
+                set.insert(i);
+            }
+
+            let mut seen = Vec::new();
+            for value in set.iter().rev() {
+                seen.push(value);
+                if seen.len() == prefix {
+                    set.remove(&255);
+                }
+            }
+
+            for expected in 0..255u64 {
+                assert!(
+                    yielded(&seen, expected),
+                    "prefix {prefix}: {expected} was present for the whole scan but was never yielded"
+                );
+            }
         }
     }
 }
