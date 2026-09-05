@@ -56,7 +56,7 @@ where
 {
     fn default() -> Self {
         Self {
-            set: Default::default(),
+            set: BTreeSet::default().with_grouped_borrow_routing(),
             marker: PhantomData,
         }
     }
@@ -185,7 +185,7 @@ where
     /// ```
     pub fn new() -> Self {
         Self {
-            set: Default::default(),
+            set: BTreeSet::default().with_grouped_borrow_routing(),
             marker: PhantomData,
         }
     }
@@ -200,7 +200,7 @@ where
     /// let map = BTreeMultiMap::<i32, i32>::with_maximum_node_size(128);
     pub fn with_maximum_node_size(node_capacity: usize) -> Self {
         Self {
-            set: BTreeSet::with_maximum_node_size(node_capacity),
+            set: BTreeSet::with_maximum_node_size(node_capacity).with_grouped_borrow_routing(),
             marker: PhantomData,
         }
     }
@@ -213,7 +213,7 @@ where
     /// Returns iterator over this multiset's [`Node`]'s.
     #[cfg(feature = "cdc")]
     pub fn iter_nodes(&self) -> impl Iterator<Item = Arc<Mutex<Node>>> + '_ {
-        self.set.index.iter().map(|e| e.value().clone())
+        self.set.index.read().values().cloned().collect::<Vec<_>>().into_iter()
     }
     /// Returns `true` if the map contains at least one occurance of the specified key.
     ///

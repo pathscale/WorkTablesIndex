@@ -225,7 +225,7 @@ where
     /// Returns iterator over this set's [`Node`]'s.
     #[cfg(feature = "cdc")]
     pub fn iter_nodes(&self) -> impl Iterator<Item = Arc<Mutex<Node>>> + '_ {
-        self.set.index.iter().map(|e| e.value().clone())
+        self.set.index.read().values().cloned().collect::<Vec<_>>().into_iter()
     }
 
     /// Copies the exact node boundaries into a pointer-free checkpoint image.

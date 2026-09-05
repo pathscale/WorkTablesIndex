@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.11]
+
+### Changed
+
+- The concurrent tree topology is now an ordinary ordered map behind its one
+  existing structural read/write lock. The previous Crossbeam skip-list sat
+  behind that same lock, so its atomics and epoch reclamation added no usable
+  concurrency. Node contents remain independently locked. Crossbeam skip-list
+  is retained only as a development benchmark comparison.
+
 ## [0.0.8] - 2026-09-01
 
 ### Changed (breaking)
