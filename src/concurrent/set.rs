@@ -58,6 +58,27 @@ impl<T, Node> PublishedNodeIndex<T, Node>
 where
     T: Ord + Clone,
 {
+    fn from_canonical(index: &NodeIndex<T, Node>) -> Self {
+        let mut chunks = Vec::with_capacity(index.len().div_ceil(PUBLISHED_ROUTES_PER_CHUNK));
+        let mut entries = Vec::with_capacity(PUBLISHED_ROUTES_PER_CHUNK);
+
+        for (key, node) in index {
+            entries.push((key.clone(), node.clone()));
+            if entries.len() == PUBLISHED_ROUTES_PER_CHUNK {
+                chunks.push(Arc::new(PublishedChunk { entries }));
+                entries = Vec::with_capacity(PUBLISHED_ROUTES_PER_CHUNK);
+            }
+        }
+        if !entries.is_empty() {
+            chunks.push(Arc::new(PublishedChunk { entries }));
+        }
+
+        Self {
+            chunks,
+            len: index.len(),
+        }
+    }
+
     fn iter(&self) -> impl Iterator<Item = (&T, &Arc<RwLock<Node>>)> {
         self.chunks
             .iter()
@@ -269,6 +290,9 @@ impl<T, Node> Drop for PublishedIndex<T, Node> {
 
 pub(crate) struct Topology<T, Node> {
     index: RwLock<NodeIndex<T, Node>>,
+    // Writer-only reverse lookup from node identity to its current published
+    // route key. This differs from the canonical key only for the last node,
+    // whose stale route remains a valid final point-read fallback.
     published_keys: Mutex<HashMap<usize, T>>,
     published: PublishedIndex<T, Node>,
     // Even values are stable publications; odd values mean a writer may have
@@ -392,6 +416,10 @@ where
         if self.publish {
             return;
         }
+        debug_assert!(
+            !self.dirty,
+            "publication must be enabled before mutating an opt-out topology guard"
+        );
         // `write_rekey` deliberately leaves the stable generation untouched
         // for a route-safe last-node rekey. If commit discovers that the
         // route really must change, enter the odd writer generation before
@@ -407,6 +435,30 @@ where
         }
     }
 
+    /// Restores all derived publication state from the canonical topology.
+    ///
+    /// Ordinary mutations update one route in O(log N). This bounded O(N)
+    /// recovery is reserved for an internal identity mismatch or impossible
+    /// key collision; it prevents a bookkeeping defect from panicking or
+    /// entering an unbounded repair loop while the structural lock is held.
+    fn rebuild_publication(&mut self) {
+        if self.published_keys.is_none() {
+            self.published_keys = Some(self.topology.published_keys.lock());
+        }
+        let canonical = self.index.as_deref().expect("topology guard already released");
+        let rebuilt = PublishedNodeIndex::from_canonical(canonical);
+        let rebuilt_keys = canonical
+            .iter()
+            .map(|(key, node)| (node_identity(node), key.clone()))
+            .collect();
+        **self
+            .published_keys
+            .as_mut()
+            .expect("publication identity lock was initialized") = rebuilt_keys;
+        self.published = Some(rebuilt);
+        self.dirty = true;
+    }
+
     pub(crate) fn is_last_node(&self, node: &Arc<RwLock<Node>>) -> bool {
         self.index
             .as_deref()
@@ -414,7 +466,88 @@ where
             .is_some_and(|(_, candidate)| Arc::ptr_eq(candidate, node))
     }
 
+    /// Re-keys the one route that may safely remain stale for point reads.
+    ///
+    /// This is deliberately separate from `insert`/`remove`: those general
+    /// mutation methods require publication to be enabled. The caller has
+    /// already verified that `old_key` identifies `node` and that it is the
+    /// canonical last node. Its published route remains a valid final
+    /// fallback whether the maximum grows or shrinks.
+    pub(crate) fn rekey_last_node(&mut self, old_key: &T, new_key: T, node: Arc<RwLock<Node>>) {
+        debug_assert!(!self.publish, "last-node rekey must use the opt-out guard");
+        debug_assert!(
+            !self.dirty,
+            "an opt-out guard may perform only one explicit last-node rekey"
+        );
+        debug_assert!(
+            self.is_last_node(&node),
+            "only the canonical last node may skip publication"
+        );
+
+        let index = self.index.as_deref_mut().expect("topology guard already released");
+        let removed = index.remove(old_key);
+        debug_assert!(
+            removed.as_ref().is_some_and(|removed| Arc::ptr_eq(removed, &node)),
+            "last-node rekey must remove its expected canonical route"
+        );
+        let replaced = index.insert(new_key, node);
+        debug_assert!(
+            replaced.is_none(),
+            "last-node rekey must not collide with another canonical route"
+        );
+        self.dirty = true;
+    }
+
+    /// Makes the current canonical last-node route exact before attachment
+    /// can place another node after it. This runs once per attach batch, not
+    /// once per node.
+    fn repair_last_route_before_attach(&mut self) {
+        debug_assert!(self.publish, "attachment repair requires publication");
+        let Some((canonical_key, last_node)) = self
+            .index
+            .as_deref()
+            .expect("topology guard already released")
+            .last_key_value()
+            .map(|(key, node)| (key.clone(), node.clone()))
+        else {
+            return;
+        };
+
+        self.ensure_publication_snapshot();
+        let published_key = self
+            .published_keys
+            .as_ref()
+            .expect("publication identity map initialized")
+            .get(&node_identity(&last_node))
+            .cloned();
+        let Some(published_key) = published_key else {
+            self.rebuild_publication();
+            return;
+        };
+        if published_key == canonical_key {
+            return;
+        }
+
+        let repaired_consistently = {
+            let published = self.published.as_mut().expect("publication snapshot initialized");
+            let published_keys = self
+                .published_keys
+                .as_mut()
+                .expect("publication identity map initialized");
+            let removed = published.remove(&published_key);
+            let displaced = published.insert(canonical_key.clone(), last_node.clone());
+            published_keys.insert(node_identity(&last_node), canonical_key);
+            removed.is_some_and(|old_node| Arc::ptr_eq(&old_node, &last_node)) && displaced.is_none()
+        };
+        if !repaired_consistently {
+            self.rebuild_publication();
+        } else {
+            self.dirty = true;
+        }
+    }
+
     pub(crate) fn insert(&mut self, key: T, node: Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+        debug_assert!(self.publish, "generic topology insertion requires publication");
         let replaced = self
             .index
             .as_deref_mut()
@@ -424,47 +557,39 @@ where
 
         if self.publish {
             self.ensure_publication_snapshot();
-            let published = self.published.as_mut().expect("publication snapshot initialized");
-            let published_keys = self
-                .published_keys
-                .as_mut()
-                .expect("publication identity map initialized");
             if let Some(replaced) = &replaced {
-                if let Some(old_key) = published_keys.remove(&node_identity(replaced)) {
-                    published.remove(&old_key);
+                let removed_consistently = {
+                    let published = self.published.as_mut().expect("publication snapshot initialized");
+                    let published_keys = self
+                        .published_keys
+                        .as_mut()
+                        .expect("publication identity map initialized");
+                    published_keys
+                        .remove(&node_identity(replaced))
+                        .and_then(|old_key| published.remove(&old_key))
+                        .is_some_and(|old_node| Arc::ptr_eq(&old_node, replaced))
+                };
+                if !removed_consistently {
+                    self.rebuild_publication();
+                    return Some(replaced.clone());
                 }
             }
 
-            // A skipped rekey can leave another node published at the new
-            // canonical boundary. Move that displaced node to its own current
-            // canonical key, repeating only if stale boundaries form a short
-            // collision chain. The fallback scan is confined to such a
-            // collision; ordinary split/attach publication remains O(log N).
-            let canonical = self.index.as_deref().expect("topology guard already released");
-            let mut route_key = key;
-            let mut route_node = node;
-            loop {
-                let displaced = published.insert(route_key.clone(), route_node.clone());
-                published_keys.insert(node_identity(&route_node), route_key.clone());
-
-                let Some(displaced) = displaced else {
-                    break;
-                };
-                if Arc::ptr_eq(&displaced, &route_node) {
-                    break;
-                }
-                published_keys.remove(&node_identity(&displaced));
-
-                let Some((canonical_key, _)) = canonical
-                    .iter()
-                    .find(|(_, candidate)| Arc::ptr_eq(candidate, &displaced))
-                else {
-                    // The displaced route belonged to a node removed from the
-                    // canonical topology by an earlier route-preserving race.
-                    break;
-                };
-                route_key = canonical_key.clone();
-                route_node = displaced;
+            let displaced = self
+                .published
+                .as_mut()
+                .expect("publication snapshot initialized")
+                .insert(key.clone(), node.clone());
+            self.published_keys
+                .as_mut()
+                .expect("publication identity map initialized")
+                .insert(node_identity(&node), key);
+            if displaced.is_some_and(|old_node| !Arc::ptr_eq(&old_node, &node)) {
+                // Canonical keys are unique, so a different node cannot
+                // lawfully occupy this route. Recover once from canonical
+                // state instead of scanning and chaining while the generation
+                // remains odd.
+                self.rebuild_publication();
             }
         }
 
@@ -476,6 +601,7 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        debug_assert!(self.publish, "generic topology removal requires publication");
         let removed = self
             .index
             .as_deref_mut()
@@ -485,21 +611,20 @@ where
 
         if self.publish {
             self.ensure_publication_snapshot();
-            let published = self.published.as_mut().expect("publication snapshot initialized");
-            let published_keys = self
-                .published_keys
-                .as_mut()
-                .expect("publication identity map initialized");
-            let route_key = published_keys
-                .remove(&node_identity(&removed))
-                .expect("published key map must contain a canonical node");
-            let route_node = published
-                .remove::<T>(&route_key)
-                .expect("published route must contain its recorded boundary");
-            assert!(
-                Arc::ptr_eq(&route_node, &removed),
-                "published boundary must identify the removed node"
-            );
+            let removed_consistently = {
+                let published = self.published.as_mut().expect("publication snapshot initialized");
+                let published_keys = self
+                    .published_keys
+                    .as_mut()
+                    .expect("publication identity map initialized");
+                published_keys
+                    .remove(&node_identity(&removed))
+                    .and_then(|route_key| published.remove::<T>(&route_key))
+                    .is_some_and(|route_node| Arc::ptr_eq(&route_node, &removed))
+            };
+            if !removed_consistently {
+                self.rebuild_publication();
+            }
         }
 
         Some(removed)
@@ -530,10 +655,14 @@ where
                 published_keys.len(),
                 "canonical and published identity counts diverged"
             );
-            for node in canonical.values() {
+            for ((_, canonical_node), (route_key, route_node)) in canonical.iter().zip(published.iter()) {
                 debug_assert!(
-                    published_keys.contains_key(&node_identity(node)),
-                    "canonical node is absent from published identity map"
+                    Arc::ptr_eq(route_node, canonical_node),
+                    "canonical and published node order diverged"
+                );
+                debug_assert!(
+                    published_keys.get(&node_identity(canonical_node)) == Some(route_key),
+                    "published identity key does not match the route index"
                 );
             }
         }
@@ -772,8 +901,10 @@ where
 
     /// Attaches a persisted topology in one structural publication.
     ///
-    /// Nodes must be non-empty, internally sorted, and mutually ordered. The
-    /// same preconditions as [`Self::attach_node`] apply to every item.
+    /// Nodes must be non-empty and internally sorted. Their values, together
+    /// with any nodes already attached to this set, must form mutually ordered
+    /// non-overlapping ranges. The same preconditions as [`Self::attach_node`]
+    /// apply to every item.
     pub fn attach_nodes(&self, nodes: impl IntoIterator<Item = Node>) {
         let mut nodes = nodes.into_iter().peekable();
         if nodes.peek().is_none() {
@@ -781,6 +912,7 @@ where
         }
 
         let mut index = self.index.write();
+        index.repair_last_route_before_attach();
         for node in nodes {
             let node_id = node
                 .max()
@@ -3060,6 +3192,83 @@ mod tests {
         assert!(set.insert(5));
         assert!(set.contains(&5));
         assert_eq!(set.get(&5).map(|value| *value.get()), Some(5));
+    }
+
+    #[test]
+    fn attach_repairs_a_stale_last_node_boundary() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(8);
+        set.attach_node(vec![1, 10]);
+
+        // A last-node maximum may remain conservatively published at its old
+        // high boundary. Incremental restoration above that node must move
+        // the old route down before installing a new node whose values occupy
+        // the gap.
+        assert_eq!(set.remove(&10), Some(10));
+        set.attach_node(vec![5, 20]);
+
+        assert_eq!(set.get(&5).map(|value| *value.get()), Some(5));
+        assert!(set.contains(&5));
+    }
+
+    #[test]
+    fn attach_repairs_a_stale_low_last_node_boundary() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(8);
+        set.attach_node(vec![1, 10]);
+
+        // Growing the last node can leave its published boundary below its
+        // canonical maximum. Once another node is attached, that old route is
+        // no longer the final fallback and must be repaired as well.
+        assert!(set.insert(20));
+        set.attach_node(vec![25, 30]);
+
+        assert_eq!(set.get(&20).map(|value| *value.get()), Some(20));
+        assert_eq!(set.get(&25).map(|value| *value.get()), Some(25));
+    }
+
+    #[test]
+    fn attach_recovers_from_a_missing_published_identity() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(8);
+        set.attach_node(vec![1, 10]);
+        let last_identity = {
+            let index = set.index.read();
+            super::node_identity(index.last_key_value().unwrap().1)
+        };
+        assert!(set.index.published_keys.lock().remove(&last_identity).is_some());
+
+        set.attach_node(vec![20, 30]);
+
+        for value in [1, 10, 20, 30] {
+            assert_eq!(set.get(&value).map(|found| *found.get()), Some(value));
+        }
+    }
+
+    #[test]
+    fn attach_boundary_repair_is_a_complete_publication_by_itself() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(8);
+        set.attach_node(vec![1, 10]);
+        assert_eq!(set.remove(&10), Some(10));
+
+        // Model attachment stopping after its preflight repair (for example,
+        // because user-provided Clone/Ord code panics while reading the first
+        // incoming node). The repaired identity map and route snapshot must
+        // still commit together when the guard drops.
+        {
+            let mut index = set.index.write();
+            index.repair_last_route_before_attach();
+        }
+        set.attach_node(vec![5, 20]);
+
+        assert_eq!(set.get(&5).map(|found| *found.get()), Some(5));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "generic topology removal requires publication")]
+    fn publication_must_be_enabled_before_an_opt_out_guard_mutates() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(8);
+        set.attach_node(vec![1, 10]);
+        let mut index = set.index.write_rekey();
+        index.remove(&10);
     }
 
     #[test]

@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A sorted 100,000-key construction benchmark guards the monotonic insert
   pattern used by autoincrementing tables.
 
+### Fixed
+
+- Incremental node attachment repairs a deliberately stale final-node route
+  before adding a later node, preventing false point-lookup misses in the new
+  node's range. Publication bookkeeping mismatches recover once from the
+  canonical topology instead of panicking or entering an unbounded collision
+  chain under the structural write lock.
+
 ## [0.0.11]
 
 ### Changed
