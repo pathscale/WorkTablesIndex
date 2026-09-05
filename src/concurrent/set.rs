@@ -1,5 +1,7 @@
-use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, RawRwLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::collections::BTreeMap;
+use parking_lot::{
+    ArcRwLockReadGuard, ArcRwLockWriteGuard, Mutex, MutexGuard, RawRwLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
@@ -15,16 +17,181 @@ use crate::core::node::*;
 use super::r#ref::Ref;
 
 const ROOT_PUBLICATION_SPIN_LIMIT: usize = 16;
+const STABLE_READ_BLOCKING_FALLBACK_AFTER: usize = 2;
+const PUBLICATION_BACKLOG_DRAIN_THRESHOLD: usize = 64;
 
 type NodeIndex<T, Node> = BTreeMap<T, Arc<RwLock<Node>>>;
 
-struct RetiredIndex<T, Node>(*mut NodeIndex<T, Node>);
+// Point-read routes are kept in immutable, cache-friendly chunks. Publishing
+// clones only the short vector of chunk Arcs and the one chunk containing the
+// changed boundary; it never copies the full node index. At WorkTable's
+// default 1,024 rows per node, one 128-route chunk covers roughly 131k rows.
+const PUBLISHED_ROUTES_PER_CHUNK: usize = 128;
+
+struct PublishedChunk<T, Node> {
+    entries: Vec<(T, Arc<RwLock<Node>>)>,
+}
+
+impl<T: Clone, Node> Clone for PublishedChunk<T, Node> {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+struct PublishedNodeIndex<T, Node> {
+    chunks: Vec<Arc<PublishedChunk<T, Node>>>,
+    len: usize,
+}
+
+impl<T, Node> Clone for PublishedNodeIndex<T, Node> {
+    fn clone(&self) -> Self {
+        Self {
+            chunks: self.chunks.clone(),
+            len: self.len,
+        }
+    }
+}
+
+impl<T, Node> PublishedNodeIndex<T, Node>
+where
+    T: Ord + Clone,
+{
+    fn iter(&self) -> impl Iterator<Item = (&T, &Arc<RwLock<Node>>)> {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.entries.iter().map(|(key, node)| (key, node)))
+    }
+
+    fn first_key_value(&self) -> Option<(&T, &Arc<RwLock<Node>>)> {
+        self.chunks.first()?.entries.first().map(|(key, node)| (key, node))
+    }
+
+    fn last_key_value(&self) -> Option<(&T, &Arc<RwLock<Node>>)> {
+        self.chunks.last()?.entries.last().map(|(key, node)| (key, node))
+    }
+
+    fn chunk_for<Q>(&self, key: &Q) -> usize
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.chunks.partition_point(|chunk| {
+            let max = &chunk.entries.last().expect("published chunks are non-empty").0;
+            <T as Borrow<Q>>::borrow(max) < key
+        })
+    }
+
+    fn first_for_bound<Q>(&self, bound: Bound<&Q>) -> Option<(&T, &Arc<RwLock<Node>>)>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let key = match bound {
+            Bound::Included(key) | Bound::Excluded(key) => key,
+            Bound::Unbounded => return self.first_key_value(),
+        };
+        let mut chunk_index = self.chunk_for(key);
+        while let Some(chunk) = self.chunks.get(chunk_index) {
+            let entry_index = chunk.entries.partition_point(|(candidate, _)| match bound {
+                Bound::Included(_) => <T as Borrow<Q>>::borrow(candidate) < key,
+                Bound::Excluded(_) => <T as Borrow<Q>>::borrow(candidate) <= key,
+                Bound::Unbounded => false,
+            });
+            if let Some((found, node)) = chunk.entries.get(entry_index) {
+                return Some((found, node));
+            }
+            chunk_index += 1;
+        }
+        None
+    }
+
+    fn insert(&mut self, key: T, node: Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+        if self.chunks.is_empty() {
+            self.chunks.push(Arc::new(PublishedChunk {
+                entries: vec![(key, node)],
+            }));
+            self.len = 1;
+            return None;
+        }
+
+        let mut chunk_index = self.chunk_for(&key);
+        if chunk_index == self.chunks.len() {
+            chunk_index -= 1;
+        }
+        let chunk = Arc::make_mut(&mut self.chunks[chunk_index]);
+        match chunk.entries.binary_search_by(|(candidate, _)| candidate.cmp(&key)) {
+            Ok(index) => Some(std::mem::replace(&mut chunk.entries[index].1, node)),
+            Err(index) => {
+                chunk.entries.insert(index, (key, node));
+                self.len += 1;
+                if chunk.entries.len() > PUBLISHED_ROUTES_PER_CHUNK {
+                    let right = chunk.entries.split_off(chunk.entries.len() / 2);
+                    self.chunks
+                        .insert(chunk_index + 1, Arc::new(PublishedChunk { entries: right }));
+                }
+                None
+            }
+        }
+    }
+
+    fn remove<Q>(&mut self, key: &Q) -> Option<Arc<RwLock<Node>>>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let chunk_index = self.chunk_for(key);
+        let chunk = self.chunks.get_mut(chunk_index)?;
+        let chunk = Arc::make_mut(chunk);
+        let entry_index = chunk
+            .entries
+            .binary_search_by(|(candidate, _)| <T as Borrow<Q>>::borrow(candidate).cmp(key))
+            .ok()?;
+        let (_, removed) = chunk.entries.remove(entry_index);
+        self.len -= 1;
+
+        if chunk.entries.is_empty() {
+            self.chunks.remove(chunk_index);
+        } else if chunk_index > 0
+            && self.chunks[chunk_index - 1].entries.len() + self.chunks[chunk_index].entries.len()
+                <= PUBLISHED_ROUTES_PER_CHUNK
+        {
+            let right = self.chunks.remove(chunk_index);
+            Arc::make_mut(&mut self.chunks[chunk_index - 1])
+                .entries
+                .extend(right.entries.iter().cloned());
+        } else if chunk_index + 1 < self.chunks.len()
+            && self.chunks[chunk_index].entries.len() + self.chunks[chunk_index + 1].entries.len()
+                <= PUBLISHED_ROUTES_PER_CHUNK
+        {
+            let right = self.chunks.remove(chunk_index + 1);
+            Arc::make_mut(&mut self.chunks[chunk_index])
+                .entries
+                .extend(right.entries.iter().cloned());
+        }
+
+        Some(removed)
+    }
+}
+
+#[inline]
+fn node_identity<Node>(node: &Arc<RwLock<Node>>) -> usize {
+    // Identity token only: it is never converted back into or dereferenced as
+    // a pointer. The Arc stays live while the token is present, preventing
+    // allocator reuse from aliasing two published nodes.
+    Arc::as_ptr(node) as usize
+}
+
+struct RetiredIndex<T, Node>(*mut PublishedNodeIndex<T, Node>);
 
 // SAFETY: the pointer is uniquely owned after it has been swapped out of the
 // publication slot, and this wrapper exposes no access to the map. Its only
-// operation is destruction after the grace period. Dropping the keys and, for
-// the final Arc, moving each node into its destructor on that thread is valid
-// when both stored types are `Send`; sharing `Node` there is not required.
+// operation is destruction after the grace period. Dropping a shared route
+// chunk only decrements its Arc; dropping the final route path can move/drop T
+// and Node on the reclaiming thread, hence Send. The wrapper never dereferences
+// the index, and its private field prevents callers from adding such access
+// without revisiting this proof.
 unsafe impl<T: Send, Node: Send> Send for RetiredIndex<T, Node> {}
 
 impl<T, Node> Drop for RetiredIndex<T, Node> {
@@ -35,16 +202,18 @@ impl<T, Node> Drop for RetiredIndex<T, Node> {
     }
 }
 
-#[derive(Debug)]
 struct PublishedIndex<T, Node> {
-    current: AtomicPtr<NodeIndex<T, Node>>,
+    current: AtomicPtr<PublishedNodeIndex<T, Node>>,
     domain: ps_reclaim::Domain,
 }
 
 impl<T, Node> PublishedIndex<T, Node> {
     fn new() -> Self {
         Self {
-            current: AtomicPtr::new(Box::into_raw(Box::new(BTreeMap::new()))),
+            current: AtomicPtr::new(Box::into_raw(Box::new(PublishedNodeIndex {
+                chunks: Vec::new(),
+                len: 0,
+            }))),
             domain: ps_reclaim::Domain::new(),
         }
     }
@@ -55,16 +224,37 @@ where
     T: Ord + Clone + Send + 'static,
     Node: Send + 'static,
 {
-    fn publish(&self, index: &NodeIndex<T, Node>) {
-        let replacement = Box::into_raw(Box::new(index.clone()));
+    fn snapshot(&self) -> PublishedNodeIndex<T, Node> {
+        let current = self.current.load(Ordering::Acquire);
+        // SAFETY: callers hold the only structural writer lock. `current`
+        // cannot be unlinked until that writer publishes its replacement.
+        unsafe { (&*current).clone() }
+    }
+
+    fn replace(&self, replacement: PublishedNodeIndex<T, Node>) -> RetiredIndex<T, Node> {
+        // The route index is structurally shared: publishing moves one root,
+        // and the writer copied only its chunk-Arc vector plus touched chunks.
+        let replacement = Box::into_raw(Box::new(replacement));
         let retired = self.current.swap(replacement, Ordering::AcqRel);
+        RetiredIndex(retired)
+    }
+
+    fn retire(&self, retired: RetiredIndex<T, Node>) {
         // Keep the pointer's provenance intact while transferring its unique
         // ownership to the retirement callback.
-        let retired = RetiredIndex(retired);
         self.domain.retire(move || drop(retired));
-        // Topology publication is infrequent (normally one node boundary per
-        // 1,024 inserts), so reclaim one expired snapshot on the writer path.
-        self.domain.advance_up_to(1);
+    }
+
+    fn advance(&self) {
+        // A reader delayed on a node writer never holds a pin (see the point
+        // read paths below). Do not sweep ps-reclaim's 256-slot registry on
+        // every split: that turns the registry into the same reader/writer
+        // cache-line fight this publication path removes. A small bounded
+        // backlog amortizes the sweep while `advance` drains every route root
+        // whose grace period has elapsed.
+        if self.domain.pending() >= PUBLICATION_BACKLOG_DRAIN_THRESHOLD {
+            self.domain.advance();
+        }
     }
 }
 
@@ -77,19 +267,30 @@ impl<T, Node> Drop for PublishedIndex<T, Node> {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct Topology<T, Node> {
     index: RwLock<NodeIndex<T, Node>>,
+    published_keys: Mutex<HashMap<usize, T>>,
     published: PublishedIndex<T, Node>,
     // Even values are stable publications; odd values mean a writer may have
     // changed node contents or routing but has not published the new route.
     generation: AtomicU64,
 }
 
+impl<T, Node> Debug for Topology<T, Node> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Topology")
+            .field("nodes", &self.index.read().len())
+            .field("generation", &self.generation.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 impl<T, Node> Topology<T, Node> {
     fn new() -> Self {
         Self {
             index: RwLock::new(BTreeMap::new()),
+            published_keys: Mutex::new(HashMap::new()),
             published: PublishedIndex::new(),
             generation: AtomicU64::new(0),
         }
@@ -110,24 +311,64 @@ where
     fn write(&self) -> TopologyWriteGuard<'_, T, Node> {
         let index = self.index.write();
         self.generation.fetch_add(1, Ordering::AcqRel);
-        TopologyWriteGuard { topology: self, index }
+        TopologyWriteGuard {
+            topology: self,
+            index: Some(index),
+            published: None,
+            published_keys: None,
+            publish: true,
+            dirty: false,
+        }
+    }
+
+    /// Re-keys a node without replacing the point-read snapshot.
+    ///
+    /// This guard starts without a replacement snapshot. The commit may retain
+    /// that fast path only when re-keying the last node: point reads already
+    /// fall back to the last route beyond its published maximum. Re-keying any
+    /// earlier node must call `enable_publication`, because a subsequent insert
+    /// can fill a gap left by a shrinking maximum in the following node.
+    #[inline]
+    fn write_rekey(&self) -> TopologyWriteGuard<'_, T, Node> {
+        let index = self.index.write();
+        TopologyWriteGuard {
+            topology: self,
+            index: Some(index),
+            published: None,
+            published_keys: None,
+            publish: false,
+            dirty: false,
+        }
     }
 
     #[inline]
     fn try_write(&self) -> Option<TopologyWriteGuard<'_, T, Node>> {
         let index = self.index.try_write()?;
         self.generation.fetch_add(1, Ordering::AcqRel);
-        Some(TopologyWriteGuard { topology: self, index })
+        Some(TopologyWriteGuard {
+            topology: self,
+            index: Some(index),
+            published: None,
+            published_keys: None,
+            publish: true,
+            dirty: false,
+        })
     }
 }
 
-struct TopologyWriteGuard<'a, T, Node>
+pub(crate) struct TopologyWriteGuard<'a, T, Node>
 where
     T: Ord + Clone + Send + 'static,
     Node: Send + 'static,
 {
     topology: &'a Topology<T, Node>,
-    index: RwLockWriteGuard<'a, NodeIndex<T, Node>>,
+    // Option lets Drop release the structural lock before advancing the
+    // reclamation domain. Range readers should not wait for a registry scan.
+    index: Option<RwLockWriteGuard<'a, NodeIndex<T, Node>>>,
+    published: Option<PublishedNodeIndex<T, Node>>,
+    published_keys: Option<MutexGuard<'a, HashMap<usize, T>>>,
+    publish: bool,
+    dirty: bool,
 }
 
 impl<T, Node> std::ops::Deref for TopologyWriteGuard<'_, T, Node>
@@ -138,17 +379,130 @@ where
     type Target = NodeIndex<T, Node>;
 
     fn deref(&self) -> &Self::Target {
-        &self.index
+        self.index.as_deref().expect("topology guard already released")
     }
 }
 
-impl<T, Node> std::ops::DerefMut for TopologyWriteGuard<'_, T, Node>
+impl<'a, T, Node> TopologyWriteGuard<'a, T, Node>
 where
     T: Ord + Clone + Send + 'static,
     Node: Send + 'static,
 {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.index
+    pub(crate) fn enable_publication(&mut self) {
+        if self.publish {
+            return;
+        }
+        // `write_rekey` deliberately leaves the stable generation untouched
+        // for a route-safe last-node rekey. If commit discovers that the
+        // route really must change, enter the odd writer generation before
+        // constructing or publishing its replacement.
+        self.topology.generation.fetch_add(1, Ordering::AcqRel);
+        self.publish = true;
+    }
+
+    fn ensure_publication_snapshot(&mut self) {
+        if self.published.is_none() {
+            self.published_keys = Some(self.topology.published_keys.lock());
+            self.published = Some(self.topology.published.snapshot());
+        }
+    }
+
+    pub(crate) fn is_last_node(&self, node: &Arc<RwLock<Node>>) -> bool {
+        self.index
+            .as_deref()
+            .and_then(BTreeMap::last_key_value)
+            .is_some_and(|(_, candidate)| Arc::ptr_eq(candidate, node))
+    }
+
+    pub(crate) fn insert(&mut self, key: T, node: Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+        let replaced = self
+            .index
+            .as_deref_mut()
+            .expect("topology guard already released")
+            .insert(key.clone(), node.clone());
+        self.dirty = true;
+
+        if self.publish {
+            self.ensure_publication_snapshot();
+            let published = self.published.as_mut().expect("publication snapshot initialized");
+            let published_keys = self
+                .published_keys
+                .as_mut()
+                .expect("publication identity map initialized");
+            if let Some(replaced) = &replaced {
+                if let Some(old_key) = published_keys.remove(&node_identity(replaced)) {
+                    published.remove(&old_key);
+                }
+            }
+
+            // A skipped rekey can leave another node published at the new
+            // canonical boundary. Move that displaced node to its own current
+            // canonical key, repeating only if stale boundaries form a short
+            // collision chain. The fallback scan is confined to such a
+            // collision; ordinary split/attach publication remains O(log N).
+            let canonical = self.index.as_deref().expect("topology guard already released");
+            let mut route_key = key;
+            let mut route_node = node;
+            loop {
+                let displaced = published.insert(route_key.clone(), route_node.clone());
+                published_keys.insert(node_identity(&route_node), route_key.clone());
+
+                let Some(displaced) = displaced else {
+                    break;
+                };
+                if Arc::ptr_eq(&displaced, &route_node) {
+                    break;
+                }
+                published_keys.remove(&node_identity(&displaced));
+
+                let Some((canonical_key, _)) = canonical
+                    .iter()
+                    .find(|(_, candidate)| Arc::ptr_eq(candidate, &displaced))
+                else {
+                    // The displaced route belonged to a node removed from the
+                    // canonical topology by an earlier route-preserving race.
+                    break;
+                };
+                route_key = canonical_key.clone();
+                route_node = displaced;
+            }
+        }
+
+        replaced
+    }
+
+    pub(crate) fn remove<Q>(&mut self, key: &Q) -> Option<Arc<RwLock<Node>>>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let removed = self
+            .index
+            .as_deref_mut()
+            .expect("topology guard already released")
+            .remove(key)?;
+        self.dirty = true;
+
+        if self.publish {
+            self.ensure_publication_snapshot();
+            let published = self.published.as_mut().expect("publication snapshot initialized");
+            let published_keys = self
+                .published_keys
+                .as_mut()
+                .expect("publication identity map initialized");
+            let route_key = published_keys
+                .remove(&node_identity(&removed))
+                .expect("published key map must contain a canonical node");
+            let route_node = published
+                .remove::<T>(&route_key)
+                .expect("published route must contain its recorded boundary");
+            assert!(
+                Arc::ptr_eq(&route_node, &removed),
+                "published boundary must identify the removed node"
+            );
+        }
+
+        Some(removed)
     }
 }
 
@@ -158,8 +512,56 @@ where
     Node: Send + 'static,
 {
     fn drop(&mut self) {
-        self.topology.published.publish(&self.index);
+        #[cfg(debug_assertions)]
+        if self.publish && self.dirty {
+            let canonical = self.index.as_deref().expect("topology guard exists while validating");
+            let published = self.published.as_ref().expect("publishing guard carries snapshot");
+            let published_keys = self
+                .published_keys
+                .as_deref()
+                .expect("publishing guard carries identity map");
+            debug_assert_eq!(
+                canonical.len(),
+                published.len,
+                "canonical and published node counts diverged"
+            );
+            debug_assert_eq!(
+                canonical.len(),
+                published_keys.len(),
+                "canonical and published identity counts diverged"
+            );
+            for node in canonical.values() {
+                debug_assert!(
+                    published_keys.contains_key(&node_identity(node)),
+                    "canonical node is absent from published identity map"
+                );
+            }
+        }
+
+        if !self.publish {
+            drop(self.published_keys.take());
+            drop(self.index.take());
+            return;
+        }
+        if !self.dirty {
+            self.topology.generation.fetch_add(1, Ordering::Release);
+            drop(self.published_keys.take());
+            drop(self.index.take());
+            return;
+        }
+        let retired = self.topology.published.replace(
+            self.published
+                .take()
+                .expect("publishing guard must carry a read snapshot"),
+        );
+        // Readers may proceed as soon as the O(1) root publication completes.
+        // Garbage bookkeeping and the registry sweep are deliberately outside
+        // that odd-generation window.
         self.topology.generation.fetch_add(1, Ordering::Release);
+        self.topology.published.retire(retired);
+        drop(self.published_keys.take());
+        drop(self.index.take());
+        self.topology.published.advance();
     }
 }
 
@@ -185,6 +587,26 @@ where
 {
     if borrow_order_matches {
         return index.range::<Q, _>((bound, Bound::Unbounded)).next();
+    }
+
+    index.iter().find(|(key, _)| match bound {
+        Bound::Included(value) => <T as Borrow<Q>>::borrow(key) >= value,
+        Bound::Excluded(value) => <T as Borrow<Q>>::borrow(key) > value,
+        Bound::Unbounded => true,
+    })
+}
+
+fn first_published_for_borrowed_bound<'a, T, Q, V>(
+    index: &'a PublishedNodeIndex<T, V>,
+    bound: Bound<&Q>,
+    borrow_order_matches: bool,
+) -> Option<(&'a T, &'a Arc<RwLock<V>>)>
+where
+    T: Ord + Clone + Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    if borrow_order_matches {
+        return index.first_for_bound(bound);
     }
 
     index.iter().find(|(key, _)| match bound {
@@ -345,11 +767,27 @@ where
         self
     }
     pub fn attach_node(&self, node: Node) {
-        let node_id = node
-            .max()
-            .cloned()
-            .expect("node should contain at least one value to be correct node");
-        self.index.write().insert(node_id, Arc::new(RwLock::new(node)));
+        self.attach_nodes(std::iter::once(node));
+    }
+
+    /// Attaches a persisted topology in one structural publication.
+    ///
+    /// Nodes must be non-empty, internally sorted, and mutually ordered. The
+    /// same preconditions as [`Self::attach_node`] apply to every item.
+    pub fn attach_nodes(&self, nodes: impl IntoIterator<Item = Node>) {
+        let mut nodes = nodes.into_iter().peekable();
+        if nodes.peek().is_none() {
+            return;
+        }
+
+        let mut index = self.index.write();
+        for node in nodes {
+            let node_id = node
+                .max()
+                .cloned()
+                .expect("node should contain at least one value to be correct node");
+            index.insert(node_id, Arc::new(RwLock::new(node)));
+        }
     }
 
     #[cfg(feature = "cdc")]
@@ -475,9 +913,11 @@ where
             drop(node_guard);
             drop(index);
 
-            let mut index = self.index.write();
-
             let op = operation.unwrap();
+            let mut index = match &op {
+                Operation::UpdateMax(_, _) => self.index.write_rekey(),
+                Operation::Split(_, _, _) | Operation::MakeUnreachable(_, _) => self.index.write(),
+            };
             match &op {
                 Operation::Split(_, _, _) => {
                     if let Ok((value, value_cdc)) = op.commit::<EMIT_CDC>(&mut index, adopt) {
@@ -708,9 +1148,13 @@ where
             drop(node_guard);
             drop(index);
 
-            let mut index = self.index.write();
+            let operation = operation.unwrap();
+            let mut index = match &operation {
+                Operation::UpdateMax(_, _) => self.index.write_rekey(),
+                Operation::Split(_, _, _) | Operation::MakeUnreachable(_, _) => self.index.write(),
+            };
 
-            return if let Ok((_, value_cdc)) = operation.unwrap().commit::<EMIT_CDC>(&mut index, no_identity_adoption) {
+            return if let Ok((_, value_cdc)) = operation.commit::<EMIT_CDC>(&mut index, no_identity_adoption) {
                 #[cfg(feature = "cdc")]
                 if EMIT_CDC {
                     for unassigned_event in value_cdc {
@@ -796,11 +1240,37 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        let mut retries = 0;
+        let mut writer_spins = 0;
+
         loop {
             let generation = self.index.generation.load(Ordering::Acquire);
             if !generation.is_multiple_of(2) {
-                std::hint::spin_loop();
+                if writer_spins < ROOT_PUBLICATION_SPIN_LIMIT {
+                    writer_spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
                 continue;
+            }
+            writer_spins = 0;
+
+            if retries >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
+                // Bounded progress fallback: hold the canonical topology read
+                // guard while acquiring the node. Structural writers follow
+                // the same topology-before-node order.
+                let index = self.index.read();
+                let node = match first_for_borrowed_bound(&index, Bound::Included(value), self.borrow_order_matches) {
+                    Some((_, node)) => Some(node.clone()),
+                    None => index
+                        .last_key_value()
+                        .map(|(_, node)| node.clone())
+                        .or_else(|| index.first_key_value().map(|(_, node)| node.clone())),
+                }?;
+                let node_guard = node.read_arc();
+                drop(index);
+                return Some(node_guard);
             }
 
             let pin = self.index.published.domain.pin();
@@ -808,25 +1278,31 @@ where
             // SAFETY: `snapshot` was loaded after `pin`, and the publication
             // domain cannot reclaim it until `pin` is dropped.
             let index = unsafe { &*snapshot };
-            let node = match first_for_borrowed_bound(index, Bound::Included(value), self.borrow_order_matches) {
-                Some((_, node)) => Some(node.clone()),
-                None => index
-                    .last_key_value()
-                    .map(|(_, node)| node.clone())
-                    .or_else(|| index.first_key_value().map(|(_, node)| node.clone())),
-            };
+            let node =
+                match first_published_for_borrowed_bound(index, Bound::Included(value), self.borrow_order_matches) {
+                    Some((_, node)) => Some(node.clone()),
+                    None => index
+                        .last_key_value()
+                        .map(|(_, node)| node.clone())
+                        .or_else(|| index.first_key_value().map(|(_, node)| node.clone())),
+                };
             let Some(node) = node else {
                 if self.index.generation.load(Ordering::Acquire) == generation {
                     return None;
                 }
+                retries += 1;
                 continue;
             };
 
+            // The snapshot pin protects the Arc only until it is cloned. Drop
+            // it before the potentially blocking node acquisition so a slow
+            // node writer cannot stall topology reclamation.
+            drop(pin);
             let node_guard = node.read_arc();
             if self.index.generation.load(Ordering::Acquire) == generation {
-                drop(pin);
                 return Some(node_guard);
             }
+            retries += 1;
         }
     }
 
@@ -850,19 +1326,42 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        let mut retries = 0;
+        let mut writer_spins = 0;
+        let mut read = Some(read);
+
         loop {
             let generation = self.index.generation.load(Ordering::Acquire);
             if !generation.is_multiple_of(2) {
-                std::hint::spin_loop();
+                if writer_spins < ROOT_PUBLICATION_SPIN_LIMIT {
+                    writer_spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
                 continue;
             }
+            writer_spins = 0;
 
-            let _pin = self.index.published.domain.pin();
+            if retries >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
+                let index = self.index.read();
+                let node = first_for_borrowed_bound(&index, Bound::Included(value), self.borrow_order_matches)
+                    .or_else(|| index.last_key_value())
+                    .or_else(|| index.first_key_value())
+                    .map(|(_, node)| node)?;
+                let node_guard = node.read();
+                let position = node_guard.try_select(value)?;
+                return node_guard
+                    .get_ith(position)
+                    .map(read.take().expect("read closure is consumed only on return"));
+            }
+
+            let pin = self.index.published.domain.pin();
             let snapshot = self.index.published.current.load(Ordering::Acquire);
             // SAFETY: `snapshot` was loaded after `pin`, and the publication
             // domain cannot reclaim it until `pin` is dropped.
             let index = unsafe { &*snapshot };
-            let node = first_for_borrowed_bound(index, Bound::Included(value), self.borrow_order_matches)
+            let node = first_published_for_borrowed_bound(index, Bound::Included(value), self.borrow_order_matches)
                 .or_else(|| index.last_key_value())
                 .or_else(|| index.first_key_value())
                 .map(|(_, node)| node);
@@ -870,18 +1369,37 @@ where
                 if self.index.generation.load(Ordering::Acquire) == generation {
                     return None;
                 }
+                retries += 1;
                 continue;
             };
 
             // Borrow the Arc from the protected snapshot: unlike
             // `lock_node_for_value`, this owned-result path does not need an
-            // Arc clone or its shared refcount update.
-            let node_guard = node.read();
+            // Arc clone or its shared refcount update when the node is free.
+            // On contention, clone it and release the reclamation pin before
+            // blocking so a node writer cannot retain old topology paths.
+            if let Some(node_guard) = node.try_read() {
+                if self.index.generation.load(Ordering::Acquire) != generation {
+                    retries += 1;
+                    continue;
+                }
+                let position = node_guard.try_select(value)?;
+                return node_guard
+                    .get_ith(position)
+                    .map(read.take().expect("read closure is consumed only on return"));
+            }
+
+            let node = node.clone();
+            drop(pin);
+            let node_guard = node.read_arc();
             if self.index.generation.load(Ordering::Acquire) != generation {
+                retries += 1;
                 continue;
             }
             let position = node_guard.try_select(value)?;
-            return node_guard.get_ith(position).map(read);
+            return node_guard
+                .get_ith(position)
+                .map(read.take().expect("read closure is consumed only on return"));
         }
     }
 
@@ -1789,7 +2307,7 @@ mod tests {
 
     #[test]
     fn published_point_reads_remain_definitive_across_splits() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         const STABLE_KEYS: usize = 256;
         const FINAL_KEYS: usize = 4_096;
@@ -1802,17 +2320,25 @@ mod tests {
 
         let start = Arc::new(Barrier::new(READERS + 1));
         let done = Arc::new(AtomicBool::new(false));
+        let published_up_to = Arc::new(AtomicUsize::new(STABLE_KEYS - 1));
         let readers = (0..READERS)
             .map(|reader| {
                 let set = Arc::clone(&set);
                 let start = Arc::clone(&start);
                 let done = Arc::clone(&done);
+                let published_up_to = Arc::clone(&published_up_to);
                 thread::spawn(move || {
                     start.wait();
                     let mut probe = reader;
                     while !done.load(Ordering::Acquire) {
                         let key = probe % STABLE_KEYS;
                         assert_eq!(set.get_with(&key, |value| *value), Some(key));
+                        let newest_acknowledged = published_up_to.load(Ordering::Acquire);
+                        assert_eq!(
+                            set.get_with(&newest_acknowledged, |value| *value),
+                            Some(newest_acknowledged),
+                            "an acknowledged insert disappeared from the published route"
+                        );
                         probe += READERS;
                     }
                 })
@@ -1822,6 +2348,7 @@ mod tests {
         start.wait();
         for key in STABLE_KEYS..FINAL_KEYS {
             set.insert(key);
+            published_up_to.store(key, Ordering::Release);
         }
         done.store(true, Ordering::Release);
 
@@ -1829,6 +2356,66 @@ mod tests {
             reader.join().unwrap();
         }
         assert_eq!(set.len(), FINAL_KEYS);
+        for key in 0..FINAL_KEYS {
+            assert_eq!(set.get_with(&key, |value| *value), Some(key));
+        }
+    }
+
+    #[test]
+    fn published_pointer_survives_reclamation_interleavings() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let set = Arc::new(BTreeSet::<usize>::with_maximum_node_size(2));
+        for key in 0..8 {
+            set.insert(key);
+        }
+        let start = Arc::new(Barrier::new(2));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let reader_set = Arc::clone(&set);
+        let reader_start = Arc::clone(&start);
+        let reader_done = Arc::clone(&done);
+        let reader = thread::spawn(move || {
+            reader_start.wait();
+            let mut probe = 0;
+            while !reader_done.load(Ordering::Acquire) {
+                let key = probe % 8;
+                assert_eq!(reader_set.get_with(&key, |value| *value), Some(key));
+                probe += 1;
+            }
+        });
+
+        start.wait();
+        for key in 8..80 {
+            set.insert(key);
+        }
+        for key in 8..80 {
+            assert_eq!(set.remove(&key), Some(key));
+        }
+        done.store(true, Ordering::Release);
+        reader.join().unwrap();
+
+        for key in 0..8 {
+            assert_eq!(set.get_with(&key, |value| *value), Some(key));
+        }
+    }
+
+    #[test]
+    fn published_route_chunks_split_and_merge_without_losing_keys() {
+        let set = BTreeSet::<usize>::with_maximum_node_size(2);
+        for key in 0..600 {
+            assert!(set.insert(key));
+        }
+        for key in (0..600).step_by(2) {
+            assert_eq!(set.remove(&key), Some(key));
+        }
+        for key in 0..600 {
+            assert_eq!(set.contains(&key), key % 2 == 1, "probe {key}");
+        }
+        for key in (1..600).step_by(2) {
+            assert_eq!(set.remove(&key), Some(key));
+        }
+        assert!(set.is_empty());
     }
 
     #[test]
@@ -2457,6 +3044,58 @@ mod tests {
             assert!(set.contains(&value), "value {value} lost to stale unlink");
             assert_eq!(set.remove(&value), Some(value));
             assert!(set.is_empty());
+        }
+    }
+
+    #[test]
+    fn published_route_updates_when_a_non_last_boundary_shrinks() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(8);
+        set.attach_nodes([vec![1, 10], vec![20, 30]]);
+
+        // Removing the first node's maximum changes its canonical route from
+        // 10 to 1. If the published route remains at 10, the later insertion
+        // of 5 correctly lands in the second node but a point read for 5 is
+        // misrouted to the first node and reports a false miss.
+        assert_eq!(set.remove(&10), Some(10));
+        assert!(set.insert(5));
+        assert!(set.contains(&5));
+        assert_eq!(set.get(&5).map(|value| *value.get()), Some(5));
+    }
+
+    #[test]
+    fn published_point_routes_match_a_sequential_oracle_under_churn() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(4);
+        let mut oracle = std::collections::BTreeSet::new();
+        let mut state = 0x8f4d_2a71_c390_6be5u64;
+
+        for step in 0..2_000 {
+            // Fixed xorshift stream: deterministic inserts/removes repeatedly
+            // grow, shrink, empty, and split tiny nodes.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let key = state % 64;
+            if state & 1 == 0 {
+                assert_eq!(set.insert(key), oracle.insert(key), "insert step {step}, key {key}");
+            } else {
+                assert_eq!(
+                    set.remove(&key).is_some(),
+                    oracle.remove(&key),
+                    "remove step {step}, key {key}"
+                );
+            }
+
+            for probe in 0..64 {
+                assert_eq!(
+                    set.contains(&probe),
+                    oracle.contains(&probe),
+                    "point route diverged at step {step}, probe {probe}"
+                );
+            }
+            assert_eq!(
+                set.iter().collect::<Vec<_>>(),
+                oracle.iter().copied().collect::<Vec<_>>()
+            );
         }
     }
 

@@ -1,8 +1,9 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use scc::TreeIndex;
 use std::hint::black_box;
+use std::time::Duration;
 
 fn criterion_benchmark(c: &mut Criterion) {
     let n = 100000;
@@ -42,6 +43,17 @@ fn criterion_benchmark(c: &mut Criterion) {
             assert_eq!(indexset.len(), n);
         })
     });
+    c.bench_function("concurrent indexset insert sorted 100k", |b| {
+        b.iter(|| {
+            let indexset: indexset::concurrent::set::BTreeSet<usize> = indexset::concurrent::set::BTreeSet::new();
+
+            for item in 0..n {
+                black_box(indexset.insert(item));
+            }
+
+            assert_eq!(indexset.len(), n);
+        })
+    });
     c.bench_function("treeindex insert 100k", |b| {
         b.iter(|| {
             let treeindex = TreeIndex::new();
@@ -53,6 +65,29 @@ fn criterion_benchmark(c: &mut Criterion) {
             assert_eq!(treeindex.len(), n);
         })
     });
+
+    let mut restore = c.benchmark_group("concurrent indexset restore nodes");
+    restore.sample_size(20);
+    restore.warm_up_time(Duration::from_millis(500));
+    restore.measurement_time(Duration::from_secs(2));
+    for node_count in [1_000usize, 2_000, 4_000, 8_000] {
+        let nodes = (0..node_count)
+            .map(|node| (node * 8..node * 8 + 8).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        restore.throughput(Throughput::Elements(node_count as u64));
+        restore.bench_with_input(BenchmarkId::new("bulk", node_count), &nodes, |b, nodes| {
+            b.iter_batched(
+                || nodes.clone(),
+                |nodes| {
+                    let set = indexset::concurrent::set::BTreeSet::<usize>::with_maximum_node_size(8);
+                    set.attach_nodes(nodes);
+                    black_box(set.node_count());
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    restore.finish();
 
     let stdlib = std::collections::BTreeSet::from_iter(input.iter());
     let indexset = indexset::BTreeSet::from_iter(input.iter());

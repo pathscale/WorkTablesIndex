@@ -1,8 +1,5 @@
 use std::fmt::{Debug, Display, Formatter};
-use std::sync::Arc;
 use std::{borrow::Borrow, iter::FusedIterator, ops::RangeBounds};
-
-use parking_lot::Mutex;
 
 use super::set::BTreeSet;
 use crate::core::node::NodeLike;
@@ -222,13 +219,18 @@ where
     pub fn attach_node(&self, node: Node) {
         self.set.attach_node(node)
     }
-    /// Returns detached snapshots of this map's [`Node`]s.
-    ///
-    /// The returned mutexes preserve the checkpoint API's existing shape, but
-    /// mutating them does not mutate this map. Callers requiring one coherent
-    /// logical generation must prevent concurrent mutation while collecting.
+    /// Attaches persisted [`Node`]s with one topology publication.
     #[cfg(feature = "cdc")]
-    pub fn iter_nodes(&self) -> impl Iterator<Item = Arc<Mutex<Node>>> + '_
+    pub fn attach_nodes(&self, nodes: impl IntoIterator<Item = Node>) {
+        self.set.attach_nodes(nodes)
+    }
+
+    /// Returns detached, read-only snapshots of this map's [`Node`]s.
+    ///
+    /// Callers requiring one coherent logical generation must prevent
+    /// concurrent mutation while collecting.
+    #[cfg(feature = "cdc")]
+    pub fn snapshot_nodes(&self) -> Vec<Node>
     where
         Node: Clone,
     {
@@ -236,9 +238,8 @@ where
             .index
             .read()
             .values()
-            .map(|node| Arc::new(Mutex::new((*node.read()).clone())))
-            .collect::<Vec<_>>()
-            .into_iter()
+            .map(|node| (*node.read()).clone())
+            .collect()
     }
 
     /// Copies the exact node boundaries into a pointer-free checkpoint image.
@@ -287,14 +288,14 @@ where
         }
 
         let map = Self::with_maximum_node_size(topology.node_capacity);
-        for values in topology.nodes {
+        map.attach_nodes(topology.nodes.into_iter().map(|values| {
             let mut node = Node::with_capacity(topology.node_capacity);
             for value in values {
                 let (inserted, _) = NodeLike::insert(&mut node, value);
                 debug_assert!(inserted, "validated topology contains unique values");
             }
-            map.attach_node(node);
-        }
+            node
+        }));
         Ok(map)
     }
     /// Returns `true` if the map contains a value for the specified key.

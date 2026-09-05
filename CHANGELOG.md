@@ -9,12 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Concurrent point lookups route through immutable, grace-period-protected
-  topology snapshots instead of acquiring the structural read lock. Per-node
-  read/write locks let independent readers proceed without serializing on a
-  node mutex.
-- Concurrent CDC `iter_nodes` retains its mutex-shaped API but returns detached
-  node snapshots. Mutating a returned node no longer mutates the live index.
+- Concurrent point lookups route through immutable, chunked,
+  grace-period-protected topology snapshots instead of acquiring the
+  structural read lock. Per-node read/write locks let independent readers
+  proceed without serializing on a node mutex.
+- Concurrent CDC `iter_nodes` is replaced by `snapshot_nodes`, which returns
+  detached `Vec<Node>` values so callers cannot mistake a checkpoint snapshot
+  for a mutable live node.
 - Sequential map exact lookups stop when binary search finds equality instead
   of completing a lower-bound search and comparing the result a second time.
 
@@ -22,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A split-heavy concurrent regression test verifies that definitive point
   reads remain correct while topology generations are repeatedly published.
+- `attach_nodes` and `attach_multi_nodes` reconstruct a persisted topology with
+  one publication instead of publishing once per node.
+- A sorted 100,000-key construction benchmark guards the monotonic insert
+  pattern used by autoincrementing tables.
 
 ## [0.0.11]
 
