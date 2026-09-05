@@ -1,13 +1,10 @@
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::{
     borrow::Borrow,
     iter::FusedIterator,
     ops::{Bound, RangeBounds},
 };
-
-use parking_lot::Mutex;
 
 use crate::core::node::NodeLike;
 use crate::{
@@ -210,13 +207,18 @@ where
     pub fn attach_multi_node(&self, node: Node) {
         self.set.attach_node(node)
     }
-    /// Returns detached snapshots of this multimap's [`Node`]s.
-    ///
-    /// The returned mutexes preserve the checkpoint API's existing shape, but
-    /// mutating them does not mutate this map. Callers requiring one coherent
-    /// logical generation must prevent concurrent mutation while collecting.
+    /// Attaches persisted [`Node`]s with one topology publication.
     #[cfg(feature = "cdc")]
-    pub fn iter_nodes(&self) -> impl Iterator<Item = Arc<Mutex<Node>>> + '_
+    pub fn attach_multi_nodes(&self, nodes: impl IntoIterator<Item = Node>) {
+        self.set.attach_nodes(nodes)
+    }
+
+    /// Returns detached, read-only snapshots of this multimap's [`Node`]s.
+    ///
+    /// Callers requiring one coherent logical generation must prevent
+    /// concurrent mutation while collecting.
+    #[cfg(feature = "cdc")]
+    pub fn snapshot_nodes(&self) -> Vec<Node>
     where
         Node: Clone,
     {
@@ -224,9 +226,8 @@ where
             .index
             .read()
             .values()
-            .map(|node| Arc::new(Mutex::new((*node.read()).clone())))
-            .collect::<Vec<_>>()
-            .into_iter()
+            .map(|node| (*node.read()).clone())
+            .collect()
     }
     /// Returns `true` if the map contains at least one occurance of the specified key.
     ///

@@ -13,6 +13,7 @@ readme = "README.md"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 crossbeam-skiplist = "^0.1"
+loom = "0.7"
 rand = "0.9"
 scc = { version = "2.2.5" }
 uuid = { version = "1.17.0", features = ["v7"]}
@@ -58,6 +59,7 @@ features = ["cdc", "concurrent", "multimap"]
 [[bench]]
 name = "stdlib"
 harness = false
+required-features = ["concurrent"]
 
 [[bench]]
 name = "concurrent"

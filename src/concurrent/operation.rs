@@ -2,9 +2,9 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
 
 use crate::cdc::change::ChangeEventUnassigned;
+use crate::concurrent::set::TopologyWriteGuard;
 use crate::core::node::NodeLike;
 
 type OldVersion<Node> = Arc<RwLock<Node>>;
@@ -27,7 +27,7 @@ where
     // value in place: see `MultiPairLike::adopt_stored_identity`.
     pub fn commit<const EMIT_CDC: bool>(
         self,
-        index: &mut BTreeMap<T, Arc<RwLock<Node>>>,
+        index: &mut TopologyWriteGuard<'_, T, Node>,
         adopt: fn(&T, &mut T),
     ) -> Result<(Option<T>, Vec<ChangeEventUnassigned<T>>), ()> {
         match self {
@@ -166,6 +166,12 @@ where
                                     };
                                     cdc.push(node_removal);
                                 }
+                                // An UpdateMax is normally a route-preserving
+                                // rekey and skips publication. A racing drain
+                                // changes it into a true node removal, so opt
+                                // this guard back into publication before the
+                                // canonical entry is unlinked.
+                                index.enable_publication();
                                 index.remove(&old_max);
 
                                 (None, cdc)
@@ -174,6 +180,14 @@ where
                             // in either direction.
                             Some(new_max) if *new_max != old_max => {
                                 let new_max = new_max.clone();
+                                // A stale boundary is definitive only for the
+                                // last node, which is the point-read fallback.
+                                // For any earlier node, publish its new route:
+                                // after a shrink, another insert may fill the
+                                // gap in the following node.
+                                if !index.is_last_node(&node) {
+                                    index.enable_publication();
+                                }
                                 index.remove(&old_max);
                                 index.insert(new_max, node.clone());
 

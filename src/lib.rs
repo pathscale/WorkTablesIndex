@@ -170,7 +170,7 @@ impl<T: Ord> BTreeSet<T> {
         // never return less than 0, so it is only necessary to check whether it is out of bounds
         // from the right
         if self.inner.get(node_idx).is_none() {
-            node_idx -= 1
+            node_idx = node_idx.saturating_sub(1)
         }
 
         node_idx
@@ -190,7 +190,7 @@ impl<T: Ord> BTreeSet<T> {
         });
 
         if self.inner.get(node_idx).is_none() {
-            node_idx -= 1
+            node_idx = node_idx.saturating_sub(1)
         }
 
         node_idx
