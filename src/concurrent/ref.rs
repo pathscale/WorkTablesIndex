@@ -1,9 +1,9 @@
 use crate::core::node::NodeLike;
-use parking_lot::{ArcMutexGuard, RawMutex};
+use parking_lot::{ArcRwLockReadGuard, RawRwLock};
 use std::marker::PhantomData;
 
 pub struct Ref<T: Ord + Clone + Send, Node: NodeLike<T> + Send> {
-    pub(super) node_guard: ArcMutexGuard<RawMutex, Node>,
+    pub(super) node_guard: ArcRwLockReadGuard<RawRwLock, Node>,
     pub(super) position: usize,
     pub(super) phantom_data: PhantomData<T>,
 }

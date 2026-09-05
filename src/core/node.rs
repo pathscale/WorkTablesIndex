@@ -70,6 +70,11 @@ mod search_backend {
     {
         haystack.binary_search_by(|candidate| candidate.borrow().cmp(needle))
     }
+
+    #[inline]
+    pub(crate) fn search_by<T>(haystack: &[T], compare: impl FnMut(&T) -> core::cmp::Ordering) -> Result<usize, usize> {
+        haystack.binary_search_by(compare)
+    }
 }
 
 #[cfg(all(
@@ -99,6 +104,18 @@ mod search_backend {
             _ => Err(index),
         }
     }
+
+    #[inline]
+    pub(crate) fn search_by<T>(
+        haystack: &[T],
+        mut compare: impl FnMut(&T) -> core::cmp::Ordering,
+    ) -> Result<usize, usize> {
+        let index = haystack.lower_bound_by(&mut compare);
+        match haystack.get(index) {
+            Some(candidate) if compare(candidate).is_eq() => Ok(index),
+            _ => Err(index),
+        }
+    }
 }
 
 #[cfg(all(
@@ -119,6 +136,11 @@ mod search_backend {
         Q: Ord + ?Sized,
     {
         haystack.exact_search_by(|candidate| candidate.borrow().cmp(needle))
+    }
+
+    #[inline]
+    pub(crate) fn search_by<T>(haystack: &[T], compare: impl FnMut(&T) -> core::cmp::Ordering) -> Result<usize, usize> {
+        haystack.exact_search_by(compare)
     }
 }
 
@@ -167,6 +189,26 @@ mod search_backend {
 
         Err(i)
     }
+
+    #[inline]
+    pub(crate) fn search_by<T>(haystack: &[T], mut compare: impl FnMut(&T) -> Ordering) -> Result<usize, usize> {
+        let mut right = haystack.len();
+        let mut left = 0;
+
+        while left != right {
+            let middle = (left + right) >> 1;
+            // SAFETY: `left < right <= haystack.len()` makes `middle` a valid
+            // element index, and both branches preserve the bounds.
+            let candidate = unsafe { haystack.get_unchecked(middle) };
+            match compare(candidate) {
+                Ordering::Equal => return Ok(middle),
+                Ordering::Less => left = middle + 1,
+                Ordering::Greater => right = middle,
+            }
+        }
+
+        Err(left)
+    }
 }
 
 // Search backend precedence is deterministic when features are composed:
@@ -174,6 +216,7 @@ mod search_backend {
 // custom implementation is the compatibility fallback. Each backend's cfg
 // selects its implementation and test name together, preventing drift.
 use search_backend::search;
+pub(crate) use search_backend::search_by;
 
 #[inline]
 fn compute_positions_to_skip<Q, T: Ord>(haystack: &[T], bound: std::ops::Bound<&Q>, forward: bool) -> Option<usize>

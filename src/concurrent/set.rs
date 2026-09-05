@@ -1,11 +1,10 @@
-use parking_lot::{ArcMutexGuard, Mutex, RawMutex, RwLock};
+use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, RawRwLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
-#[cfg(feature = "cdc")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::{borrow::Borrow, sync::Arc};
 
 use crate::cdc::change::ChangeEvent;
@@ -15,12 +14,154 @@ use crate::core::node::*;
 
 use super::r#ref::Ref;
 
-// Most point reads acquire the node mutex immediately while the structural
-// mapping is pinned. If a node is genuinely contended, wait without holding a
-// structural shard and retry. A bounded fallback preserves progress if the
-// node keeps being reacquired between the wait and the next stable attempt.
-const STABLE_READ_BLOCKING_FALLBACK_AFTER: usize = 2;
 const ROOT_PUBLICATION_SPIN_LIMIT: usize = 16;
+
+type NodeIndex<T, Node> = BTreeMap<T, Arc<RwLock<Node>>>;
+
+struct RetiredIndex<T, Node>(*mut NodeIndex<T, Node>);
+
+// SAFETY: the pointer is uniquely owned after it has been swapped out of the
+// publication slot, and this wrapper exposes no access to the map. Its only
+// operation is destruction after the grace period. Dropping the keys and, for
+// the final Arc, moving each node into its destructor on that thread is valid
+// when both stored types are `Send`; sharing `Node` there is not required.
+unsafe impl<T: Send, Node: Send> Send for RetiredIndex<T, Node> {}
+
+impl<T, Node> Drop for RetiredIndex<T, Node> {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper is created exactly once for a pointer returned
+        // by `Box::into_raw`, after that pointer has been atomically unlinked.
+        unsafe { drop(Box::from_raw(self.0)) }
+    }
+}
+
+#[derive(Debug)]
+struct PublishedIndex<T, Node> {
+    current: AtomicPtr<NodeIndex<T, Node>>,
+    domain: ps_reclaim::Domain,
+}
+
+impl<T, Node> PublishedIndex<T, Node> {
+    fn new() -> Self {
+        Self {
+            current: AtomicPtr::new(Box::into_raw(Box::new(BTreeMap::new()))),
+            domain: ps_reclaim::Domain::new(),
+        }
+    }
+}
+
+impl<T, Node> PublishedIndex<T, Node>
+where
+    T: Ord + Clone + Send + 'static,
+    Node: Send + 'static,
+{
+    fn publish(&self, index: &NodeIndex<T, Node>) {
+        let replacement = Box::into_raw(Box::new(index.clone()));
+        let retired = self.current.swap(replacement, Ordering::AcqRel);
+        // Keep the pointer's provenance intact while transferring its unique
+        // ownership to the retirement callback.
+        let retired = RetiredIndex(retired);
+        self.domain.retire(move || drop(retired));
+        // Topology publication is infrequent (normally one node boundary per
+        // 1,024 inserts), so reclaim one expired snapshot on the writer path.
+        self.domain.advance_up_to(1);
+    }
+}
+
+impl<T, Node> Drop for PublishedIndex<T, Node> {
+    fn drop(&mut self) {
+        let current = *self.current.get_mut();
+        // SAFETY: exclusive access proves no reader can load `current`, and it
+        // is the one still-linked allocation created by `Box::into_raw`.
+        unsafe { drop(Box::from_raw(current)) }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Topology<T, Node> {
+    index: RwLock<NodeIndex<T, Node>>,
+    published: PublishedIndex<T, Node>,
+    // Even values are stable publications; odd values mean a writer may have
+    // changed node contents or routing but has not published the new route.
+    generation: AtomicU64,
+}
+
+impl<T, Node> Topology<T, Node> {
+    fn new() -> Self {
+        Self {
+            index: RwLock::new(BTreeMap::new()),
+            published: PublishedIndex::new(),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, NodeIndex<T, Node>> {
+        self.index.read()
+    }
+}
+
+impl<T, Node> Topology<T, Node>
+where
+    T: Ord + Clone + Send + 'static,
+    Node: Send + 'static,
+{
+    #[inline]
+    fn write(&self) -> TopologyWriteGuard<'_, T, Node> {
+        let index = self.index.write();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        TopologyWriteGuard { topology: self, index }
+    }
+
+    #[inline]
+    fn try_write(&self) -> Option<TopologyWriteGuard<'_, T, Node>> {
+        let index = self.index.try_write()?;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Some(TopologyWriteGuard { topology: self, index })
+    }
+}
+
+struct TopologyWriteGuard<'a, T, Node>
+where
+    T: Ord + Clone + Send + 'static,
+    Node: Send + 'static,
+{
+    topology: &'a Topology<T, Node>,
+    index: RwLockWriteGuard<'a, NodeIndex<T, Node>>,
+}
+
+impl<T, Node> std::ops::Deref for TopologyWriteGuard<'_, T, Node>
+where
+    T: Ord + Clone + Send + 'static,
+    Node: Send + 'static,
+{
+    type Target = NodeIndex<T, Node>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.index
+    }
+}
+
+impl<T, Node> std::ops::DerefMut for TopologyWriteGuard<'_, T, Node>
+where
+    T: Ord + Clone + Send + 'static,
+    Node: Send + 'static,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.index
+    }
+}
+
+impl<T, Node> Drop for TopologyWriteGuard<'_, T, Node>
+where
+    T: Ord + Clone + Send + 'static,
+    Node: Send + 'static,
+{
+    fn drop(&mut self) {
+        self.topology.published.publish(&self.index);
+        self.topology.generation.fetch_add(1, Ordering::Release);
+    }
+}
 
 // Default identity-adoption hook for replace-on-equality: plain sets and maps
 // have no hidden ordering state to carry over. See
@@ -144,14 +285,12 @@ where
     T: Ord + Clone + 'static,
     Node: NodeLike<T>,
 {
-    // The old representation put a concurrent Crossbeam skip-list behind a
-    // second structural read/write lock. Every topology read already held the
-    // outer lock and every topology mutation held it exclusively, so the
-    // skip-list's epoch reclamation and atomics could not add concurrency.
-    // Keeping the ordered map inside the one structural lock removes that
-    // redundant reclamation domain. Node contents retain their independent
-    // mutexes and remain concurrently mutable.
-    pub(crate) index: RwLock<BTreeMap<T, Arc<Mutex<Node>>>>,
+    // Writers maintain the canonical ordered topology under one structural
+    // lock and publish immutable snapshots for point reads. The read path is
+    // therefore free of a shared reader-count cache line. Node contents use
+    // independent read/write locks, so readers routed to one node may proceed
+    // concurrently while mutations retain exclusive node access.
+    pub(crate) index: Topology<T, Node>,
     node_capacity: usize,
     // Ordinary set/map keys satisfy Borrow's ordering contract and retain a
     // logarithmic BTreeMap route. Multimap entries intentionally borrow only
@@ -166,7 +305,7 @@ where
 impl<T: Ord + Clone + 'static, Node: NodeLike<T>> Default for BTreeSet<T, Node> {
     fn default() -> Self {
         Self {
-            index: RwLock::new(BTreeMap::new()),
+            index: Topology::new(),
             node_capacity: DEFAULT_INNER_SIZE,
             borrow_order_matches: true,
             #[cfg(feature = "cdc")]
@@ -194,7 +333,7 @@ where
     /// let set: BTreeSet<i32> = BTreeSet::with_maximum_node_size(128);
     pub fn with_maximum_node_size(node_capacity: usize) -> Self {
         Self {
-            index: RwLock::new(BTreeMap::new()),
+            index: Topology::new(),
             node_capacity,
             borrow_order_matches: true,
             #[cfg(feature = "cdc")]
@@ -210,7 +349,7 @@ where
             .max()
             .cloned()
             .expect("node should contain at least one value to be correct node");
-        self.index.write().insert(node_id, Arc::new(Mutex::new(node)));
+        self.index.write().insert(node_id, Arc::new(RwLock::new(node)));
     }
 
     #[cfg(feature = "cdc")]
@@ -218,7 +357,7 @@ where
         let index = self.index.read();
         let nodes = index
             .values()
-            .map(|node| node.lock().iter().cloned().collect())
+            .map(|node| node.read().iter().cloned().collect())
             .collect();
         (self.node_capacity, nodes)
     }
@@ -230,7 +369,7 @@ where
         &self,
         value: T,
         adopt: fn(&T, &mut T),
-    ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcMutexGuard<RawMutex, Node>, usize, T)> {
+    ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcRwLockWriteGuard<RawRwLock, Node>, usize, T)> {
         loop {
             let mut cdc = vec![];
             let index = self.index.read();
@@ -275,14 +414,14 @@ where
                             cdc.push(node_insertion);
                         }
 
-                        index.insert(value, Arc::new(Mutex::new(first_node)));
+                        index.insert(value, Arc::new(RwLock::new(first_node)));
 
                         return Ok((None, cdc));
                     }
                 }
             };
 
-            let mut node_guard = target_node_entry.1.clone().lock_arc();
+            let mut node_guard = target_node_entry.1.clone().write_arc();
 
             #[allow(unused_assignments)]
             let mut operation = None;
@@ -462,7 +601,7 @@ where
     pub(crate) fn put_checked(
         &self,
         value: T,
-    ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcMutexGuard<RawMutex, Node>, usize, T)> {
+    ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcRwLockWriteGuard<RawRwLock, Node>, usize, T)> {
         self.put_checked_inner::<false>(value, no_identity_adoption)
     }
 
@@ -479,7 +618,7 @@ where
     pub(crate) fn put_cdc_checked(
         &self,
         value: T,
-    ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcMutexGuard<RawMutex, Node>, usize, T)> {
+    ) -> Result<(Option<T>, Vec<ChangeEvent<T>>), (ArcRwLockWriteGuard<RawRwLock, Node>, usize, T)> {
         self.put_checked_inner::<true>(value, no_identity_adoption)
     }
 
@@ -525,7 +664,7 @@ where
             first_for_borrowed_bound(&index, Bound::Included(value), self.borrow_order_matches)
                 .or_else(|| index.last_key_value())
         {
-            let mut node_guard = target_node_entry.1.clone().lock_arc();
+            let mut node_guard = target_node_entry.1.clone().write_arc();
             let old_max = node_guard.max().cloned();
             let deleted = NodeLike::delete(&mut *node_guard, value);
             if deleted.is_none() {
@@ -627,7 +766,7 @@ where
     // the multimap paths use this, and it relies on NodeLike::delete_at (also
     // multimap-gated), so gate the whole family to avoid an unconditional break.
     #[inline(always)]
-    fn lock_node_for_value_optimistic<Q>(&self, value: &Q) -> Option<ArcMutexGuard<RawMutex, Node>>
+    fn lock_node_for_value_optimistic<Q>(&self, value: &Q) -> Option<ArcRwLockReadGuard<RawRwLock, Node>>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -642,58 +781,58 @@ where
                     .or_else(|| index.first_key_value().map(|(_, node)| node.clone())),
             }
         }?;
-        Some(node.lock_arc())
+        Some(node.read_arc())
     }
 
     /// Locates and locks the node whose structural range owns `value`.
     ///
-    /// The common uncontended path acquires the node with `try_lock_arc` while
-    /// holding the topology read lock, making both hits and misses definitive with
-    /// one structural lookup. On contention, the structural guard is released
-    /// before waiting so a long-lived node reference cannot convoy unrelated
-    /// structural writers. After repeated contention, the documented
-    /// topology-to-node lock order is used as a bounded progress fallback.
+    /// Readers route through an immutable published topology and validate its
+    /// generation after locking the node. A concurrent structural change makes
+    /// the read retry, so hits and misses remain definitive without updating a
+    /// shared reader-count cache line.
     #[inline(always)]
-    fn lock_node_for_value<Q>(&self, value: &Q) -> Option<ArcMutexGuard<RawMutex, Node>>
+    fn lock_node_for_value<Q>(&self, value: &Q) -> Option<ArcRwLockReadGuard<RawRwLock, Node>>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut contentions = 0;
-
         loop {
-            let index = self.index.read();
-            let node = match first_for_borrowed_bound(&index, Bound::Included(value), self.borrow_order_matches) {
-                Some((_, node)) => node.clone(),
+            let generation = self.index.generation.load(Ordering::Acquire);
+            if !generation.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let pin = self.index.published.domain.pin();
+            let snapshot = self.index.published.current.load(Ordering::Acquire);
+            // SAFETY: `snapshot` was loaded after `pin`, and the publication
+            // domain cannot reclaim it until `pin` is dropped.
+            let index = unsafe { &*snapshot };
+            let node = match first_for_borrowed_bound(index, Bound::Included(value), self.borrow_order_matches) {
+                Some((_, node)) => Some(node.clone()),
                 None => index
                     .last_key_value()
                     .map(|(_, node)| node.clone())
-                    .or_else(|| index.first_key_value().map(|(_, node)| node.clone()))?,
+                    .or_else(|| index.first_key_value().map(|(_, node)| node.clone())),
+            };
+            let Some(node) = node else {
+                if self.index.generation.load(Ordering::Acquire) == generation {
+                    return None;
+                }
+                continue;
             };
 
-            if let Some(node_guard) = node.try_lock_arc() {
-                drop(index);
+            let node_guard = node.read_arc();
+            if self.index.generation.load(Ordering::Acquire) == generation {
+                drop(pin);
                 return Some(node_guard);
             }
-
-            contentions += 1;
-            if contentions >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
-                let node_guard = node.lock_arc();
-                drop(index);
-                return Some(node_guard);
-            }
-
-            drop(index);
-            // Wait for the observed holder without pinning the structural
-            // mapping, then retry so the returned guard always corresponds to
-            // a mapping observed under the topology read lock.
-            drop(node.lock_arc());
         }
     }
 
     #[inline(always)]
     fn get_with_guard<Q, R>(
-        node_guard: ArcMutexGuard<RawMutex, Node>,
+        node_guard: ArcRwLockReadGuard<RawRwLock, Node>,
         value: &Q,
         read: impl FnOnce(&T) -> R,
     ) -> Option<R>
@@ -711,7 +850,39 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        Self::get_with_guard(self.lock_node_for_value(value)?, value, read)
+        loop {
+            let generation = self.index.generation.load(Ordering::Acquire);
+            if !generation.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let _pin = self.index.published.domain.pin();
+            let snapshot = self.index.published.current.load(Ordering::Acquire);
+            // SAFETY: `snapshot` was loaded after `pin`, and the publication
+            // domain cannot reclaim it until `pin` is dropped.
+            let index = unsafe { &*snapshot };
+            let node = first_for_borrowed_bound(index, Bound::Included(value), self.borrow_order_matches)
+                .or_else(|| index.last_key_value())
+                .or_else(|| index.first_key_value())
+                .map(|(_, node)| node);
+            let Some(node) = node else {
+                if self.index.generation.load(Ordering::Acquire) == generation {
+                    return None;
+                }
+                continue;
+            };
+
+            // Borrow the Arc from the protected snapshot: unlike
+            // `lock_node_for_value`, this owned-result path does not need an
+            // Arc clone or its shared refcount update.
+            let node_guard = node.read();
+            if self.index.generation.load(Ordering::Acquire) != generation {
+                continue;
+            }
+            let position = node_guard.try_select(value)?;
+            return node_guard.get_ith(position).map(read);
+        }
     }
 
     #[inline(always)]
@@ -743,8 +914,7 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        self.lock_node_for_value(value)
-            .is_some_and(|node_guard| node_guard.contains(value))
+        self.get_with(value, |_| ()).is_some()
     }
     pub fn get<'a, Q>(&'a self, value: &'a Q) -> Option<Ref<T, Node>>
     where
@@ -767,17 +937,17 @@ where
     }
 
     pub fn len(&self) -> usize {
-        self.index.read().values().map(|node| node.lock().len()).sum()
+        self.index.read().values().map(|node| node.read().len()).sum()
     }
     pub fn is_empty(&self) -> bool {
-        self.index.read().values().all(|node| node.lock().is_empty())
+        self.index.read().values().all(|node| node.read().is_empty())
     }
     pub fn capacity(&self) -> usize {
         self.index
             .read()
             .values()
             .map(|node| {
-                let guard = node.lock();
+                let guard = node.read();
                 guard.capacity()
             })
             .sum()
@@ -840,16 +1010,16 @@ where
     // Identity of the node the last batch in each direction was cloned from,
     // so the next install can step past it when the cursor lookup lands on
     // it again (its entry key can sit past every element it still holds).
-    exhausted_front_node: Option<Arc<Mutex<Node>>>,
-    exhausted_back_node: Option<Arc<Mutex<Node>>>,
+    exhausted_front_node: Option<Arc<RwLock<Node>>>,
+    exhausted_back_node: Option<Arc<RwLock<Node>>>,
     // The node a direction is partway through, and how many of its elements it
     // has taken. A batch that stops short of a node's end must resume inside
     // that node, and must never take less than it already has: the rank-based
     // skip alone cannot guarantee that, because a repositioned node can leave
     // the cursor ranking below elements already yielded. Recording the count
     // makes forward progress structural rather than incidental.
-    front_partial: Option<(Arc<Mutex<Node>>, usize)>,
-    back_partial: Option<(Arc<Mutex<Node>>, usize)>,
+    front_partial: Option<(Arc<RwLock<Node>>, usize)>,
+    back_partial: Option<(Arc<RwLock<Node>>, usize)>,
     // How many elements the next batch may clone, doubling per install.
     front_batch_limit: usize,
     back_batch_limit: usize,
@@ -941,7 +1111,7 @@ where
             return false;
         };
         let node = entry.clone();
-        let guard = node.lock_arc();
+        let guard = node.read_arc();
         drop(index);
 
         let rank_skip = self
@@ -1023,7 +1193,7 @@ where
             return false;
         };
         let node = entry.clone();
-        let guard = node.lock_arc();
+        let guard = node.read_arc();
         drop(index);
 
         let truncate = self
@@ -1203,7 +1373,7 @@ where
         let current_front_entry = first_for_borrowed_bound(&index, start_bound, btree.borrow_order_matches);
 
         let front_value = if let Some((front_key, front_node)) = current_front_entry {
-            let front_guard = front_node.clone().lock_arc();
+            let front_guard = front_node.clone().read_arc();
             let rank = match start_bound {
                 Bound::Included(v) => front_guard.rank(Bound::Included(v), true),
                 Bound::Excluded(v) => front_guard.rank(Bound::Excluded(v), true),
@@ -1222,7 +1392,7 @@ where
                 // Never hold two node locks here.
                 drop(front_guard);
                 if let Some((_, pre_front_node)) = index.range::<T, _>(..front_key).next_back() {
-                    let pre_front_guard = pre_front_node.clone().lock_arc();
+                    let pre_front_guard = pre_front_node.clone().read_arc();
                     pre_front_guard.iter().last().cloned()
                 } else {
                     None
@@ -1240,7 +1410,7 @@ where
         };
 
         let back_value = if let Some((back_key, back_node)) = current_back_entry {
-            let back_guard = back_node.clone().lock_arc();
+            let back_guard = back_node.clone().read_arc();
             let rank = match end_bound {
                 Bound::Included(v) => back_guard.rank(Bound::Included(v), false),
                 Bound::Excluded(v) => back_guard.rank(Bound::Excluded(v), false),
@@ -1258,7 +1428,7 @@ where
                     .range::<T, _>((Bound::Excluded(back_key), Bound::Unbounded))
                     .next()
                 {
-                    let next_back_guard = next_back_node.clone().lock_arc();
+                    let next_back_guard = next_back_node.clone().read_arc();
                     next_back_guard.iter().next().cloned()
                 } else {
                     None
@@ -1273,7 +1443,7 @@ where
             if start_bound != Bound::Unbounded || end_bound != Bound::Unbounded {
                 if let Some(max) = index
                     .last_key_value()
-                    .and_then(|(_, node)| node.clone().lock_arc().max().cloned())
+                    .and_then(|(_, node)| node.clone().read_arc().max().cloned())
                 {
                     if let Bound::Included(v) = start_bound {
                         if v > max.borrow() {
@@ -1288,7 +1458,7 @@ where
 
                 if let Some(min) = index
                     .first_key_value()
-                    .and_then(|(_, node)| node.clone().lock_arc().min().cloned())
+                    .and_then(|(_, node)| node.clone().read_arc().min().cloned())
                 {
                     if let Bound::Included(v) = end_bound {
                         if v < min.borrow() {
@@ -1492,7 +1662,7 @@ where
 
         if Arc::ptr_eq(&front_node, &back_node) {
             // The whole range lives in one node.
-            let mut guard = front_node.clone().lock_arc();
+            let mut guard = front_node.clone().write_arc();
             let front_position = guard.rank(start_bound, true).map_or(0, |last| last + 1);
             let back_position = removed_prefix_len(&guard);
             if back_position <= front_position {
@@ -1512,8 +1682,8 @@ where
             return;
         }
 
-        let mut front_guard = front_node.clone().lock_arc();
-        let mut back_guard = back_node.clone().lock_arc();
+        let mut front_guard = front_node.clone().write_arc();
+        let mut back_guard = back_node.clone().write_arc();
         let front_position = front_guard.rank(start_bound, true).map_or(0, |last| last + 1);
         let back_position = removed_prefix_len(&back_guard);
 
@@ -1526,7 +1696,7 @@ where
             let node = index
                 .remove::<T>(&key)
                 .expect("middle key was collected under the write lock");
-            let mut removed_node = node.lock_arc();
+            let mut removed_node = node.write_arc();
             detached_nodes.push(std::mem::take(&mut *removed_node));
         }
 
@@ -1615,6 +1785,50 @@ mod tests {
         let expected = (0..WRITERS * VALUES_PER_WRITER).collect::<Vec<_>>();
         assert_eq!(set.len(), expected.len());
         assert_eq!(set.iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn published_point_reads_remain_definitive_across_splits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const STABLE_KEYS: usize = 256;
+        const FINAL_KEYS: usize = 4_096;
+        const READERS: usize = 4;
+
+        let set = Arc::new(BTreeSet::<usize>::with_maximum_node_size(8));
+        for key in 0..STABLE_KEYS {
+            set.insert(key);
+        }
+
+        let start = Arc::new(Barrier::new(READERS + 1));
+        let done = Arc::new(AtomicBool::new(false));
+        let readers = (0..READERS)
+            .map(|reader| {
+                let set = Arc::clone(&set);
+                let start = Arc::clone(&start);
+                let done = Arc::clone(&done);
+                thread::spawn(move || {
+                    start.wait();
+                    let mut probe = reader;
+                    while !done.load(Ordering::Acquire) {
+                        let key = probe % STABLE_KEYS;
+                        assert_eq!(set.get_with(&key, |value| *value), Some(key));
+                        probe += READERS;
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        for key in STABLE_KEYS..FINAL_KEYS {
+            set.insert(key);
+        }
+        done.store(true, Ordering::Release);
+
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(set.len(), FINAL_KEYS);
     }
 
     #[test]
@@ -1753,7 +1967,7 @@ mod tests {
             set.index
                 .read()
                 .values()
-                .flat_map(|node| node.lock().iter().cloned().collect::<Vec<_>>())
+                .flat_map(|node| node.read().iter().cloned().collect::<Vec<_>>())
                 .collect::<HashSet<_>>()
                 .symmetric_difference(&inserted_values)
                 .collect::<Vec<_>>()
@@ -2079,12 +2293,12 @@ mod tests {
             .unwrap()
             .1
             .clone();
-        let detached_values = detached.lock().iter().copied().collect::<Vec<_>>();
+        let detached_values = detached.read().iter().copied().collect::<Vec<_>>();
         assert!(detached_values.iter().all(|value| (2..30).contains(value)));
 
         set.remove_range(2..30);
 
-        assert!(detached.lock().is_empty());
+        assert!(detached.read().is_empty());
         assert!(detached_values.iter().all(|value| !set.contains(value)));
     }
 
@@ -2101,7 +2315,7 @@ mod tests {
         // reach it the same way.
         {
             let node = set.index.read().last_key_value().expect("node must exist").1.clone();
-            let mut guard = node.lock();
+            let mut guard = node.write();
             NodeLike::insert(&mut *guard, 5u64);
         }
 
@@ -2117,7 +2331,7 @@ mod tests {
     fn drain_node_with_pending_unlink(set: &BTreeSet<u64>, values: &[u64], stale_key: u64) -> Operation<u64, Vec<u64>> {
         let node = set.index.read().last_key_value().expect("node must exist").1.clone();
         {
-            let mut guard = node.lock();
+            let mut guard = node.write();
             for value in values {
                 NodeLike::delete(&mut *guard, value).expect("seeded value must be present");
             }
@@ -2136,7 +2350,7 @@ mod tests {
         let pending_split = Operation::Split(node.clone(), 30u64, 15u64);
         // ...then a concurrent remove drains the node before the commit.
         {
-            let mut guard = node.lock();
+            let mut guard = node.write();
             for seeded in [10u64, 20, 30] {
                 NodeLike::delete(&mut *guard, &seeded).expect("seeded value must be present");
             }
@@ -2169,7 +2383,7 @@ mod tests {
         let node = set.index.read().last_key_value().expect("node must exist").1.clone();
         let pending_split = Operation::Split(node.clone(), 30u64, 15u64);
         {
-            let mut guard = node.lock();
+            let mut guard = node.write();
             for seeded in [10u64, 20, 30] {
                 NodeLike::delete(&mut *guard, &seeded).expect("seeded value must be present");
             }
@@ -2227,7 +2441,7 @@ mod tests {
             // routed (empty) node under the node lock; the UpdateMax repair
             // has not committed yet.
             {
-                let mut guard = node.lock();
+                let mut guard = node.write();
                 NodeLike::insert(&mut *guard, value);
             }
             let pending_repair = Operation::UpdateMax(node.clone(), 30u64);
@@ -2277,7 +2491,7 @@ mod tests {
                         let mut attempts = 0;
                         while set.remove(&key).is_none() {
                             let index = set.index.read();
-                            let present = index.values().any(|node| node.lock().contains(&key));
+                            let present = index.values().any(|node| node.read().contains(&key));
                             drop(index);
                             assert!(present, "acknowledged insert of {key} was lost");
                             attempts += 1;
@@ -2686,7 +2900,7 @@ mod tests {
         set.attach_node(vec![30u64, 40]);
         {
             let node = set.index.read().first_key_value().expect("fixture node").1.clone();
-            let mut guard = node.lock();
+            let mut guard = node.write();
             NodeLike::insert(&mut *guard, 35u64);
         }
 

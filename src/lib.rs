@@ -2162,16 +2162,14 @@ where
         K: Borrow<Q> + Ord,
         Q: Ord + ?Sized,
     {
-        let (node_idx, position_within_node) = self.set.locate_value_cmp(|item: &Pair<K, V>| item.key.borrow() < key);
-        if let Some(candidate_node) = self.set.inner.get(node_idx) {
-            if let Some(candidate_value) = candidate_node.get(position_within_node) {
-                if candidate_value.key.borrow() == key {
-                    return Some((&candidate_value.key, &candidate_value.value));
-                }
-            }
-        }
-
-        None
+        let node_idx = self.set.locate_node_cmp(|item: &Pair<K, V>| item.key.borrow() < key);
+        let candidate_node = self.set.inner.get(node_idx)?;
+        let position = crate::core::node::search_by(candidate_node, |candidate| {
+            <K as Borrow<Q>>::borrow(&candidate.key).cmp(key)
+        })
+        .ok()?;
+        let candidate = &candidate_node[position];
+        Some((&candidate.key, &candidate.value))
     }
     /// Returns a mutable reference to the value corresponding to the key.
     ///

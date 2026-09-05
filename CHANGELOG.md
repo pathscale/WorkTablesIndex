@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.12]
+
+### Changed
+
+- Concurrent point lookups route through immutable, grace-period-protected
+  topology snapshots instead of acquiring the structural read lock. Per-node
+  read/write locks let independent readers proceed without serializing on a
+  node mutex.
+- Concurrent CDC `iter_nodes` retains its mutex-shaped API but returns detached
+  node snapshots. Mutating a returned node no longer mutates the live index.
+- Sequential map exact lookups stop when binary search finds equality instead
+  of completing a lower-bound search and comparing the result a second time.
+
+### Added
+
+- A split-heavy concurrent regression test verifies that definitive point
+  reads remain correct while topology generations are repeatedly published.
+
 ## [0.0.11]
 
 ### Changed

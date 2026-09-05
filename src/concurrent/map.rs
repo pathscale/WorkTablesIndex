@@ -222,10 +222,23 @@ where
     pub fn attach_node(&self, node: Node) {
         self.set.attach_node(node)
     }
-    /// Returns iterator over this set's [`Node`]'s.
+    /// Returns detached snapshots of this map's [`Node`]s.
+    ///
+    /// The returned mutexes preserve the checkpoint API's existing shape, but
+    /// mutating them does not mutate this map. Callers requiring one coherent
+    /// logical generation must prevent concurrent mutation while collecting.
     #[cfg(feature = "cdc")]
-    pub fn iter_nodes(&self) -> impl Iterator<Item = Arc<Mutex<Node>>> + '_ {
-        self.set.index.read().values().cloned().collect::<Vec<_>>().into_iter()
+    pub fn iter_nodes(&self) -> impl Iterator<Item = Arc<Mutex<Node>>> + '_
+    where
+        Node: Clone,
+    {
+        self.set
+            .index
+            .read()
+            .values()
+            .map(|node| Arc::new(Mutex::new((*node.read()).clone())))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// Copies the exact node boundaries into a pointer-free checkpoint image.
@@ -780,7 +793,7 @@ mod tests {
             .index
             .read()
             .iter()
-            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.read_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }
@@ -810,7 +823,7 @@ mod tests {
             .index
             .read()
             .iter()
-            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.read_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }
@@ -841,7 +854,7 @@ mod tests {
             .index
             .read()
             .iter()
-            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.read_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }
@@ -874,7 +887,7 @@ mod tests {
             .index
             .read()
             .iter()
-            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.read_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }
@@ -941,7 +954,7 @@ mod tests {
             .index
             .read()
             .iter()
-            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.read_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }

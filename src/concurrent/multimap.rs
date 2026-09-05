@@ -210,10 +210,23 @@ where
     pub fn attach_multi_node(&self, node: Node) {
         self.set.attach_node(node)
     }
-    /// Returns iterator over this multiset's [`Node`]'s.
+    /// Returns detached snapshots of this multimap's [`Node`]s.
+    ///
+    /// The returned mutexes preserve the checkpoint API's existing shape, but
+    /// mutating them does not mutate this map. Callers requiring one coherent
+    /// logical generation must prevent concurrent mutation while collecting.
     #[cfg(feature = "cdc")]
-    pub fn iter_nodes(&self) -> impl Iterator<Item = Arc<Mutex<Node>>> + '_ {
-        self.set.index.read().values().cloned().collect::<Vec<_>>().into_iter()
+    pub fn iter_nodes(&self) -> impl Iterator<Item = Arc<Mutex<Node>>> + '_
+    where
+        Node: Clone,
+    {
+        self.set
+            .index
+            .read()
+            .values()
+            .map(|node| Arc::new(Mutex::new((*node.read()).clone())))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
     /// Returns `true` if the map contains at least one occurance of the specified key.
     ///

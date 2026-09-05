@@ -1,6 +1,6 @@
 [package]
 name = "WorkTablesIndex"
-version = "0.0.11"
+version = "0.0.12"
 edition = "2021"
 documentation = "https://docs.rs/WorkTablesIndex/"
 repository = "https://github.com/pathscale/WorkTablesIndex"
@@ -33,6 +33,7 @@ parking_lot = { version = "0.12", features = [
     "send_guard",
     "arc_lock",
 ], optional = true }
+ps-reclaim = { version = "^0.1, >=0.1.3", optional = true }
 fastrand = { version = "2", optional = true }
 superslice = { version = "1", optional = true }
 wt-slice = { version = "0.1", optional = true }
@@ -42,6 +43,7 @@ default = ["wt-slice-binary-search"]
 serde = ["dep:serde"]
 concurrent = [
     "dep:parking_lot",
+    "dep:ps-reclaim",
 ]
 cdc = ["concurrent"]
 multimap = ["concurrent", "dep:fastrand"]

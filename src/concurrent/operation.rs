@@ -1,14 +1,14 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
 
 use crate::cdc::change::ChangeEventUnassigned;
 use crate::core::node::NodeLike;
 
-type OldVersion<Node> = Arc<Mutex<Node>>;
-type CurrentVersion<Node> = Arc<Mutex<Node>>;
+type OldVersion<Node> = Arc<RwLock<Node>>;
+type CurrentVersion<Node> = Arc<RwLock<Node>>;
 
 pub enum Operation<T: Send + Ord, Node: NodeLike<T>> {
     Split(OldVersion<Node>, T, T),
@@ -27,12 +27,12 @@ where
     // value in place: see `MultiPairLike::adopt_stored_identity`.
     pub fn commit<const EMIT_CDC: bool>(
         self,
-        index: &mut BTreeMap<T, Arc<Mutex<Node>>>,
+        index: &mut BTreeMap<T, Arc<RwLock<Node>>>,
         adopt: fn(&T, &mut T),
     ) -> Result<(Option<T>, Vec<ChangeEventUnassigned<T>>), ()> {
         match self {
             Operation::Split(old_node, old_max, value) => {
-                let mut guard = old_node.lock_arc();
+                let mut guard = old_node.write_arc();
                 if let Some(entry) = index.get(&old_max) {
                     if Arc::ptr_eq(entry, &old_node) {
                         // The node was drained by a concurrent remove after
@@ -131,7 +131,7 @@ where
                                     cdc.push(value_insertion);
                                 }
                             }
-                            let new_node = Arc::new(Mutex::new(new_vec));
+                            let new_node = Arc::new(RwLock::new(new_vec));
 
                             index.insert(max, new_node);
                         }
@@ -143,7 +143,7 @@ where
                 Err(())
             }
             Operation::UpdateMax(node, old_max) => {
-                let guard = node.lock_arc();
+                let guard = node.write_arc();
                 if let Some(entry) = index.get(&old_max) {
                     if Arc::ptr_eq(entry, &node) {
                         let mut cdc = vec![];
@@ -188,7 +188,7 @@ where
                 Err(())
             }
             Operation::MakeUnreachable(node, old_max) => {
-                let guard = node.lock_arc();
+                let guard = node.write_arc();
                 if let Some(entry) = index.get(&old_max) {
                     if Arc::ptr_eq(entry, &node) {
                         return match guard.max() {
