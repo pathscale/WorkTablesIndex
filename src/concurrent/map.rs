@@ -778,8 +778,9 @@ mod tests {
         let expected_state = map
             .set
             .index
+            .read()
             .iter()
-            .map(|e| (e.key().clone().key, e.value().lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }
@@ -807,8 +808,9 @@ mod tests {
         let expected_state = map
             .set
             .index
+            .read()
             .iter()
-            .map(|e| (e.key().clone().key, e.value().lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }
@@ -837,8 +839,9 @@ mod tests {
         let expected_state = map
             .set
             .index
+            .read()
             .iter()
-            .map(|e| (e.key().clone().key, e.value().lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }
@@ -869,8 +872,9 @@ mod tests {
         let expected_state = map
             .set
             .index
+            .read()
             .iter()
-            .map(|e| (e.key().clone().key, e.value().lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }
@@ -935,8 +939,9 @@ mod tests {
         let expected_state = map
             .set
             .index
+            .read()
             .iter()
-            .map(|e| (e.key().clone().key, e.value().lock_arc().clone()))
+            .map(|(key, node)| (key.clone().key, node.lock_arc().clone()))
             .collect::<_>();
         assert_eq!(mock_state.nodes, expected_state);
     }
