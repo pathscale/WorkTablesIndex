@@ -12,6 +12,7 @@ readme = "README.md"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+crossbeam-skiplist = "^0.1"
 rand = "0.9"
 scc = { version = "2.2.5" }
 uuid = { version = "1.17.0", features = ["v7"]}
@@ -32,8 +33,6 @@ parking_lot = { version = "0.12", features = [
     "send_guard",
     "arc_lock",
 ], optional = true }
-crossbeam-utils = { version = "0.8", optional = true }
-crossbeam-skiplist = { version = "0.1", optional = true }
 fastrand = { version = "2", optional = true }
 superslice = { version = "1", optional = true }
 wt-slice = { version = "0.1", optional = true }
@@ -42,8 +41,6 @@ wt-slice = { version = "0.1", optional = true }
 default = ["wt-slice-binary-search"]
 serde = ["dep:serde"]
 concurrent = [
-    "dep:crossbeam-utils",
-    "dep:crossbeam-skiplist",
     "dep:parking_lot",
 ]
 cdc = ["concurrent"]

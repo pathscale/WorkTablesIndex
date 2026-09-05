@@ -1,8 +1,8 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 
 use crate::cdc::change::ChangeEventUnassigned;
 use crate::core::node::NodeLike;
@@ -27,14 +27,14 @@ where
     // value in place: see `MultiPairLike::adopt_stored_identity`.
     pub fn commit<const EMIT_CDC: bool>(
         self,
-        index: &SkipMap<T, Arc<Mutex<Node>>>,
+        index: &mut BTreeMap<T, Arc<Mutex<Node>>>,
         adopt: fn(&T, &mut T),
     ) -> Result<(Option<T>, Vec<ChangeEventUnassigned<T>>), ()> {
         match self {
             Operation::Split(old_node, old_max, value) => {
                 let mut guard = old_node.lock_arc();
                 if let Some(entry) = index.get(&old_max) {
-                    if Arc::ptr_eq(entry.value(), &old_node) {
+                    if Arc::ptr_eq(entry, &old_node) {
                         // The node was drained by a concurrent remove after
                         // this split was scheduled. Halving an empty node
                         // would unlink it while silently dropping the pending
@@ -49,7 +49,7 @@ where
                         #[cfg(feature = "cdc")]
                         let max_value =
                             EMIT_CDC.then(|| guard.max().expect("node should be non empty if split").clone());
-                        entry.remove();
+                        index.remove(&old_max);
                         let mut new_vec = guard.halve();
 
                         #[cfg(feature = "cdc")]
@@ -145,7 +145,7 @@ where
             Operation::UpdateMax(node, old_max) => {
                 let guard = node.lock_arc();
                 if let Some(entry) = index.get(&old_max) {
-                    if Arc::ptr_eq(entry.value(), &node) {
+                    if Arc::ptr_eq(entry, &node) {
                         let mut cdc = vec![];
                         return Ok(match guard.max() {
                             // The node was drained by a concurrent remove
@@ -190,7 +190,7 @@ where
             Operation::MakeUnreachable(node, old_max) => {
                 let guard = node.lock_arc();
                 if let Some(entry) = index.get(&old_max) {
-                    if Arc::ptr_eq(entry.value(), &node) {
+                    if Arc::ptr_eq(entry, &node) {
                         return match guard.max() {
                             // Still empty: unlink the node as requested.
                             None => {
