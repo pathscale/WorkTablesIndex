@@ -217,8 +217,8 @@ where
     pub(crate) fn export_topology(&self) -> (usize, Vec<Vec<T>>) {
         let index = self.index.read();
         let nodes = index
-            .iter()
-            .map(|(_, node)| node.lock().iter().cloned().collect())
+            .values()
+            .map(|node| node.lock().iter().cloned().collect())
             .collect();
         (self.node_capacity, nodes)
     }
@@ -775,8 +775,8 @@ where
     pub fn capacity(&self) -> usize {
         self.index
             .read()
-            .iter()
-            .map(|(_, node)| {
+            .values()
+            .map(|node| {
                 let guard = node.lock();
                 guard.capacity()
             })
@@ -1752,8 +1752,8 @@ mod tests {
             "Length did not match, missing: {:?}",
             set.index
                 .read()
-                .iter()
-                .flat_map(|(_, node)| node.lock().iter().cloned().collect::<Vec<_>>())
+                .values()
+                .flat_map(|node| node.lock().iter().cloned().collect::<Vec<_>>())
                 .collect::<HashSet<_>>()
                 .symmetric_difference(&inserted_values)
                 .collect::<Vec<_>>()
