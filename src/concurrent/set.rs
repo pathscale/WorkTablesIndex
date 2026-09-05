@@ -27,6 +27,10 @@ type NodeIndex<T, Node> = BTreeMap<T, Arc<RwLock<Node>>>;
 // changed boundary; it never copies the full node index. At WorkTable's
 // default 1,024 rows per node, one 128-route chunk covers roughly 131k rows.
 const PUBLISHED_ROUTES_PER_CHUNK: usize = 128;
+// Leave rebuilt chunks room for subsequent inserts, and merge only below the
+// split threshold so alternating insert/remove cannot thrash one boundary.
+const PUBLISHED_REBUILD_ROUTES_PER_CHUNK: usize = PUBLISHED_ROUTES_PER_CHUNK * 2 / 3;
+const PUBLISHED_ROUTE_MERGE_THRESHOLD: usize = PUBLISHED_ROUTES_PER_CHUNK * 3 / 4;
 
 struct PublishedChunk<T, Node> {
     entries: Vec<(T, Arc<RwLock<Node>>)>,
@@ -59,14 +63,14 @@ where
     T: Ord + Clone,
 {
     fn from_canonical(index: &NodeIndex<T, Node>) -> Self {
-        let mut chunks = Vec::with_capacity(index.len().div_ceil(PUBLISHED_ROUTES_PER_CHUNK));
-        let mut entries = Vec::with_capacity(PUBLISHED_ROUTES_PER_CHUNK);
+        let mut chunks = Vec::with_capacity(index.len().div_ceil(PUBLISHED_REBUILD_ROUTES_PER_CHUNK));
+        let mut entries = Vec::with_capacity(PUBLISHED_REBUILD_ROUTES_PER_CHUNK);
 
         for (key, node) in index {
             entries.push((key.clone(), node.clone()));
-            if entries.len() == PUBLISHED_ROUTES_PER_CHUNK {
+            if entries.len() == PUBLISHED_REBUILD_ROUTES_PER_CHUNK {
                 chunks.push(Arc::new(PublishedChunk { entries }));
-                entries = Vec::with_capacity(PUBLISHED_ROUTES_PER_CHUNK);
+                entries = Vec::with_capacity(PUBLISHED_REBUILD_ROUTES_PER_CHUNK);
             }
         }
         if !entries.is_empty() {
@@ -163,12 +167,13 @@ where
         Q: Ord + ?Sized,
     {
         let chunk_index = self.chunk_for(key);
-        let chunk = self.chunks.get_mut(chunk_index)?;
-        let chunk = Arc::make_mut(chunk);
-        let entry_index = chunk
+        let entry_index = self
+            .chunks
+            .get(chunk_index)?
             .entries
             .binary_search_by(|(candidate, _)| <T as Borrow<Q>>::borrow(candidate).cmp(key))
             .ok()?;
+        let chunk = Arc::make_mut(&mut self.chunks[chunk_index]);
         let (_, removed) = chunk.entries.remove(entry_index);
         self.len -= 1;
 
@@ -176,7 +181,7 @@ where
             self.chunks.remove(chunk_index);
         } else if chunk_index > 0
             && self.chunks[chunk_index - 1].entries.len() + self.chunks[chunk_index].entries.len()
-                <= PUBLISHED_ROUTES_PER_CHUNK
+                <= PUBLISHED_ROUTE_MERGE_THRESHOLD
         {
             let right = self.chunks.remove(chunk_index);
             Arc::make_mut(&mut self.chunks[chunk_index - 1])
@@ -184,7 +189,7 @@ where
                 .extend(right.entries.iter().cloned());
         } else if chunk_index + 1 < self.chunks.len()
             && self.chunks[chunk_index].entries.len() + self.chunks[chunk_index + 1].entries.len()
-                <= PUBLISHED_ROUTES_PER_CHUNK
+                <= PUBLISHED_ROUTE_MERGE_THRESHOLD
         {
             let right = self.chunks.remove(chunk_index + 1);
             Arc::make_mut(&mut self.chunks[chunk_index])
@@ -288,6 +293,14 @@ impl<T, Node> Drop for PublishedIndex<T, Node> {
     }
 }
 
+// Publication invariant: every canonical node appears once and in the same
+// order in the published route index. At most one route key may differ from
+// its canonical key, and only for the canonical last node. That exception is
+// safe because point lookup falls back to the published last node above all
+// routes, while a stale route below the current maximum still selects that
+// same final node. A last-node shrink cannot reorder it before the preceding
+// node because node ranges are non-overlapping. Attachment repairs the route
+// before it can cease to be the last node.
 pub(crate) struct Topology<T, Node> {
     index: RwLock<NodeIndex<T, Node>>,
     // Writer-only reverse lookup from node identity to its current published
@@ -1480,8 +1493,9 @@ where
                 let node = first_for_borrowed_bound(&index, Bound::Included(value), self.borrow_order_matches)
                     .or_else(|| index.last_key_value())
                     .or_else(|| index.first_key_value())
-                    .map(|(_, node)| node)?;
-                let node_guard = node.read();
+                    .map(|(_, node)| node.clone())?;
+                let node_guard = node.read_arc();
+                drop(index);
                 let position = node_guard.try_select(value)?;
                 return node_guard
                     .get_ith(position)
@@ -3240,6 +3254,98 @@ mod tests {
         for value in [1, 10, 20, 30] {
             assert_eq!(set.get(&value).map(|found| *found.get()), Some(value));
         }
+    }
+
+    #[test]
+    fn insert_recovers_from_a_missing_replaced_node_identity() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(8);
+        set.attach_node(vec![1, 10]);
+        let old_node = set.index.read().last_key_value().unwrap().1.clone();
+        assert!(set
+            .index
+            .published_keys
+            .lock()
+            .remove(&super::node_identity(&old_node))
+            .is_some());
+
+        {
+            let mut index = set.index.write();
+            let replaced = index.insert(10, Arc::new(parking_lot::RwLock::new(vec![5, 10])));
+            assert!(replaced.is_some_and(|node| Arc::ptr_eq(&node, &old_node)));
+        }
+
+        assert!(!set.contains(&1));
+        assert!(set.contains(&5));
+        assert!(set.contains(&10));
+    }
+
+    #[test]
+    fn remove_recovers_from_a_missing_node_identity() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(8);
+        set.attach_node(vec![1, 10]);
+        let old_node = set.index.read().last_key_value().unwrap().1.clone();
+        assert!(set
+            .index
+            .published_keys
+            .lock()
+            .remove(&super::node_identity(&old_node))
+            .is_some());
+
+        {
+            let mut index = set.index.write();
+            let removed = index.remove(&10).expect("canonical route exists");
+            assert!(Arc::ptr_eq(&removed, &old_node));
+        }
+
+        assert!(set.is_empty());
+        assert!(!set.contains(&1));
+    }
+
+    #[test]
+    fn missing_published_remove_does_not_clone_a_shared_chunk() {
+        let mut published = super::PublishedNodeIndex::<u64, Vec<u64>> {
+            chunks: Vec::new(),
+            len: 0,
+        };
+        for key in 0..16 {
+            published.insert(key, Arc::new(parking_lot::RwLock::new(vec![key])));
+        }
+        let snapshot = published.clone();
+        assert!(Arc::ptr_eq(&published.chunks[0], &snapshot.chunks[0]));
+
+        assert!(published.remove(&100).is_none());
+
+        assert!(Arc::ptr_eq(&published.chunks[0], &snapshot.chunks[0]));
+    }
+
+    #[test]
+    fn published_chunks_have_split_merge_hysteresis() {
+        let mut published = super::PublishedNodeIndex::<u64, Vec<u64>> {
+            chunks: Vec::new(),
+            len: 0,
+        };
+        for key in 0..=128 {
+            published.insert(key, Arc::new(parking_lot::RwLock::new(vec![key])));
+        }
+        assert_eq!(published.chunks.len(), 2);
+
+        for key in 0..33 {
+            assert!(published.remove(&key).is_some());
+        }
+        assert_eq!(published.chunks.len(), 1);
+
+        published.insert(0, Arc::new(parking_lot::RwLock::new(vec![0])));
+        assert_eq!(
+            published.chunks.len(),
+            1,
+            "one insert after a merge must not split again"
+        );
+        assert!(published.remove(&0).is_some());
+        assert_eq!(
+            published.chunks.len(),
+            1,
+            "one remove after a merge must not change chunking"
+        );
     }
 
     #[test]
