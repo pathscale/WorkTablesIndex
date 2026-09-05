@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node's range. Publication bookkeeping mismatches recover once from the
   canonical topology instead of panicking or entering an unbounded collision
   chain under the structural write lock.
+- Published route chunks keep merge/split headroom, and failed route removals
+  no longer copy a shared chunk. The bounded point-read fallback releases the
+  structural lock before invoking caller code.
 
 ## [0.0.11]
 

@@ -1,0 +1,27 @@
+name: Miri
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publication:
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Prepare Miri
+        run: cargo +nightly miri setup
+      - name: Published-pointer reclamation interleavings
+        env:
+          MIRIFLAGS: -Zmiri-many-seeds=0..8
+        run: cargo +nightly miri test --all-features published_pointer_survives_reclamation_interleavings
+      - name: Stale-boundary and recovery paths
+        env:
+          MIRIFLAGS: -Zmiri-many-seeds=0..8
+        run: cargo +nightly miri test --all-features attach_
