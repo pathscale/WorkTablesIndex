@@ -276,6 +276,149 @@ fn give_up_the_core() {
     std::thread::yield_now();
 }
 
+/// A lock whose waiters idle the core, with no operating system.
+///
+/// # Why this instruction exists and why nothing emits it
+///
+/// `WFE` puts the core in a low-power state until its event register is set;
+/// `SEV` sets it on every core. ARM documents this as **the** intended spinlock
+/// construction: the waiter executes WFE to request a low-power state and the
+/// releaser executes SEV to wake it.
+///
+/// Rust does not emit it. `core::hint::spin_loop()` on aarch64 is
+/// `__isb(SY)`, an instruction barrier, verified by disassembly:
+///
+/// ```text
+/// __RNvCs8LfLpYhzmc_7hintasm1s:
+///     isb
+///     ret
+/// ```
+///
+/// There is no WFE anywhere in `core::hint`, and no safe wrapper in
+/// `core::arch::aarch64`. That is structural rather than an oversight: WFE is
+/// only useful if the *releaser* pairs it with SEV, which is a protocol between
+/// both sides of a lock, and a one-sided hint like `spin_loop()` cannot express
+/// one. So it has to be written here, in the lock, where both sides are known.
+///
+/// # What it costs, measured on this machine
+///
+/// ```text
+/// nop                     0.3 ns
+/// isb (spin_loop)         8.6 ns
+/// wfe, event pending   1336.7 ns
+/// ```
+///
+/// WFE is not a no-op in userspace here, and it does not block forever either:
+/// it idles for about 1.3 us and returns on its own. So a waiter needs no SEV
+/// to make progress, and burns roughly 150x less CPU per unit of wall time
+/// waited than an `isb` spin. SEV is still sent on unlock, because waking
+/// immediately beats waiting out the timeout.
+///
+/// # Why this is the interesting arm rather than a curiosity
+///
+/// Every other `no_std` arm in this file fails the same way: when its spin
+/// schedule runs out there is nothing to hand the core to, so the waiter keeps
+/// running and keeps burning. Karlin et al.'s competitive-spinning result says
+/// spin-then-block is 2-competitive, and the "block" half is exactly what a
+/// target without an operating system cannot do. WFE is the hardware answering
+/// that: a block with no scheduler involved.
+///
+/// The problem is current, not settled. HTLL (IEEE TPDS, January 2025) targets
+/// throughput and latency together under oversubscription, reporting up to 97%
+/// latency reduction for about 5% throughput; Fissile Locks (arXiv 2003.05025)
+/// is compact, NUMA-aware and preemption-tolerant; Asymmetry-aware Scalable
+/// Locking (arXiv 2108.03355) matters here specifically, because this is a
+/// P-core/E-core machine and this benchmark does not separate them.
+///
+/// # When to use it, measured rather than assumed
+///
+/// **WFE idles the core. It does not yield to the operating system.** That is
+/// the whole rule, and it was learned the expensive way here: with 128 threads
+/// on 16 cores this arm costs 5478 ms of CPU against 1168 for a yielding
+/// spinner, because a waiter idling in WFE is still a scheduled thread, so the
+/// lock holder still cannot get a core. An earlier version of this lock
+/// restarted its spin schedule after every WFE, which meant it yielded between
+/// idles, and that accident is what made it competitive.
+///
+/// So the case for WFE is:
+///
+/// * threads at most cores, so idling a core costs nothing that is wanted;
+/// * no operating system to yield to, which is when every other option here
+///   reduces to burning the core anyway;
+/// * long enough waits that 1.3 us of idle is better than 8.6 ns of `isb`
+///   repeated until the holder finishes.
+///
+/// That is bare metal and pinned threads, not an oversubscribed server. Under
+/// oversubscription yielding beats idling, and this arm is the wrong choice.
+///
+/// # And the reason to care beyond this crate
+///
+/// EKOPathRS is a compiler. A compiler that recognises a spin loop can emit
+/// WFE for it, which is a transformation LLVM does not perform and which the
+/// measurement above prices at 150x. That makes this arm a bet on the toolchain
+/// rather than only a lock experiment.
+pub struct WfeMutex {
+    locked: core::sync::atomic::AtomicBool,
+}
+
+unsafe impl lock_api::RawMutex for WfeMutex {
+    const INIT: Self = Self {
+        locked: core::sync::atomic::AtomicBool::new(false),
+    };
+    type GuardMarker = lock_api::GuardSend;
+
+    fn lock(&self) {
+        // Spin briefly first: an uncontended lock should never reach a 1.3 us
+        // instruction, and a short hold is over before the schedule ends.
+        let mut spinwait = SpinWait::new();
+        while spinwait.spin() {
+            if self.try_lock() {
+                return;
+            }
+        }
+        // The schedule is spent, so stop competing with the holder for its
+        // core and idle instead. **Do not restart the schedule**: an earlier
+        // version reset it after every WFE, so it went back to yielding
+        // between idles and measured the same as not using WFE at all.
+        loop {
+            if self.try_lock() {
+                return;
+            }
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: WFE is unprivileged, has no memory operands, and no
+            // effect beyond waiting on the event register.
+            unsafe {
+                core::arch::asm!("wfe", options(nomem, nostack))
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            give_up_the_core();
+        }
+    }
+
+    fn try_lock(&self) -> bool {
+        self.locked
+            .compare_exchange_weak(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    unsafe fn unlock(&self) {
+        self.locked.store(false, core::sync::atomic::Ordering::Release);
+        // Wake every waiting core now rather than letting each wait out its
+        // own timeout.
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: SEV sets the event register on every core and has no other
+        // effect.
+        unsafe {
+            core::arch::asm!("sev", options(nomem, nostack))
+        };
+    }
+}
+
 /// The same bounded spin, but it **blocks** instead of yielding.
 ///
 /// This is the std column, and the difference is the whole point: a yielding
@@ -372,15 +515,17 @@ contended_arm!(
 );
 contended_arm!(held_bounded, lock_api::Mutex<BoundedMutex, u64>);
 contended_arm!(held_futex, lock_api::Mutex<FutexMutex, u64>);
+contended_arm!(held_wfe, lock_api::Mutex<WfeMutex, u64>);
 
 nodes_arm!(nodes_park, LaPlMx);
 nodes_arm!(nodes_spin, LaSpMx);
 nodes_arm!(nodes_yield, LaYdMx);
 nodes_arm!(nodes_bounded, lock_api::Mutex<BoundedMutex, Node>);
 nodes_arm!(nodes_futex, lock_api::Mutex<FutexMutex, Node>);
+nodes_arm!(nodes_wfe, lock_api::Mutex<WfeMutex, Node>);
 
 /// The same five, named once and used by both tables.
-const NAMES: [&str; 5] = ["parking_lot", "spin", "spin+yield", "bounded", "futex"];
+const NAMES: [&str; 5] = ["parking_lot", "spin", "spin+yield", "bounded", "wfe"];
 
 type Arm = fn(usize) -> (Duration, Duration);
 
@@ -437,13 +582,13 @@ fn main() {
         &format!("this crate's shape, {LOOKUPS} lookups over {NODES} nodes"),
         &[1, 2, 4, cores, cores * 2],
         NAMES,
-        [nodes_park, nodes_spin, nodes_yield, nodes_bounded, nodes_futex],
+        [nodes_park, nodes_spin, nodes_yield, nodes_bounded, nodes_wfe],
     );
 
     table(
         &format!("one lock, held {HELD_ITERS} iterations, {HOLDS} times per thread"),
-        &[cores / 2, cores, cores * 2, cores * 8],
+        &[cores / 4, cores / 2, cores, cores * 2, cores * 8],
         NAMES,
-        [held_park, held_spin, held_yield, held_bounded, held_futex],
+        [held_park, held_spin, held_yield, held_bounded, held_wfe],
     );
 }
