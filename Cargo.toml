@@ -17,6 +17,16 @@ loom = "0.7"
 rand = "0.9"
 scc = { version = "2.2.5" }
 uuid = { version = "1.17.0", features = ["v7"]}
+# For benches/locks.rs, which prices this crate's lock choice. `lock_api` is the
+# layer both parking_lot and spin are built on, so one generic body measures
+# both, and `libc` reads CPU time, which wall clock cannot show.
+lock_api = { version = "0.4", features = ["arc_lock"] }
+spin = { version = "0.12", default-features = false, features = ["spin_mutex", "rwlock", "lock_api"] }
+libc = "0.2"
+# parking_lot is optional in this crate (the `concurrent` feature). The bench
+# measures it against spin regardless of which features the library is built
+# with, so it needs its own unconditional copy.
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 
 # The crate is a fork of `indexset`, published under a different package name
 # to avoid colliding with upstream on the registry, and consumed everywhere as
@@ -111,3 +121,7 @@ unnecessary_unwrap = "allow"
 useless_conversion = "allow"
 useless_vec = "allow"
 while_let_loop = "allow"
+
+[[bench]]
+name = "locks"
+harness = false
