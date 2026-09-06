@@ -21,8 +21,10 @@ uuid = { version = "1.17.0", features = ["v7"]}
 # layer both parking_lot and spin are built on, so one generic body measures
 # both, and `libc` reads CPU time, which wall clock cannot show.
 lock_api = { version = "0.4", features = ["arc_lock"] }
-spin = { version = "0.12", default-features = false, features = ["spin_mutex", "rwlock", "lock_api"] }
+spin = { version = "0.12", default-features = false, features = ["spin_mutex", "rwlock", "lock_api", "std"] }
 libc = "0.2"
+# The std column: a real futex, which is the primitive parking_lot parks on.
+atomic-wait = "1.1"
 # parking_lot is optional in this crate (the `concurrent` feature). The bench
 # measures it against spin regardless of which features the library is built
 # with, so it needs its own unconditional copy.
