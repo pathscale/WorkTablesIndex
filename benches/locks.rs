@@ -1,65 +1,66 @@
-//! What this crate's node locking costs, and what it would cost on a `no_std`
-//! lock instead.
+//! What this crate's node locking costs, four ways.
 //!
 //! # Why this exists
 //!
 //! `concurrent` is the only reason this crate needs `std`. Its 31 lock sites
 //! are `parking_lot`, and `cdc` and `multimap` both imply `concurrent`, so a
-//! consumer that wants only `ChangeEvent` and `Pair` takes `parking_lot` and
-//! `libc` with them. DataBucket is exactly that consumer.
+//! consumer wanting only `ChangeEvent` and `Pair` takes `parking_lot` and
+//! `libc` with them. DataBucket is exactly that consumer, and that is what
+//! stops its format layer from being `no_std`.
 //!
-//! Swapping to a spinlock is the obvious `no_std` answer and the obvious
-//! objection is equally well known: a spinlock burns a core instead of
-//! sleeping, which is why `parking_lot` exists. **Both are true, in different
-//! regimes**, and this measures which regime this crate is actually in.
+//! # The four arms
+//!
+//! | arm | what it is |
+//! |---|---|
+//! | `parking_lot` | `parking_lot::Mutex`, named directly. What this crate uses today. |
+//! | `spin` | `spin::Mutex`, named directly. |
+//! | `lock_api+parking_lot` | `lock_api::Mutex<parking_lot::RawMutex, T>` |
+//! | `lock_api+spin` | `lock_api::Mutex<spin::Mutex<()>, T>` |
+//!
+//! The two `lock_api` arms are one generic body instantiated twice. That is the
+//! proposed shape: `concurrent` goes generic over `R: RawMutex` and the
+//! consumer chooses, rather than this crate naming a lock for everyone.
+//! `lock_arc` and `ArcMutexGuard<R, T>` belong to `lock_api`, not to
+//! `parking_lot`, so `Ref` keeps working either way.
+//!
+//! The two direct arms exist to price the `lock_api` wrapper itself. If
+//! `parking_lot` and `lock_api+parking_lot` differ, the wrapper is not free and
+//! every other comparison here is contaminated.
 //!
 //! # The two regimes
 //!
-//! `nodes` is this crate's own shape, from `src/concurrent/set.rs`:
-//! `RwLock<BTreeMap<T, Arc<Mutex<Node>>>>`. A lookup takes the index read
-//! lock, clones the node `Arc`, drops the index lock and locks the node. The
-//! critical section is a few operations on a key array.
+//! `nodes` is this crate's shape from `src/concurrent/set.rs`:
+//! `RwLock<BTreeMap<T, Arc<Mutex<Node>>>>`, with `DEFAULT_INNER_SIZE` entries
+//! per node. **1024, not the 16 an earlier version of this file guessed.** That
+//! was wrong by 64x and it decides the answer, because a lock held over 16
+//! entries is short and favours spinning while one held over 1024 does not.
 //!
-//! `contended` is the case a spinlock is supposed to lose: one lock, a long
-//! hold, and far more threads than cores, so a waiter can burn the core that
-//! the lock holder needs in order to finish. That needs both a long critical
-//! section and oversubscription, and a benchmark with neither will report that
-//! spinning is free.
+//! `contended` is one lock held long under oversubscription, where a spinlock
+//! is supposed to lose: a waiter burns the core the holder needs to finish.
 //!
 //! # Reading it
 //!
-//! **CPU time, not just wall clock.** A spinlock finishes sooner while burning
-//! a core that did no work, and on a machine with spare cores that trade looks
-//! free until something else wants one. `getrusage` is the only arm of this
-//! that can see it.
+//! **CPU time, from `getrusage`.** Wall clock cannot see a burnt core. A
+//! spinlock finishes sooner while consuming more, and on a machine with spare
+//! cores that looks free until something else wants one.
 //!
-//! **The null column is the floor.** It runs `parking_lot` a second time under
-//! another name, so whatever it shows is what this harness reports for
-//! identical code. Nothing smaller than that means anything.
-//!
-//! # The generic, which is the point
-//!
-//! Every measurement runs one body, generic over `R: RawMutex`, instantiated
-//! once with `parking_lot`'s raw lock and once with `spin`'s. That is not a
-//! benchmarking convenience: it is the proposed shape for this crate. Both
-//! locks are `lock_api` underneath, `ArcMutexGuard<R, T>` is `lock_api`'s type
-//! in both cases, and `lock_arc` is available from both. So `concurrent` can
-//! be generic over `R` and let a consumer choose, rather than naming a
-//! concrete lock and deciding for everyone.
+//! **`null` is the first arm run twice.** Whatever it shows is what this
+//! harness reports for identical code, so nothing closer than its distance
+//! from 1.00x means anything.
 
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lock_api::{Mutex, RawMutex, RawRwLock, RwLock};
+use indexset::core::constants::DEFAULT_INNER_SIZE;
 
 /// Nodes in the index, enough that lookups spread rather than queue on one.
 const NODES: u64 = 4_096;
 /// Lookups per measurement, split across threads.
 const LOOKUPS: usize = 200_000;
-/// How long the contended case holds its lock. Long enough that a holder can
-/// be preempted inside it, short enough to keep this bounded.
+/// How long the contended case holds. Long enough for a holder to be preempted
+/// inside it, short enough to keep this bounded.
 const HELD_ITERS: u64 = 20_000;
 /// Acquisitions per thread in the contended case.
 const HOLDS: usize = 40;
@@ -76,137 +77,373 @@ fn cpu() -> Duration {
     secs(usage.ru_utime) + secs(usage.ru_stime)
 }
 
+/// A node the size this crate actually uses.
 struct Node {
     keys: Vec<u64>,
 }
 
 impl Node {
     fn new(seed: u64) -> Self {
-        Self {
-            keys: (0..16).map(|n| seed.wrapping_mul(31).wrapping_add(n)).collect(),
-        }
+        let mut keys: Vec<u64> = (0..DEFAULT_INNER_SIZE as u64)
+            .map(|n| seed.wrapping_mul(0x9e37_79b9).wrapping_add(n))
+            .collect();
+        keys.sort_unstable();
+        Self { keys }
     }
 
-    /// A few operations, which is what a real node access is.
+    /// A sorted search then a write, which is what a node access is.
     fn touch(&mut self, n: u64) -> u64 {
-        let at = (n as usize) % self.keys.len();
+        let at = self.keys.partition_point(|key| *key < n).min(self.keys.len() - 1);
         self.keys[at] ^= n;
         self.keys[at]
     }
 }
 
-/// This crate's shape: an index lock, then a node lock per access.
-fn nodes<RM, RR>(threads: usize) -> (Duration, Duration)
-where
-    RM: RawMutex + Send + Sync + 'static,
-    RR: RawRwLock + Send + Sync + 'static,
-{
-    let index: Arc<RwLock<RR, BTreeMap<u64, Arc<Mutex<RM, Node>>>>> = Arc::new(RwLock::new(
-        (0..NODES).map(|n| (n, Arc::new(Mutex::new(Node::new(n))))).collect(),
-    ));
-    let before = cpu();
-    let now = Instant::now();
-    std::thread::scope(|scope| {
-        for worker in 0..threads {
-            let index = index.clone();
-            scope.spawn(move || {
-                let mut acc = 0u64;
-                let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ (worker as u64).wrapping_mul(0x9E37_79B9);
-                for _ in 0..LOOKUPS / threads {
-                    rng ^= rng << 13;
-                    rng ^= rng >> 7;
-                    rng ^= rng << 17;
-                    // The index lock is dropped before the node lock is taken,
-                    // which is what the real code does.
-                    let node = index.read().get(&(rng % NODES)).cloned();
-                    if let Some(node) = node {
-                        acc ^= node.lock().touch(rng);
-                    }
-                }
-                black_box(acc);
-            });
-        }
-    });
-    (now.elapsed(), cpu() - before)
+fn spread(worker: usize) -> u64 {
+    0x2545_F491_4F6C_DD1Du64 ^ (worker as u64).wrapping_mul(0x9E37_79B9)
 }
 
-/// One lock, held long, oversubscribed. Where spinning is supposed to fail.
-fn contended<RM: RawMutex + Send + Sync + 'static>(threads: usize) -> (Duration, Duration) {
-    let lock: Arc<Mutex<RM, u64>> = Arc::new(Mutex::new(0));
-    let before = cpu();
-    let now = Instant::now();
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            let lock = lock.clone();
-            scope.spawn(move || {
-                for _ in 0..HOLDS {
-                    let mut held = lock.lock();
-                    for n in 0..HELD_ITERS {
-                        *held = held.wrapping_mul(0x9e37_79b9).wrapping_add(n);
-                    }
-                }
-            });
-        }
-    });
-    (now.elapsed(), cpu() - before)
+fn next(rng: &mut u64) -> u64 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    *rng % NODES
 }
 
-type SpinM = spin::Mutex<()>;
-type SpinR = spin::RwLock<()>;
+/// The index lock is the same in every arm.
+///
+/// Only the node lock varies. An earlier version changed both at once, which
+/// conflated them: a difference could have come from either, and the two
+/// tables could not be read against each other.
+type IndexLock<M> = parking_lot::RwLock<BTreeMap<u64, Arc<M>>>;
+
+macro_rules! nodes_arm {
+    ($name:ident, $mx:ty) => {
+        fn $name(threads: usize) -> (Duration, Duration) {
+            let index: Arc<IndexLock<$mx>> = Arc::new(IndexLock::<$mx>::new(
+                (0..NODES)
+                    .map(|n| (n, Arc::new(<$mx>::new(Node::new(n)))))
+                    .collect(),
+            ));
+            let before = cpu();
+            let now = Instant::now();
+            std::thread::scope(|scope| {
+                for worker in 0..threads {
+                    let index = index.clone();
+                    scope.spawn(move || {
+                        let mut acc = 0u64;
+                        let mut rng = spread(worker);
+                        for _ in 0..LOOKUPS / threads {
+                            let key = next(&mut rng);
+                            // The index lock is released before the node lock
+                            // is taken, which is what the real code does.
+                            let node = index.read().get(&key).cloned();
+                            if let Some(node) = node {
+                                acc ^= node.lock().touch(rng);
+                            }
+                        }
+                        black_box(acc);
+                    });
+                }
+            });
+            (now.elapsed(), cpu() - before)
+        }
+    };
+}
+
+macro_rules! contended_arm {
+    ($name:ident, $mx:ty) => {
+        fn $name(threads: usize) -> (Duration, Duration) {
+            let lock: Arc<$mx> = Arc::new(<$mx>::new(0u64));
+            let before = cpu();
+            let now = Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    let lock = lock.clone();
+                    scope.spawn(move || {
+                        for _ in 0..HOLDS {
+                            let mut held = lock.lock();
+                            for n in 0..HELD_ITERS {
+                                *held = held.wrapping_mul(0x9e37_79b9).wrapping_add(n);
+                            }
+                        }
+                    });
+                }
+            });
+            (now.elapsed(), cpu() - before)
+        }
+    };
+}
+
+/// A lock that spins for a bounded budget, then gives the core up.
+///
+/// `spin::relax::Yield` yields on every iteration, so it trades cycles for
+/// syscalls and still costs 10x parking_lot's CPU when a lock is held long.
+/// `RelaxStrategy` is stateless, so the budget cannot live there.
+///
+/// This is what parking_lot does, minus the parking: spin while the holder is
+/// plausibly about to finish, then stop competing with it for the core. The
+/// give-up step is the only part that needs a platform, which is why it is one
+/// call and not a design.
+pub struct Bounded;
+
+/// parking_lot's spin schedule, copied from `parking_lot_core::SpinWait`.
+///
+/// Reading it was overdue. It is not "spin N times then yield": it is three
+/// exponentially growing pauses, then seven yields, then give up and park.
+///
+/// ```text
+/// counter 1..=3   cpu_relax(1 << counter)   2, 4, 8 pauses
+/// counter 4..=10  yield to the scheduler
+/// counter >10     stop spinning, park
+/// ```
+///
+/// The first version here spun 64 times flat and then yielded forever, which
+/// is why it never stopped burning CPU. Fourteen attempts, not sixty-four, and
+/// a hard end to them.
+struct SpinWait {
+    counter: u32,
+}
+
+impl SpinWait {
+    const fn new() -> Self {
+        Self { counter: 0 }
+    }
+
+    /// Returns false once spinning has stopped being worth it.
+    fn spin(&mut self) -> bool {
+        if self.counter >= 10 {
+            return false;
+        }
+        self.counter += 1;
+        if self.counter <= 3 {
+            for _ in 0..(1u32 << self.counter) {
+                core::hint::spin_loop();
+            }
+        } else {
+            give_up_the_core();
+        }
+        true
+    }
+}
+
+pub struct BoundedMutex {
+    locked: core::sync::atomic::AtomicBool,
+}
+
+unsafe impl lock_api::RawMutex for BoundedMutex {
+    const INIT: Self = Self {
+        locked: core::sync::atomic::AtomicBool::new(false),
+    };
+    type GuardMarker = lock_api::GuardSend;
+
+    fn lock(&self) {
+        // parking_lot's schedule exactly, minus the park at the end, because
+        // there is nothing to park on without an operating system. So when the
+        // schedule runs out this keeps yielding: that residue is the price of
+        // no_std, and the table measures it.
+        let mut spinwait = SpinWait::new();
+        loop {
+            if self.try_lock() {
+                return;
+            }
+            if !spinwait.spin() {
+                spinwait = SpinWait::new();
+                give_up_the_core();
+            }
+        }
+    }
+
+    fn try_lock(&self) -> bool {
+        self.locked
+            .compare_exchange_weak(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    unsafe fn unlock(&self) {
+        self.locked.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The one platform call. On a target with no scheduler this is a spin, and
+/// the lock degrades to `spin::Mutex` rather than breaking.
+fn give_up_the_core() {
+    std::thread::yield_now();
+}
+
+/// The same bounded spin, but it **blocks** instead of yielding.
+///
+/// This is the std column, and the difference is the whole point: a yielding
+/// waiter still runs, so it still burns CPU. A blocked waiter consumes
+/// nothing. That is what parking_lot does and it is why nothing without an
+/// operating system can match it.
+///
+/// The classic three-state futex mutex: 0 free, 1 locked, 2 locked and
+/// somebody is asleep on it. The third state exists so `unlock` can skip the
+/// wake syscall when nobody is waiting, which is the common case.
+pub struct FutexMutex {
+    state: core::sync::atomic::AtomicU32,
+}
+
+const FREE: u32 = 0;
+const HELD: u32 = 1;
+const CONTENDED: u32 = 2;
+
+unsafe impl lock_api::RawMutex for FutexMutex {
+    const INIT: Self = Self {
+        state: core::sync::atomic::AtomicU32::new(FREE),
+    };
+    type GuardMarker = lock_api::GuardSend;
+
+    fn lock(&self) {
+        use core::sync::atomic::Ordering;
+        // parking_lot's schedule, then a real park. The earlier version spun a
+        // flat 64 and then ran a CAS dance that re-announced every waiter on
+        // every wake, so unlock woke somebody on every release forever. It
+        // measured worse than a plain spinlock, which is not something a
+        // blocking lock can honestly do.
+        let mut spinwait = SpinWait::new();
+        while spinwait.spin() {
+            if self.try_lock() {
+                return;
+            }
+        }
+
+        // Drepper's three-state mutex. The first version of this swapped
+        // CONTENDED unconditionally on every retry, which republished the
+        // waiter flag after each wake and had every sleeper re-announce itself:
+        // it measured worse than a plain spinlock, which is how the bug was
+        // found rather than by reading it.
+        let mut seen = self
+            .state
+            .compare_exchange(FREE, HELD, Ordering::Acquire, Ordering::Relaxed)
+            .unwrap_or_else(|seen| seen);
+        while seen != FREE {
+            // Mark contention once, then sleep on that exact value.
+            if seen != CONTENDED
+                && self
+                    .state
+                    .compare_exchange(HELD, CONTENDED, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+                && self.state.load(Ordering::Relaxed) == FREE
+            {
+                seen = FREE;
+                continue;
+            }
+            atomic_wait::wait(&self.state, CONTENDED);
+            seen = self
+                .state
+                .compare_exchange(FREE, CONTENDED, Ordering::Acquire, Ordering::Relaxed)
+                .unwrap_or_else(|seen| seen);
+        }
+    }
+
+    fn try_lock(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        self.state
+            .compare_exchange(FREE, HELD, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    unsafe fn unlock(&self) {
+        use core::sync::atomic::Ordering;
+        // Only wake if somebody actually slept. The uncontended path is a
+        // single store and no syscall.
+        if self.state.swap(FREE, Ordering::Release) == CONTENDED {
+            atomic_wait::wake_one(&self.state);
+        }
+    }
+}
+
+type LaPlMx = lock_api::Mutex<parking_lot::RawMutex, Node>;
+type LaSpMx = lock_api::Mutex<spin::Mutex<()>, Node>;
+type LaYdMx = lock_api::Mutex<spin::mutex::Mutex<(), spin::relax::Yield>, Node>;
+
+contended_arm!(held_park, lock_api::Mutex<parking_lot::RawMutex, u64>);
+contended_arm!(held_spin, lock_api::Mutex<spin::Mutex<()>, u64>);
+contended_arm!(
+    held_yield,
+    lock_api::Mutex<spin::mutex::Mutex<(), spin::relax::Yield>, u64>
+);
+contended_arm!(held_bounded, lock_api::Mutex<BoundedMutex, u64>);
+contended_arm!(held_futex, lock_api::Mutex<FutexMutex, u64>);
+
+nodes_arm!(nodes_park, LaPlMx);
+nodes_arm!(nodes_spin, LaSpMx);
+nodes_arm!(nodes_yield, LaYdMx);
+nodes_arm!(nodes_bounded, lock_api::Mutex<BoundedMutex, Node>);
+nodes_arm!(nodes_futex, lock_api::Mutex<FutexMutex, Node>);
+
+/// The same five, named once and used by both tables.
+const NAMES: [&str; 5] = ["parking_lot", "spin", "spin+yield", "bounded", "futex"];
+
+type Arm = fn(usize) -> (Duration, Duration);
 
 fn median(mut runs: Vec<(Duration, Duration)>) -> (Duration, Duration) {
     runs.sort_by_key(|(wall, _)| *wall);
     runs[REPS / 2]
 }
 
-fn row(threads: usize, park: fn(usize) -> (Duration, Duration), spin: fn(usize) -> (Duration, Duration)) {
-    let mut parking = Vec::new();
-    let mut spinning = Vec::new();
-    let mut null = Vec::new();
-    for _ in 0..REPS {
-        parking.push(park(threads));
-        spinning.push(spin(threads));
-        null.push(park(threads));
+fn table(title: &str, threads: &[usize], names: [&str; 5], arms: [Arm; 5]) {
+    println!("\n{title}");
+    print!("         ");
+    for name in names {
+        print!("{name:>16}");
     }
-    let ((pw, pc), (sw, sc), (nw, _)) = (median(parking), median(spinning), median(null));
-    println!(
-        "  {threads:>7}   {:>7.1} {:>8.1}   {:>7.1} {:>8.1}   {:>6.2}x   {:>8}",
-        pw.as_secs_f64() * 1e3,
-        pc.as_secs_f64() * 1e3,
-        sw.as_secs_f64() * 1e3,
-        sc.as_secs_f64() * 1e3,
-        pw.as_secs_f64() / nw.as_secs_f64(),
-        format!("{:+.0}%", 100.0 * (sc.as_secs_f64() / pc.as_secs_f64() - 1.0)),
-    );
+    println!("{:>9}", "null");
+    print!("  threads");
+    for _ in names {
+        print!("{:>8}{:>8}", "wall", "cpu");
+    }
+    println!("{:>9}", "");
+    for &thread_count in threads {
+        let mut runs: Vec<Vec<(Duration, Duration)>> = vec![Vec::new(); 6];
+        for _ in 0..REPS {
+            for (slot, arm) in arms.iter().enumerate() {
+                runs[slot].push(arm(thread_count));
+            }
+            // The null arm: the first one again, measured under another name.
+            runs[5].push(arms[0](thread_count));
+        }
+        let m: Vec<(Duration, Duration)> = runs.into_iter().map(median).collect();
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        println!(
+            "  {thread_count:>7}{:>8.1}{:>8.1}{:>8.1}{:>8.1}{:>8.1}{:>8.1}{:>8.1}{:>8.1}{:>8.1}{:>8.1}{:>8.2}x",
+            ms(m[0].0),
+            ms(m[0].1),
+            ms(m[1].0),
+            ms(m[1].1),
+            ms(m[2].0),
+            ms(m[2].1),
+            ms(m[3].0),
+            ms(m[3].1),
+            ms(m[4].0),
+            ms(m[4].1),
+            m[0].0.as_secs_f64() / m[5].0.as_secs_f64(),
+        );
+    }
 }
 
 fn main() {
     let cores = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
-    println!("\n{cores} cores, median of {REPS}, one generic body over R: RawMutex\n");
+    println!("\n{cores} cores, median of {REPS}, nodes of {DEFAULT_INNER_SIZE} entries, ms");
 
-    println!("this crate's shape: RwLock<BTreeMap<T, Arc<Mutex<Node>>>>, {LOOKUPS} lookups");
-    println!("            parking_lot            spin                     spin CPU");
-    println!("  threads    wall      cpu       wall      cpu       null      vs now");
-    for threads in [1, 2, 4, cores, cores * 2, cores * 4] {
-        row(
-            threads,
-            nodes::<parking_lot::RawMutex, parking_lot::RawRwLock>,
-            nodes::<SpinM, SpinR>,
-        );
-    }
+    table(
+        &format!("this crate's shape, {LOOKUPS} lookups over {NODES} nodes"),
+        &[1, 2, 4, cores, cores * 2],
+        NAMES,
+        [nodes_park, nodes_spin, nodes_yield, nodes_bounded, nodes_futex],
+    );
 
-    println!("\none lock, held {HELD_ITERS} iterations, {HOLDS} times per thread");
-    println!("            parking_lot            spin                     spin CPU");
-    println!("  threads    wall      cpu       wall      cpu       null      vs now");
-    for threads in [cores / 2, cores, cores * 2, cores * 8] {
-        row(threads, contended::<parking_lot::RawMutex>, contended::<SpinM>);
-    }
-
-    println!(
-        "\n  The two tables disagree on purpose. Short critical sections favour\n  \
-         spinning; a long one under oversubscription does not, because a spinner\n  \
-         holds the core the lock holder needs. Which row this crate is in is the\n  \
-         question, and the answer is per consumer, which is why the body above is\n  \
-         generic over R rather than naming a lock."
+    table(
+        &format!("one lock, held {HELD_ITERS} iterations, {HOLDS} times per thread"),
+        &[cores / 2, cores, cores * 2, cores * 8],
+        NAMES,
+        [held_park, held_spin, held_yield, held_bounded, held_futex],
     );
 }
