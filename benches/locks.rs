@@ -514,14 +514,21 @@ contended_arm!(
     lock_api::Mutex<spin::mutex::Mutex<(), spin::relax::Yield>, u64>
 );
 contended_arm!(held_bounded, lock_api::Mutex<BoundedMutex, u64>);
-contended_arm!(held_futex, lock_api::Mutex<FutexMutex, u64>);
+// Wired but not in NAMES: this futex arm is a known-broken implementation,
+// kept so nobody writes it a third time. It loses to a spinning lock, which a
+// blocking lock cannot honestly do.
+#[allow(dead_code)]
+mod broken_futex_arm {
+    use super::*;
+    contended_arm!(held_futex, lock_api::Mutex<FutexMutex, u64>);
+    nodes_arm!(nodes_futex, lock_api::Mutex<FutexMutex, Node>);
+}
 contended_arm!(held_wfe, lock_api::Mutex<WfeMutex, u64>);
 
 nodes_arm!(nodes_park, LaPlMx);
 nodes_arm!(nodes_spin, LaSpMx);
 nodes_arm!(nodes_yield, LaYdMx);
 nodes_arm!(nodes_bounded, lock_api::Mutex<BoundedMutex, Node>);
-nodes_arm!(nodes_futex, lock_api::Mutex<FutexMutex, Node>);
 nodes_arm!(nodes_wfe, lock_api::Mutex<WfeMutex, Node>);
 
 /// The same five, named once and used by both tables.
