@@ -27,8 +27,10 @@ libc = "0.2"
 atomic-wait = "1.1"
 # parking_lot is optional in this crate (the `concurrent` feature). The bench
 # measures it against spin regardless of which features the library is built
-# with, so it needs its own unconditional copy.
-parking_lot = { version = "0.12", features = ["arc_lock"] }
+# with, so it needs its own unconditional copy. Named `parking_lot_upstream`
+# because the library's own `parking_lot` is now the no_std fork, and one name
+# cannot mean both: this arm is deliberately the real one, with its std futex.
+parking_lot_upstream = { package = "parking_lot", version = "0.12", features = ["arc_lock"] }
 
 # The crate is a fork of `indexset`, published under a different package name
 # to avoid colliding with upstream on the registry, and consumed everywhere as
@@ -40,29 +42,43 @@ parking_lot = { version = "0.12", features = ["arc_lock"] }
 name = "indexset"
 
 [dependencies]
-serde = { version = "1", optional = true, features = ["derive"] }
-ftree = { version = "1", features = ["serde"] }
-parking_lot = { version = "0.12", features = [
+serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# `ftree` is no_std, but its `serde` feature takes serde with default features,
+# which is `std`. Asking for it unconditionally made every build a std build,
+# so it now arrives with this crate's own `serde` feature and nowhere else.
+ftree = { version = "1", default-features = false }
+# `parking_lot_lite_hack` is parking_lot's `Mutex` and `RwLock` with `std` made
+# optional, kept under the `parking_lot` name because that is what the code
+# says. This crate uses `Mutex`, `RwLock` and `RawMutex` and nothing the fork
+# left behind.
+parking_lot = { package = "parking_lot_lite_hack", version = "0.12.5", default-features = false, features = [
     "send_guard",
     "arc_lock",
 ], optional = true }
-ps-reclaim = { version = "^0.1, >=0.1.3", optional = true }
-fastrand = { version = "2", optional = true }
+ps-reclaim = { version = "^0.1, >=0.1.4", optional = true, default-features = false }
+fastrand = { version = "2", optional = true, default-features = false }
 superslice = { version = "1", optional = true }
 wt-slice = { version = "0.1", optional = true }
 
 [features]
-default = ["wt-slice-binary-search"]
-serde = ["dep:serde"]
+default = ["std", "wt-slice-binary-search"]
+# Off, this crate does not link `std`. What it costs: `superslice` as a search
+# strategy, and `yield_now` in the two publication spin loops, which fall back
+# to a spin because there is no scheduler to yield to.
+std = ["fastrand?/std", "parking_lot?/std", "ps-reclaim?/std", "serde?/std"]
+serde = ["dep:serde", "ftree/serde", "std"]
 concurrent = [
     "dep:parking_lot",
     "dep:ps-reclaim",
+    "ps-reclaim/libc",
+    "ps-reclaim/spin",
 ]
 cdc = ["concurrent"]
 multimap = ["concurrent", "dep:fastrand"]
 custom-binary-search = []
 std-binary-search = []
-superslice-binary-search = ["dep:superslice"]
+# `superslice` is not a no_std crate, so choosing it chooses `std`.
+superslice-binary-search = ["dep:superslice", "std"]
 wt-slice-binary-search = ["dep:wt-slice"]
 
 [package.metadata.docs.rs]

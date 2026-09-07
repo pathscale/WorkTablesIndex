@@ -1,6 +1,6 @@
 use crate::core::node::NodeLike;
+use ::core::marker::PhantomData;
 use parking_lot::{ArcRwLockReadGuard, RawRwLock};
-use std::marker::PhantomData;
 
 /// A point reference that keeps its node read-locked.
 ///

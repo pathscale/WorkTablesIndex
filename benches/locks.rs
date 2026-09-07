@@ -12,9 +12,9 @@
 //!
 //! | arm | what it is |
 //! |---|---|
-//! | `parking_lot` | `parking_lot::Mutex`, named directly. What this crate uses today. |
+//! | `parking_lot` | `parking_lot_upstream::Mutex`, named directly. What this crate uses today. |
 //! | `spin` | `spin::Mutex`, named directly. |
-//! | `lock_api+parking_lot` | `lock_api::Mutex<parking_lot::RawMutex, T>` |
+//! | `lock_api+parking_lot` | `lock_api::Mutex<parking_lot_upstream::RawMutex, T>` |
 //! | `lock_api+spin` | `lock_api::Mutex<spin::Mutex<()>, T>` |
 //!
 //! The two `lock_api` arms are one generic body instantiated twice. That is the
@@ -115,7 +115,7 @@ fn next(rng: &mut u64) -> u64 {
 /// Only the node lock varies. An earlier version changed both at once, which
 /// conflated them: a difference could have come from either, and the two
 /// tables could not be read against each other.
-type IndexLock<M> = parking_lot::RwLock<BTreeMap<u64, Arc<M>>>;
+type IndexLock<M> = parking_lot_upstream::RwLock<BTreeMap<u64, Arc<M>>>;
 
 macro_rules! nodes_arm {
     ($name:ident, $mx:ty) => {
@@ -503,11 +503,11 @@ unsafe impl lock_api::RawMutex for FutexMutex {
     }
 }
 
-type LaPlMx = lock_api::Mutex<parking_lot::RawMutex, Node>;
+type LaPlMx = lock_api::Mutex<parking_lot_upstream::RawMutex, Node>;
 type LaSpMx = lock_api::Mutex<spin::Mutex<()>, Node>;
 type LaYdMx = lock_api::Mutex<spin::mutex::Mutex<(), spin::relax::Yield>, Node>;
 
-contended_arm!(held_park, lock_api::Mutex<parking_lot::RawMutex, u64>);
+contended_arm!(held_park, lock_api::Mutex<parking_lot_upstream::RawMutex, u64>);
 contended_arm!(held_spin, lock_api::Mutex<spin::Mutex<()>, u64>);
 contended_arm!(
     held_yield,

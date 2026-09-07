@@ -1,7 +1,8 @@
 use crate::cdc::change::ChangeEvent;
 use crate::concurrent::set::BTreeSet;
 use crate::core::node::NodeLike;
-use std::fmt::Debug;
+use ::core::fmt::Debug;
+use alloc::vec::Vec;
 
 pub mod ord;
 pub use ord::OrdMultiPair;

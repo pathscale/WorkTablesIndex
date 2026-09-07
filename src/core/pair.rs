@@ -1,7 +1,8 @@
+use ::core::borrow::Borrow;
+use alloc::string::String;
 use core::cmp::Ordering;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::borrow::Borrow;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Default, Clone)]
@@ -39,11 +40,11 @@ where
     }
 }
 
-impl<K, V> std::hash::Hash for Pair<K, V>
+impl<K, V> ::core::hash::Hash for Pair<K, V>
 where
-    K: std::hash::Hash,
+    K: ::core::hash::Hash,
 {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
         self.key.hash(state);
     }
 }

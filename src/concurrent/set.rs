@@ -1,13 +1,17 @@
+use ::core::borrow::Borrow;
+use ::core::fmt::Debug;
+use ::core::iter::FusedIterator;
+use ::core::marker::PhantomData;
+use ::core::ops::{Bound, RangeBounds};
+use ::core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use parking_lot::{
     ArcRwLockReadGuard, ArcRwLockWriteGuard, Mutex, MutexGuard, RawRwLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::Debug;
-use std::iter::FusedIterator;
-use std::marker::PhantomData;
-use std::ops::{Bound, RangeBounds};
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::{borrow::Borrow, sync::Arc};
 
 use crate::cdc::change::ChangeEvent;
 use crate::concurrent::operation::*;
@@ -15,6 +19,19 @@ use crate::core::constants::DEFAULT_INNER_SIZE;
 use crate::core::node::*;
 
 use super::r#ref::Ref;
+
+/// Give the scheduler the core, when there is a scheduler to give it to.
+///
+/// `yield_now` is a `std` call, and a `no_std` build has no thread to yield.
+/// Spinning is the honest fallback there: it is what the caller was already
+/// doing on the fast path, without the syscall that would make it wait longer.
+#[inline]
+fn yield_now() {
+    #[cfg(feature = "std")]
+    std::thread::yield_now();
+    #[cfg(not(feature = "std"))]
+    ::core::hint::spin_loop();
+}
 
 const ROOT_PUBLICATION_SPIN_LIMIT: usize = 16;
 const STABLE_READ_BLOCKING_FALLBACK_AFTER: usize = 2;
@@ -147,7 +164,7 @@ where
         }
         let chunk = Arc::make_mut(&mut self.chunks[chunk_index]);
         match chunk.entries.binary_search_by(|(candidate, _)| candidate.cmp(&key)) {
-            Ok(index) => Some(std::mem::replace(&mut chunk.entries[index].1, node)),
+            Ok(index) => Some(::core::mem::replace(&mut chunk.entries[index].1, node)),
             Err(index) => {
                 chunk.entries.insert(index, (key, node));
                 self.len += 1;
@@ -306,7 +323,7 @@ pub(crate) struct Topology<T, Node> {
     // Writer-only reverse lookup from node identity to its current published
     // route key. This differs from the canonical key only for the last node,
     // whose stale route remains a valid final point-read fallback.
-    published_keys: Mutex<HashMap<usize, T>>,
+    published_keys: Mutex<BTreeMap<usize, T>>,
     published: PublishedIndex<T, Node>,
     // Even values are stable publications; odd values mean a writer may have
     // changed node contents or routing but has not published the new route.
@@ -314,7 +331,7 @@ pub(crate) struct Topology<T, Node> {
 }
 
 impl<T, Node> Debug for Topology<T, Node> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         formatter
             .debug_struct("Topology")
             .field("nodes", &self.index.read().len())
@@ -327,7 +344,7 @@ impl<T, Node> Topology<T, Node> {
     fn new() -> Self {
         Self {
             index: RwLock::new(BTreeMap::new()),
-            published_keys: Mutex::new(HashMap::new()),
+            published_keys: Mutex::new(BTreeMap::new()),
             published: PublishedIndex::new(),
             generation: AtomicU64::new(0),
         }
@@ -403,12 +420,12 @@ where
     // reclamation domain. Range readers should not wait for a registry scan.
     index: Option<RwLockWriteGuard<'a, NodeIndex<T, Node>>>,
     published: Option<PublishedNodeIndex<T, Node>>,
-    published_keys: Option<MutexGuard<'a, HashMap<usize, T>>>,
+    published_keys: Option<MutexGuard<'a, BTreeMap<usize, T>>>,
     publish: bool,
     dirty: bool,
 }
 
-impl<T, Node> std::ops::Deref for TopologyWriteGuard<'_, T, Node>
+impl<T, Node> ::core::ops::Deref for TopologyWriteGuard<'_, T, Node>
 where
     T: Ord + Clone + Send + 'static,
     Node: Send + 'static,
@@ -777,12 +794,12 @@ where
     let mut last_equal = None;
     for entry @ (key, _) in index {
         match <T as Borrow<Q>>::borrow(key).cmp(end) {
-            std::cmp::Ordering::Less => {}
-            std::cmp::Ordering::Equal => last_equal = Some(entry),
+            ::core::cmp::Ordering::Less => {}
+            ::core::cmp::Ordering::Equal => last_equal = Some(entry),
             // The first node whose maximum is above the end may still start
             // with values inside the range. `Range::new` ranks within that
             // node to obtain the first out-of-range sentinel.
-            std::cmp::Ordering::Greater => return Some(entry),
+            ::core::cmp::Ordering::Greater => return Some(entry),
         }
     }
     last_equal.or_else(|| index.last_key_value())
@@ -803,8 +820,8 @@ where
 /// Iterators returned by [`crate::BTreeSet::iter`] produce their items in order, and take worst-case
 /// logarithmic and amortized constant time per item returned.
 ///
-/// [`Cell`]: crate::core::cell::Cell
-/// [`RefCell`]: crate::core::cell::RefCell
+/// [`Cell`]: cratestd::cell::Cell
+/// [`RefCell`]: cratestd::cell::RefCell
 ///
 /// # Examples
 ///
@@ -909,7 +926,7 @@ where
         self
     }
     pub fn attach_node(&self, node: Node) {
-        self.attach_nodes(std::iter::once(node));
+        self.attach_nodes(::core::iter::once(node));
     }
 
     /// Attaches a persisted topology in one structural publication.
@@ -975,7 +992,7 @@ where
                                 break self.index.write();
                             }
                             spins += 1;
-                            std::hint::spin_loop();
+                            ::core::hint::spin_loop();
                         };
                         // Another first writer may have published while this
                         // caller was acquiring the exclusive structural guard.
@@ -1393,9 +1410,9 @@ where
             if !generation.is_multiple_of(2) {
                 if writer_spins < ROOT_PUBLICATION_SPIN_LIMIT {
                     writer_spins += 1;
-                    std::hint::spin_loop();
+                    ::core::hint::spin_loop();
                 } else {
-                    std::thread::yield_now();
+                    yield_now();
                 }
                 continue;
             }
@@ -1480,9 +1497,9 @@ where
             if !generation.is_multiple_of(2) {
                 if writer_spins < ROOT_PUBLICATION_SPIN_LIMIT {
                     writer_spins += 1;
-                    std::hint::spin_loop();
+                    ::core::hint::spin_loop();
                 } else {
-                    std::thread::yield_now();
+                    yield_now();
                 }
                 continue;
             }
@@ -1669,8 +1686,8 @@ where
     Node: NodeLike<T> + Send + 'static,
 {
     tree: &'a BTreeSet<T, Node>,
-    current_front_batch: Option<std::vec::IntoIter<T>>,
-    current_back_batch: Option<std::vec::IntoIter<T>>,
+    current_front_batch: Option<alloc::vec::IntoIter<T>>,
+    current_back_batch: Option<alloc::vec::IntoIter<T>>,
     // Identity of the node the last batch in each direction was cloned from,
     // so the next install can step past it when the cursor lookup lands on
     // it again (its entry key can sit past every element it still holds).
@@ -2361,7 +2378,7 @@ where
                 .remove::<T>(&key)
                 .expect("middle key was collected under the write lock");
             let mut removed_node = node.write_arc();
-            detached_nodes.push(std::mem::take(&mut *removed_node));
+            detached_nodes.push(::core::mem::take(&mut *removed_node));
         }
 
         // Trim the front node from the start position: its maximum goes away,
