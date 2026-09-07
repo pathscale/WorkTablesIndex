@@ -1,5 +1,7 @@
-use std::fmt::Debug;
-use std::sync::Arc;
+use ::core::fmt::Debug;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use parking_lot::RwLock;
 

@@ -1,3 +1,15 @@
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+// The crate does not link `std` unless asked. Tests always do, because a
+// concurrency test is made of threads and clocks; with the `std` feature on,
+// the library links it too, and the only thing it takes from it is
+// `thread::yield_now`.
+#[cfg(any(test, feature = "std"))]
+extern crate std;
+
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(feature = "concurrent")]
 pub mod concurrent;
 
@@ -7,18 +19,18 @@ pub mod cdc;
 pub mod core;
 
 use crate::Entry::{Occupied, Vacant};
+use ::core::borrow::Borrow;
+use ::core::cmp::Ordering;
+use ::core::iter::FusedIterator;
+use ::core::mem::swap;
+use ::core::ops::Bound;
+use ::core::ops::{Index, RangeBounds};
 use core::constants::DEFAULT_INNER_SIZE;
 use core::node::*;
 use core::pair::Pair;
 use ftree::FenwickTree;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::borrow::Borrow;
-use std::cmp::Ordering;
-use std::collections::Bound;
-use std::iter::FusedIterator;
-use std::mem::swap;
-use std::ops::{Index, RangeBounds};
 
 type Node<T> = Vec<T>;
 
@@ -1333,8 +1345,8 @@ where
     current_front_idx: usize,
     current_back_node_idx: usize,
     current_back_idx: usize,
-    current_front_iterator: Option<std::slice::Iter<'a, T>>,
-    current_back_iterator: Option<std::slice::Iter<'a, T>>,
+    current_front_iterator: Option<::core::slice::Iter<'a, T>>,
+    current_back_iterator: Option<::core::slice::Iter<'a, T>>,
 }
 
 impl<'a, T> Iter<'a, T>
@@ -2263,7 +2275,7 @@ where
                 node_idx,
                 position_within_node,
             } => {
-                std::mem::swap(&mut self.set.inner[node_idx][position_within_node].value, &mut value);
+                ::core::mem::swap(&mut self.set.inner[node_idx][position_within_node].value, &mut value);
                 Some(value)
             }
             NodeEntry::Empty { node_idx } => {
@@ -3466,13 +3478,13 @@ pub struct IterMut<'a, K: 'a, V: 'a>
 where
     K: Ord,
 {
-    inner: std::slice::IterMut<'a, Node<Pair<K, V>>>,
+    inner: ::core::slice::IterMut<'a, Node<Pair<K, V>>>,
     current_front_node_idx: usize,
     current_front_idx: usize,
     current_back_node_idx: usize,
     current_back_idx: usize,
-    current_front_iterator: std::slice::IterMut<'a, Pair<K, V>>,
-    current_back_iterator: std::slice::IterMut<'a, Pair<K, V>>,
+    current_front_iterator: ::core::slice::IterMut<'a, Pair<K, V>>,
+    current_back_iterator: ::core::slice::IterMut<'a, Pair<K, V>>,
 }
 
 impl<'a, K, V> Iterator for IterMut<'a, K, V>

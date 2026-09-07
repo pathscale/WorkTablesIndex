@@ -1,5 +1,6 @@
-use std::borrow::Borrow;
-use std::fmt::Debug;
+use ::core::borrow::Borrow;
+use ::core::fmt::Debug;
+use alloc::vec::Vec;
 
 use core::cmp::Ordering;
 #[cfg(feature = "serde")]

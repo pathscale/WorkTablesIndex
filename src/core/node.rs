@@ -1,5 +1,6 @@
+use ::core::ops::Deref;
+use alloc::vec::Vec;
 use core::borrow::Borrow;
-use std::ops::Deref;
 
 pub trait NodeLike<T: Ord> {
     #[allow(dead_code)]
@@ -31,7 +32,7 @@ pub trait NodeLike<T: Ord> {
     where
         T: Borrow<Q>;
     #[allow(dead_code)]
-    fn rank<Q: Ord + ?Sized>(&self, bound: std::ops::Bound<&Q>, from_start: bool) -> Option<usize>
+    fn rank<Q: Ord + ?Sized>(&self, bound: ::core::ops::Bound<&Q>, from_start: bool) -> Option<usize>
     where
         T: Borrow<Q>;
     #[allow(dead_code)]
@@ -52,7 +53,7 @@ pub trait NodeLike<T: Ord> {
     #[allow(dead_code)]
     fn min(&self) -> Option<&T>;
     #[allow(dead_code)]
-    fn iter<'a>(&'a self) -> std::slice::Iter<'a, T>
+    fn iter<'a>(&'a self) -> ::core::slice::Iter<'a, T>
     where
         T: 'a;
 }
@@ -192,26 +193,30 @@ pub(crate) fn search_by<T>(haystack: &[T], mut compare: impl FnMut(&T) -> core::
 }
 
 #[inline]
-fn compute_positions_to_skip<Q, T: Ord>(haystack: &[T], bound: std::ops::Bound<&Q>, forward: bool) -> Option<usize>
+fn compute_positions_to_skip<Q, T: Ord>(haystack: &[T], bound: ::core::ops::Bound<&Q>, forward: bool) -> Option<usize>
 where
     T: Borrow<Q> + Ord,
     Q: Ord + ?Sized,
 {
     let skipped = match (bound, forward) {
         // A forward iterator skips values before the start bound.
-        (std::ops::Bound::Included(value), true) => haystack.partition_point(|item| item.borrow().cmp(value).is_lt()),
-        (std::ops::Bound::Excluded(value), true) => haystack.partition_point(|item| item.borrow().cmp(value).is_le()),
+        (::core::ops::Bound::Included(value), true) => {
+            haystack.partition_point(|item| item.borrow().cmp(value).is_lt())
+        }
+        (::core::ops::Bound::Excluded(value), true) => {
+            haystack.partition_point(|item| item.borrow().cmp(value).is_le())
+        }
 
         // A backward iterator skips values after the end bound.
-        (std::ops::Bound::Included(value), false) => {
+        (::core::ops::Bound::Included(value), false) => {
             let first_greater = haystack.partition_point(|item| item.borrow().cmp(value).is_le());
             haystack.len() - first_greater
         }
-        (std::ops::Bound::Excluded(value), false) => {
+        (::core::ops::Bound::Excluded(value), false) => {
             let first_equal = haystack.partition_point(|item| item.borrow().cmp(value).is_lt());
             haystack.len() - first_equal
         }
-        (std::ops::Bound::Unbounded, _) => return None,
+        (::core::ops::Bound::Unbounded, _) => return None,
     };
 
     // Callers use this as the index of the last value to skip. No skipped
@@ -271,7 +276,7 @@ impl<T: Ord> NodeLike<T> for Vec<T> {
         search(self, value).ok()
     }
     #[inline]
-    fn rank<Q>(&self, bound: std::ops::Bound<&Q>, from_start: bool) -> Option<usize>
+    fn rank<Q>(&self, bound: ::core::ops::Bound<&Q>, from_start: bool) -> Option<usize>
     where
         T: Borrow<Q> + Ord,
         Q: Ord + ?Sized,
@@ -301,7 +306,7 @@ impl<T: Ord> NodeLike<T> for Vec<T> {
     #[inline]
     fn replace(&mut self, idx: usize, value: T) -> Option<T> {
         if let Some(old) = self.get_mut(idx) {
-            let old = std::mem::replace(old, value);
+            let old = ::core::mem::replace(old, value);
             return Some(old);
         }
 
@@ -316,7 +321,7 @@ impl<T: Ord> NodeLike<T> for Vec<T> {
         self.first()
     }
     #[inline]
-    fn iter<'a>(&'a self) -> std::slice::Iter<'a, T>
+    fn iter<'a>(&'a self) -> ::core::slice::Iter<'a, T>
     where
         T: 'a,
     {

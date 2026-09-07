@@ -1,10 +1,9 @@
-use std::fmt::Debug;
-use std::marker::PhantomData;
-use std::{
-    borrow::Borrow,
-    iter::FusedIterator,
-    ops::{Bound, RangeBounds},
-};
+use ::core::borrow::Borrow;
+use ::core::fmt::Debug;
+use ::core::iter::FusedIterator;
+use ::core::marker::PhantomData;
+use ::core::ops::{Bound, RangeBounds};
+use alloc::vec::Vec;
 
 use crate::core::node::NodeLike;
 use crate::{

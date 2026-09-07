@@ -1,5 +1,8 @@
-use std::fmt::{Debug, Display, Formatter};
-use std::{borrow::Borrow, iter::FusedIterator, ops::RangeBounds};
+use ::core::borrow::Borrow;
+use ::core::fmt::{Debug, Display, Formatter};
+use ::core::iter::FusedIterator;
+use ::core::ops::RangeBounds;
+use alloc::vec::Vec;
 
 use super::set::BTreeSet;
 use crate::core::node::NodeLike;
@@ -31,7 +34,7 @@ pub enum TopologyError {
 
 #[cfg(feature = "cdc")]
 impl Display for TopologyError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> ::core::fmt::Result {
         match self {
             Self::ZeroNodeCapacity => formatter.write_str("topology node capacity must be non-zero"),
             Self::EmptyNode { index } => write!(formatter, "topology node {index} is empty"),
@@ -51,7 +54,7 @@ impl Display for TopologyError {
 }
 
 #[cfg(feature = "cdc")]
-impl std::error::Error for TopologyError {}
+impl ::core::error::Error for TopologyError {}
 
 #[derive(Debug)]
 pub struct BTreeMap<K, V, Node = Vec<Pair<K, V>>>
