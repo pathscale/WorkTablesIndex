@@ -4,3 +4,6 @@
 .DS_Store
 .gitignore
 .vscode
+
+# Agent tool state, not part of the crate.
+.agentcoder/
