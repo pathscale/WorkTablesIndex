@@ -12,7 +12,7 @@ readme = "README.md"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-crossbeam-skiplist = "^0.1"
+crossbeam-skiplist = "0.1"
 loom = "0.7"
 rand = "0.9"
 scc = { version = "2.2.5" }
@@ -55,7 +55,7 @@ parking_lot = { package = "parking_lot_lite_hack", version = "0.12.5", default-f
     "send_guard",
     "arc_lock",
 ], optional = true }
-ps-reclaim = { version = "^0.1, >=0.1.4", optional = true, default-features = false }
+ps-reclaim = { version = "0.1.4", optional = true, default-features = false }
 fastrand = { version = "2", optional = true, default-features = false }
 superslice = { version = "1", optional = true }
 wt-slice = { version = "0.1", optional = true }
