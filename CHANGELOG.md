@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.14]
+
+### Fixed
+
+- Windows builds without `std` no longer fail to compile. `concurrent` named
+  `ps-reclaim/libc` in a feature list, and a feature list is not per target, so
+  Windows was handed the unix platform crate and never enabled its own. The
+  choice moves into `cfg(unix)` and `cfg(windows)` dependency sections. Builds
+  with `std` were unaffected, which is why this went unnoticed: `ps-reclaim`
+  only reaches for `windows-sys` on its `no_std` path.
+
 ## [0.0.12]
 
 ### Changed

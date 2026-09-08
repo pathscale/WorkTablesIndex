@@ -1,6 +1,6 @@
 [package]
 name = "WorkTablesIndex"
-version = "0.0.13"
+version = "0.0.14"
 edition = "2021"
 documentation = "https://docs.rs/WorkTablesIndex/"
 repository = "https://github.com/pathscale/WorkTablesIndex"
@@ -55,7 +55,6 @@ parking_lot = { package = "parking_lot_lite_hack", version = "0.12.6", default-f
     "send_guard",
     "arc_lock",
 ], optional = true }
-ps-reclaim = { version = "0.1.4", optional = true, default-features = false }
 fastrand = { version = "2", optional = true, default-features = false }
 superslice = { version = "1", optional = true }
 wt-slice = { version = "0.1", optional = true }
@@ -70,7 +69,6 @@ serde = ["dep:serde", "ftree/serde", "std"]
 concurrent = [
     "dep:parking_lot",
     "dep:ps-reclaim",
-    "ps-reclaim/libc",
     "ps-reclaim/spin",
 ]
 cdc = ["concurrent"]
@@ -143,3 +141,15 @@ while_let_loop = "allow"
 [[bench]]
 name = "locks"
 harness = false
+
+[target."cfg(unix)".dependencies.ps-reclaim]
+version = "^0.1, >=0.1.4"
+features = ["libc"]
+optional = true
+default-features = false
+
+[target."cfg(windows)".dependencies.ps-reclaim]
+version = "^0.1, >=0.1.4"
+features = ["windows-sys"]
+optional = true
+default-features = false
