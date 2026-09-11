@@ -14,10 +14,25 @@ env:
 
 jobs:
   build_test:
+    name: build_test (${{ matrix.name }})
     runs-on: ubicloud-standard-2
-    # A hung test must fail fast, not squat the runner (a livelocking
-    # concurrent test once held a runner for 28+ minutes).
+    # Each configuration keeps the ten-minute hung-job limit. Running all five
+    # serially exceeded it despite completed configurations passing their tests.
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: custom
+            cargo_args: '--no-default-features --features "serde concurrent cdc multimap"'
+          - name: superslice
+            cargo_args: '--no-default-features --features "serde concurrent cdc multimap superslice-binary-search"'
+          - name: hybrid
+            cargo_args: '--features "serde concurrent cdc multimap"'
+          - name: std
+            cargo_args: '--no-default-features --features "serde concurrent cdc multimap std-binary-search"'
+          - name: all-features
+            cargo_args: '--all-features'
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -25,72 +40,20 @@ jobs:
           cache-on-failure: "true"
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Build (custom binary search, all targets)
-        run: cargo build --no-default-features --all-targets --features "serde concurrent cdc multimap"
-      - name: Build (superslice binary search, all targets)
-        run: cargo build --no-default-features --all-targets --features "serde concurrent cdc multimap superslice-binary-search"
-      - name: Build (default wt-slice hybrid binary search, all targets)
-        run: cargo build --all-targets --features "serde concurrent cdc multimap"
-      - name: Build (std binary search, all targets)
-        run: cargo build --no-default-features --all-targets --features "serde concurrent cdc multimap std-binary-search"
-      - name: Build (explicit custom override, all features, all targets)
-        run: cargo build --all-targets --all-features
-      - name: Test (composed search-feature precedence)
+      - name: Build all targets
+        run: cargo build --all-targets ${{ matrix.cargo_args }}
+      - name: Test composed search-feature precedence
+        if: matrix.name == 'all-features'
         run: >
           cargo test --no-default-features
           --features "concurrent custom-binary-search std-binary-search wt-slice-binary-search superslice-binary-search"
           configured_search_implementation_matches_precedence --lib
-      # Doctests are excluded on purpose: upstream doc examples import
-      # `indexset::...`, which is correct for consumers (they alias the
-      # package back to `indexset`) but unresolvable under this crate name.
-      # Fast tier only. The multi-threaded stress tests degrade badly (or
-      # livelock) on 2-core runners - they spawn 8 OS threads over spin-retry
-      # concurrent structures - so they are reserved for the manually
-      # triggered full-suite workflow (heavy.yml), per repo policy: tests
-      # that take too long do not run in automatic CI.
-      - name: Test (fast tier, custom binary search)
+      # Keep the existing fast/stress split. The full-scan regression remains
+      # in every search configuration; none of its assertions are relaxed.
+      # Doctests use the consumer alias indexset and run outside this job.
+      - name: Test fast tier
         run: >
-          cargo test --no-default-features --features "serde concurrent cdc multimap" --lib --tests --
-          --skip test_concurrent_insert
-          --skip test_concurrent_multimap_remove_reinsert_stress
-          --skip test_remove_stress
-          --skip parallel_iter_and_mut
-          --skip test_concurrent_cdc_no_gaps
-          --skip concurrent_first_writers_preserve_disjoint_ranges
-          --skip mixed_structural_and_node_lock_paths_complete_without_deadlock
-      - name: Test (fast tier, superslice binary search)
-        run: >
-          cargo test --no-default-features --features "serde concurrent cdc multimap superslice-binary-search" --lib --tests --
-          --skip test_concurrent_insert
-          --skip test_concurrent_multimap_remove_reinsert_stress
-          --skip test_remove_stress
-          --skip parallel_iter_and_mut
-          --skip test_concurrent_cdc_no_gaps
-          --skip concurrent_first_writers_preserve_disjoint_ranges
-          --skip mixed_structural_and_node_lock_paths_complete_without_deadlock
-      - name: Test (fast tier, default wt-slice hybrid binary search)
-        run: >
-          cargo test --features "serde concurrent cdc multimap" --lib --tests --
-          --skip test_concurrent_insert
-          --skip test_concurrent_multimap_remove_reinsert_stress
-          --skip test_remove_stress
-          --skip parallel_iter_and_mut
-          --skip test_concurrent_cdc_no_gaps
-          --skip concurrent_first_writers_preserve_disjoint_ranges
-          --skip mixed_structural_and_node_lock_paths_complete_without_deadlock
-      - name: Test (fast tier, std binary search)
-        run: >
-          cargo test --no-default-features --features "serde concurrent cdc multimap std-binary-search" --lib --tests --
-          --skip test_concurrent_insert
-          --skip test_concurrent_multimap_remove_reinsert_stress
-          --skip test_remove_stress
-          --skip parallel_iter_and_mut
-          --skip test_concurrent_cdc_no_gaps
-          --skip concurrent_first_writers_preserve_disjoint_ranges
-          --skip mixed_structural_and_node_lock_paths_complete_without_deadlock
-      - name: Test (fast tier, explicit custom override and all features)
-        run: >
-          cargo test --all-features --lib --tests --
+          cargo test ${{ matrix.cargo_args }} --lib --tests --
           --skip test_concurrent_insert
           --skip test_concurrent_multimap_remove_reinsert_stress
           --skip test_remove_stress
