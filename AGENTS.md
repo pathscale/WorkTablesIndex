@@ -12,23 +12,24 @@ pathscale's maintained downstream package of
 [indexset](https://github.com/lucidarium-systems/indexset), published on
 crates.io as `WorkTablesIndex`. It was created to ship the `NodeLike::halve()`
 `len()/2` fix before upstream adopted it. Upstream now carries that fix and its
-regression tests; this package remains the coordinated, exactly pinned source
+regression tests; this package remains the coordinated source
 shared by WorkTable and DataBucket.
 
 Consumers (`worktable`, `data_bucket`) depend on it via a **package alias**:
 
 ```toml
-indexset = { package = "WorkTablesIndex", version = "=0.0.1", features = ["concurrent", "cdc", "multimap"] }
+indexset = { package = "WorkTablesIndex", version = "^0.0, >=0.0.14", features = ["concurrent", "cdc", "multimap"] }
 ```
 
 so every `use indexset::` path in their code keeps working unchanged.
 
 ## Invariants (don't break these)
 
-- **Type identity is load-bearing.** `worktable` and `data_bucket` must always
-  pin the *same exact version* of this crate — two source crates providing the
-  same `Pair`/`ChangeEvent` types cannot coexist in one dependency tree. Any
-  version bump here requires bumping both consumers together.
+- **Use compatible caret requirements, not exact dependency pins.** `worktable`
+  and `data_bucket` must resolve one source/version for shared `Pair` and
+  `ChangeEvent` types. Keep their requirements compatible and verify the resolved
+  graph. For this 0.0.x series, `^0.0, >=0.0.14` allows later 0.0.x fixes while
+  retaining the required API baseline; `^0.0.14` alone excludes 0.0.15.
 - **On-disk geometry coupling.** Changes to node split/merge behaviour change
   WorkTable's space-index golden fixtures
   (`tests/data/expected/space_index/indexset/…` in the WorkTable repo). Ship
@@ -39,7 +40,7 @@ so every `use indexset::` path in their code keeps working unchanged.
   examples.
 - **Publishing to crates.io is irreversible.** Versions can never be reused;
   yanking does not delete. `cargo publish --dry-run` first, publish from the
-  default branch, and remember the exact-pin consumers.
+  default branch, and check the consuming dependency graph.
 
 ## Testing tiers
 

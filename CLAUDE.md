@@ -12,4 +12,4 @@ Claude-specific wiring belongs below.
 - The most common task here is syncing with upstream or shipping a fix that
   WorkTable needs; read the "Invariants" section before touching inherited
   code, and remember every version bump cascades into `worktable` and
-  `data_bucket` exact pins.
+  `data_bucket` compatibility checks.
