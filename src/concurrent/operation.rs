@@ -187,7 +187,7 @@ where
                                 // For any earlier node, publish its new route:
                                 // after a shrink, another insert may fill the
                                 // gap in the following node.
-                                if index.is_last_node(&node) {
+                                if index.can_rekey_last_node_without_publication(&node, &new_max) {
                                     index.rekey_last_node(&old_max, new_max, node.clone());
                                 } else {
                                     index.enable_publication();

@@ -267,6 +267,22 @@ where
     T: Ord + Clone + Send + 'static,
     Node: Send + 'static,
 {
+    /// Checks the final node in the currently published route root.
+    ///
+    /// The caller holds the structural writer lock, so another writer cannot
+    /// unlink `current` while the pointer is inspected. Readers never replace
+    /// the root.
+    fn last_is(&self, node: &Arc<RwLock<Node>>) -> bool {
+        let current = self.current.load(Ordering::Acquire);
+        // SAFETY: the structural writer lock keeps `current` linked for this
+        // call, and the returned references do not escape it.
+        unsafe {
+            (&*current)
+                .last_key_value()
+                .is_some_and(|(_, published)| Arc::ptr_eq(published, node))
+        }
+    }
+
     fn snapshot(&self) -> PublishedNodeIndex<T, Node> {
         let current = self.current.load(Ordering::Acquire);
         // SAFETY: callers hold the only structural writer lock. `current`
@@ -496,6 +512,29 @@ where
             .is_some_and(|(_, candidate)| Arc::ptr_eq(candidate, node))
     }
 
+    /// A last-node boundary may stay unpublished only while the node remains
+    /// last in both route orders. An emptied node can be refilled with a value
+    /// below its predecessor; treating that as an ordinary last-node shrink
+    /// leaves the canonical and published nodes in different orders.
+    pub(crate) fn can_rekey_last_node_without_publication(&self, node: &Arc<RwLock<Node>>, new_key: &T) -> bool {
+        let mut canonical = self
+            .index
+            .as_deref()
+            .expect("topology guard already released")
+            .iter()
+            .rev();
+        let Some((_, last_node)) = canonical.next() else {
+            return false;
+        };
+        if !Arc::ptr_eq(last_node, node) || !self.topology.published.last_is(node) {
+            return false;
+        }
+        match canonical.next() {
+            Some((predecessor, _)) => predecessor < new_key,
+            None => true,
+        }
+    }
+
     /// Re-keys the one route that may safely remain stale for point reads.
     ///
     /// This is deliberately separate from `insert`/`remove`: those general
@@ -528,11 +567,10 @@ where
         self.dirty = true;
     }
 
-    /// Makes the current canonical last-node route exact before attachment
-    /// can place another node after it. This runs once per attach batch, not
-    /// once per node.
-    fn repair_last_route_before_attach(&mut self) {
-        debug_assert!(self.publish, "attachment repair requires publication");
+    /// Makes the current canonical last-node route exact before another route
+    /// can be inserted after it. Attachment calls this once per batch.
+    fn repair_last_route_before_insert(&mut self) {
+        debug_assert!(self.publish, "route insertion repair requires publication");
         let Some((canonical_key, last_node)) = self
             .index
             .as_deref()
@@ -577,6 +615,11 @@ where
     }
 
     pub(crate) fn insert(&mut self, key: T, node: Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+        self.repair_last_route_before_insert();
+        self.insert_after_last_route_repair(key, node)
+    }
+
+    fn insert_after_last_route_repair(&mut self, key: T, node: Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
         debug_assert!(self.publish, "generic topology insertion requires publication");
         let replaced = self
             .index
@@ -942,13 +985,13 @@ where
         }
 
         let mut index = self.index.write();
-        index.repair_last_route_before_attach();
+        index.repair_last_route_before_insert();
         for node in nodes {
             let node_id = node
                 .max()
                 .cloned()
                 .expect("node should contain at least one value to be correct node");
-            index.insert(node_id, Arc::new(RwLock::new(node)));
+            index.insert_after_last_route_repair(node_id, Arc::new(RwLock::new(node)));
         }
     }
 
@@ -2406,6 +2449,7 @@ mod tests {
     use crate::concurrent::operation::Operation;
     use crate::concurrent::set::{BTreeSet, Iter, DEFAULT_INNER_SIZE, INITIAL_BATCH};
     use crate::core::node::NodeLike;
+    use parking_lot::RwLock;
     use rand::Rng;
     use std::collections::HashSet;
     use std::ops::Bound::{self, Included};
@@ -3377,7 +3421,7 @@ mod tests {
         // still commit together when the guard drops.
         {
             let mut index = set.index.write();
-            index.repair_last_route_before_attach();
+            index.repair_last_route_before_insert();
         }
         set.attach_node(vec![5, 20]);
 
@@ -3491,6 +3535,57 @@ mod tests {
             assert_eq!(set.remove(&key), Some(key));
         }
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn last_node_rekey_that_crosses_predecessor_is_published() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(2);
+        set.attach_nodes([vec![0], vec![2], vec![3]]);
+        let node = set.index.read().last_key_value().expect("last node").1.clone();
+
+        // Model the window where the final node is emptied and refilled below
+        // its predecessor before the delayed boundary repair acquires the
+        // structural lock.
+        {
+            let mut values = node.write();
+            NodeLike::delete(&mut *values, &3).expect("seeded value");
+            NodeLike::insert(&mut *values, 1);
+        }
+        Operation::UpdateMax(node, 3)
+            .commit::<false>(&mut set.index.write_rekey(), super::no_identity_adoption)
+            .expect("boundary repair");
+
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+        for value in 0..=2 {
+            assert_eq!(set.get(&value).map(|found| *found.get()), Some(value));
+        }
+    }
+
+    #[test]
+    fn structural_insert_repairs_a_stale_last_route() {
+        let set = BTreeSet::<u64>::with_maximum_node_size(2);
+        set.attach_nodes([vec![0], vec![3]]);
+        let node = set.index.read().last_key_value().expect("last node").1.clone();
+
+        // This ordinary shrink can retain the old final fallback route.
+        {
+            let mut values = node.write();
+            NodeLike::delete(&mut *values, &3).expect("seeded value");
+            NodeLike::insert(&mut *values, 1);
+        }
+        Operation::UpdateMax(node, 3)
+            .commit::<false>(&mut set.index.write_rekey(), super::no_identity_adoption)
+            .expect("boundary repair");
+
+        // Installing a route after that node must first make its published
+        // boundary exact, or the new node sorts before it only in the reader
+        // snapshot.
+        set.index.write().insert(2, Arc::new(RwLock::new(vec![2])));
+
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+        for value in 0..=2 {
+            assert_eq!(set.get(&value).map(|found| *found.get()), Some(value));
+        }
     }
 
     #[test]
