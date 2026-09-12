@@ -51,7 +51,7 @@ ftree = { version = "1", default-features = false }
 # optional, kept under the `parking_lot` name because that is what the code
 # says. This crate uses `Mutex`, `RwLock` and `RawMutex` and nothing the fork
 # left behind.
-parking_lot = { package = "parking_lot_lite_hack", version = "0.12.6", default-features = false, features = [
+parking_lot = { package = "parking_lot_lite_hack", version = "^0.12", default-features = false, features = [
     "send_guard",
     "arc_lock",
 ], optional = true }
