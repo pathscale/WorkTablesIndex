@@ -751,6 +751,7 @@ where
             drop(self.index.take());
             return;
         }
+        let publication_pin = self.topology.published.domain.pin();
         let retired = self.topology.published.replace(
             self.published
                 .take()
@@ -760,7 +761,9 @@ where
         // Garbage bookkeeping and the registry sweep are deliberately outside
         // that odd-generation window.
         self.topology.generation.fetch_add(1, Ordering::Release);
+        ::core::sync::atomic::fence(Ordering::SeqCst);
         self.topology.published.retire(retired);
+        drop(publication_pin);
         drop(self.published_keys.take());
         drop(self.index.take());
         self.topology.published.advance();
@@ -1074,15 +1077,31 @@ where
                 if inserted {
                     #[cfg(feature = "cdc")]
                     if EMIT_CDC {
-                        let node_element_insertion = ChangeEvent::InsertAt {
-                            // is correct as node is locked and current thread is the only that can
-                            // fetch event_id, so events for this node will have monotonic id's.
-                            event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
-                            max_value: old_max.clone().unwrap_or(value.clone()),
-                            value: value.clone(),
-                            index: idx,
-                        };
-                        cdc.push(node_element_insertion);
+                        if let Some(old_max) = old_max.as_ref() {
+                            let node_element_insertion = ChangeEvent::InsertAt {
+                                // is correct as node is locked and current thread is the only that can
+                                // fetch event_id, so events for this node will have monotonic id's.
+                                event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
+                                max_value: old_max.clone(),
+                                value: value.clone(),
+                                index: idx,
+                            };
+                            cdc.push(node_element_insertion);
+                        } else {
+                            // A concurrent remove may have emptied this still-linked node and
+                            // scheduled its unlink. The persisted node is still keyed by the
+                            // route captured above, so represent refill as removing that stale
+                            // persisted node and creating its replacement. An InsertAt keyed by
+                            // the new value cannot find the old route in a CDC consumer.
+                            cdc.push(ChangeEvent::RemoveNode {
+                                event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
+                                max_value: target_node_entry.0.clone(),
+                            });
+                            cdc.push(ChangeEvent::CreateNode {
+                                event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
+                                max_value: value.clone(),
+                            });
+                        }
                     }
 
                     if node_guard.max().cloned() == old_max {
@@ -1164,9 +1183,11 @@ where
                 // the stored value's hidden ordering state before it takes
                 // the stored position (see MultiPairLike::adopt_stored_identity).
                 let mut value = value;
-                if let Some(stored) = node_guard.get_ith(idx) {
-                    adopt(stored, &mut value);
-                }
+                let old_value = node_guard
+                    .get_ith(idx)
+                    .expect("selected position remains locked during replacement")
+                    .clone();
+                adopt(&old_value, &mut value);
                 let mut cdc = vec![];
                 #[cfg(feature = "cdc")]
                 if EMIT_CDC {
@@ -1195,7 +1216,7 @@ where
                             // fetch event_id, so events for this node will have monotonic id's.
                             event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: max.clone(),
-                            value: value.clone(),
+                            value: old_value.clone(),
                             index: idx,
                         };
                         let node_element_insertion = ChangeEvent::InsertAt {
@@ -1213,7 +1234,7 @@ where
                             // fetch event_id, so events for this node will have monotonic id's.
                             event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                             max_value: max.clone(),
-                            value: value.clone(),
+                            value: old_value.clone(),
                             index: idx,
                         };
                         let node_element_insertion = ChangeEvent::InsertAt {
@@ -1449,18 +1470,6 @@ where
         let mut writer_spins = 0;
 
         loop {
-            let generation = self.index.generation.load(Ordering::Acquire);
-            if !generation.is_multiple_of(2) {
-                if writer_spins < ROOT_PUBLICATION_SPIN_LIMIT {
-                    writer_spins += 1;
-                    ::core::hint::spin_loop();
-                } else {
-                    yield_now();
-                }
-                continue;
-            }
-            writer_spins = 0;
-
             if retries >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
                 // Bounded progress fallback: hold the canonical topology read
                 // guard while acquiring the node. Structural writers follow
@@ -1477,6 +1486,19 @@ where
                 drop(index);
                 return Some(node_guard);
             }
+
+            let generation = self.index.generation.load(Ordering::Acquire);
+            if !generation.is_multiple_of(2) {
+                retries += 1;
+                if writer_spins < ROOT_PUBLICATION_SPIN_LIMIT {
+                    writer_spins += 1;
+                    ::core::hint::spin_loop();
+                } else {
+                    yield_now();
+                }
+                continue;
+            }
+            writer_spins = 0;
 
             let pin = self.index.published.domain.pin();
             let snapshot = self.index.published.current.load(Ordering::Acquire);
@@ -1536,18 +1558,6 @@ where
         let mut read = Some(read);
 
         loop {
-            let generation = self.index.generation.load(Ordering::Acquire);
-            if !generation.is_multiple_of(2) {
-                if writer_spins < ROOT_PUBLICATION_SPIN_LIMIT {
-                    writer_spins += 1;
-                    ::core::hint::spin_loop();
-                } else {
-                    yield_now();
-                }
-                continue;
-            }
-            writer_spins = 0;
-
             if retries >= STABLE_READ_BLOCKING_FALLBACK_AFTER {
                 let index = self.index.read();
                 let node = first_for_borrowed_bound(&index, Bound::Included(value), self.borrow_order_matches)
@@ -1557,10 +1567,21 @@ where
                 let node_guard = node.read_arc();
                 drop(index);
                 let position = node_guard.try_select(value)?;
-                return node_guard
-                    .get_ith(position)
-                    .map(read.take().expect("read closure is consumed only on return"));
+                return node_guard.get_ith(position).map(read.take()?);
             }
+
+            let generation = self.index.generation.load(Ordering::Acquire);
+            if !generation.is_multiple_of(2) {
+                retries += 1;
+                if writer_spins < ROOT_PUBLICATION_SPIN_LIMIT {
+                    writer_spins += 1;
+                    ::core::hint::spin_loop();
+                } else {
+                    yield_now();
+                }
+                continue;
+            }
+            writer_spins = 0;
 
             let pin = self.index.published.domain.pin();
             let snapshot = self.index.published.current.load(Ordering::Acquire);
@@ -2446,6 +2467,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cdc")]
+    use crate::cdc::change::ChangeEvent;
     use crate::concurrent::operation::Operation;
     use crate::concurrent::set::{BTreeSet, Iter, DEFAULT_INNER_SIZE, INITIAL_BATCH};
     use crate::core::node::NodeLike;
@@ -3252,6 +3275,31 @@ mod tests {
             assert_eq!(set.remove(&value), Some(value));
             assert!(set.is_empty());
         }
+    }
+
+    #[cfg(feature = "cdc")]
+    #[test]
+    fn refill_of_drained_node_emits_remove_and_create_for_cdc() {
+        let set = BTreeSet::<u64>::new();
+        for seeded in [10u64, 20, 30] {
+            set.insert(seeded);
+        }
+        let pending_unlink = drain_node_with_pending_unlink(&set, &[10, 20, 30], 30);
+
+        let (old, events) = set.put_cdc(15);
+        assert!(old.is_none());
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], ChangeEvent::RemoveNode { max_value: 30, .. }));
+        assert!(matches!(&events[1], ChangeEvent::CreateNode { max_value: 15, .. }));
+        assert_eq!(events[1].id().inner(), events[0].id().inner() + 1);
+
+        // The insert repairs the route before the stale unlink commits. The
+        // stale operation must neither remove the refilled node nor duplicate
+        // its CDC pair.
+        assert!(pending_unlink
+            .commit::<true>(&mut set.index.write(), super::no_identity_adoption)
+            .is_err());
+        assert!(set.contains(&15));
     }
 
     #[test]

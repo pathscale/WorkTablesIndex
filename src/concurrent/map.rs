@@ -1006,6 +1006,32 @@ mod tests {
 
     #[cfg(feature = "cdc")]
     #[test]
+    fn replacing_a_value_reports_the_stored_value_in_cdc_removal() {
+        let map = BTreeMap::<usize, String>::new();
+        map.insert(1, "old".to_owned());
+        map.insert(2, "unchanged".to_owned());
+
+        let (old, events) = map.insert_cdc(1, "new".to_owned());
+        assert_eq!(old.as_deref(), Some("old"));
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            ChangeEvent::RemoveAt { value, .. } => {
+                assert_eq!(value.key, 1);
+                assert_eq!(value.value, "old");
+            }
+            event => panic!("expected removal of stored value, got {event:?}"),
+        }
+        match &events[1] {
+            ChangeEvent::InsertAt { value, .. } => {
+                assert_eq!(value.key, 1);
+                assert_eq!(value.value, "new");
+            }
+            event => panic!("expected insertion of new value, got {event:?}"),
+        }
+    }
+
+    #[cfg(feature = "cdc")]
+    #[test]
     fn test_cdc_remove_monotonicity() {
         let map = BTreeMap::<usize, String>::new();
         let mut all_events = Vec::new();
