@@ -12,13 +12,13 @@ The queued fix serialized every removal with the topology write lock. That
 would put a global exclusive lock on the ordinary remove path, including
 removals that leave their node nonempty. It was not integrated as written.
 
-Instead, inserting into a still-linked empty node now emits `RemoveNode` for
-the stale persisted route followed by `CreateNode` for the new one. The event
-consumer keys `InsertAt` by the node's current maximum, which cannot find this
-still-stale route; the remove/create pair models the refill without serializing
-all removals. The focused regression drains a node, refills it before the
-pending unlink commits, checks both events and their order, and then verifies
-the delayed unlink re-keys rather than removing the node.
+The intermediate refill event fix was superseded in 0.0.16: a routing pair can
+retain an obsolete payload after singleton replacement. Final singleton deletion
+now reroutes under topology write, emits the actual deleted member, and unlinks
+before refill can proceed. Non-final deletion keeps its ordinary read-lock path.
+A deterministic regression checks payload identity, refill exclusion and event
+ordering. Legacy split-phase fixtures remain test-only. A downstream cold-reopen
+regression covers empty-table storage reuse and both deletion APIs.
 
 ### Replace-in-place CDC payload
 

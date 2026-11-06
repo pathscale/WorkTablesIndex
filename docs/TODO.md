@@ -11,10 +11,10 @@
 
 ## Resolved queue findings
 
-- [x] CDC refill of a still-linked empty node now emits removal of the stale
-  persisted node followed by creation of the refilled node. This avoids taking
-  the global topology write lock for every removal. A focused regression covers
-  the event sequence.
+- [x] Final singleton deletion revalidates and unlinks under topology write,
+  emitting the actual deleted member before concurrent refill can proceed.
+  Ordinary non-final removals retain their read-lock path. Payload and
+  deterministic refill-order regressions cover this correction.
 - [x] Replace-in-place CDC removal carries the value actually stored before
   replacement, including its value payload; focused regression covers a map
   replacement within a multi-entry node.
