@@ -2,6 +2,12 @@
 
 ## Open review items
 
+- [x] Implement the [manifest-driven Cargo publishing contract](cargo-publishing.md)
+  for this crate: manual-only, exact reviewed commit, explicit registry
+  eligibility, and registry errors distinguished from an absent version.
+  Static review and ten mocked success/refusal scenarios passed; no live
+  publication or workflow dispatch was performed for this change.
+
 - [ ] Define the compatible serde representation for tree invariants, then
   validate deserialized trees before exposing them to concurrent operations.
 - [ ] Review registry publish action references, token scope, and release inputs;
