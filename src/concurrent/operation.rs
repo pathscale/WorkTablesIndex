@@ -15,7 +15,8 @@ type CurrentVersion<Node> = Arc<RwLock<Node>>;
 pub enum Operation<T: Send + Ord, Node: NodeLike<T>> {
     Split(OldVersion<Node>, T, T),
     UpdateMax(CurrentVersion<Node>, T),
-    MakeUnreachable(CurrentVersion<Node>, T),
+    #[cfg(test)]
+    MakeUnreachable(CurrentVersion<Node>, T, T),
 }
 
 impl<T, Node> Operation<T, Node>
@@ -148,36 +149,11 @@ where
                 let guard = node.write_arc();
                 if let Some(entry) = index.get(&old_max) {
                     if Arc::ptr_eq(entry, &node) {
-                        let mut cdc = vec![];
-                        return Ok(match guard.max() {
-                            // The node was drained by a concurrent remove
-                            // after this repair was scheduled. Returning
-                            // without unlinking would leave a stale entry
-                            // pointing at an empty node: a routing black hole
-                            // whose pending `MakeUnreachable` (addressed by
-                            // the node's drained maximum, not this entry key)
-                            // can never remove it. Unlink it here; a racing
-                            // refill either completed before this commit (the
-                            // maximum is visible under the node lock) or will
-                            // route after it and no longer see this entry.
-                            None => {
-                                #[cfg(feature = "cdc")]
-                                if EMIT_CDC {
-                                    let node_removal = ChangeEventUnassigned::RemoveNode {
-                                        max_value: old_max.clone(),
-                                    };
-                                    cdc.push(node_removal);
-                                }
-                                // An UpdateMax is normally a route-preserving
-                                // rekey and skips publication. A racing drain
-                                // changes it into a true node removal, so opt
-                                // this guard back into publication before the
-                                // canonical entry is unlinked.
-                                index.enable_publication();
-                                index.remove(&old_max);
-
-                                (None, cdc)
-                            }
+                        return match guard.max() {
+                            // A real final delete unlinks under the topology write
+                            // guard. Only a synthetic pending unlink can still
+                            // expose an empty entry. Its unlink owns the identity.
+                            None => Err(()),
                             // Re-key the entry to the node's current maximum,
                             // in either direction.
                             Some(new_max) if *new_max != old_max => {
@@ -195,19 +171,22 @@ where
                                     index.insert(new_max, node.clone());
                                 }
 
-                                (None, cdc)
+                                Ok((None, vec![]))
                             }
                             // The entry key already matches the maximum.
-                            _ => (None, cdc),
-                        });
+                            _ => Ok((None, vec![])),
+                        };
                     }
                 }
 
                 Err(())
             }
-            Operation::MakeUnreachable(node, old_max) => {
+            #[cfg(test)]
+            Operation::MakeUnreachable(node, routing_key, removed_value) => {
+                #[cfg(not(feature = "cdc"))]
+                let _ = removed_value;
                 let guard = node.write_arc();
-                if let Some(entry) = index.get(&old_max) {
+                if let Some(entry) = index.get(&routing_key) {
                     if Arc::ptr_eq(entry, &node) {
                         return match guard.max() {
                             // Still empty: unlink the node as requested.
@@ -217,11 +196,11 @@ where
                                 #[cfg(feature = "cdc")]
                                 if EMIT_CDC {
                                     let node_removal = ChangeEventUnassigned::RemoveNode {
-                                        max_value: old_max.clone(),
+                                        max_value: removed_value,
                                     };
                                     cdc.push(node_removal);
                                 }
-                                index.remove(&old_max);
+                                index.remove(&routing_key);
 
                                 Ok((None, cdc))
                             }
@@ -230,9 +209,9 @@ where
                             // Unlinking would silently drop the acknowledged
                             // insert, so re-key the entry to the fresh maximum
                             // instead (in either direction).
-                            Some(new_max) if *new_max != old_max => {
+                            Some(new_max) if *new_max != routing_key => {
                                 let new_max = new_max.clone();
-                                index.remove(&old_max);
+                                index.remove(&routing_key);
                                 index.insert(new_max, node.clone());
 
                                 Ok((None, vec![]))

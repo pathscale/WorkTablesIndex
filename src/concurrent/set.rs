@@ -1087,12 +1087,11 @@ where
                                 index: idx,
                             };
                             cdc.push(node_element_insertion);
-                        } else {
-                            // A concurrent remove may have emptied this still-linked node and
-                            // scheduled its unlink. The persisted node is still keyed by the
-                            // route captured above, so represent refill as removing that stale
-                            // persisted node and creating its replacement. An InsertAt keyed by
-                            // the new value cannot find the old route in a CDC consumer.
+                        }
+                        #[cfg(test)]
+                        if old_max.is_none() {
+                            // Compatibility for synthetic pending-unlink fixtures.
+                            // Real singleton deletes unlink before a writer can refill.
                             cdc.push(ChangeEvent::RemoveNode {
                                 event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
                                 max_value: target_node_entry.0.clone(),
@@ -1108,17 +1107,9 @@ where
                         return Ok((None, cdc));
                     }
 
-                    // The node's maximum changed, so its index entry must be
-                    // re-keyed. Address the repair by the entry's CURRENT key,
-                    // not the observed maximum: during a stale-key window (a
-                    // concurrent writer changed the maximum but its own repair
-                    // has not committed, or a remove emptied the node before
-                    // this insert refilled it, leaving `old_max` as `None`)
-                    // the two differ, and a repair addressed by the maximum
-                    // misses the entry at commit time and is silently dropped,
-                    // leaving the entry permanently stale (unreachable values,
-                    // and a pending `MakeUnreachable` could unlink the node
-                    // containing this acknowledged insert).
+                    // A concurrent writer may have changed the maximum
+                    // without committing its repair. Use the current route
+                    // to find this node even when its maximum differs.
                     operation = Some(Operation::UpdateMax(
                         target_node_entry.1.clone(),
                         target_node_entry.0.clone(),
@@ -1140,7 +1131,9 @@ where
             let op = operation.unwrap();
             let mut index = match &op {
                 Operation::UpdateMax(_, _) => self.index.write_rekey(),
-                Operation::Split(_, _, _) | Operation::MakeUnreachable(_, _) => self.index.write(),
+                Operation::Split(_, _, _) => self.index.write(),
+                #[cfg(test)]
+                Operation::MakeUnreachable(_, _, _) => unreachable!(),
             };
             match &op {
                 Operation::Split(_, _, _) => {
@@ -1171,7 +1164,8 @@ where
                         Ok((None, cdc))
                     }
                 }
-                Operation::MakeUnreachable(_, _) => unreachable!(),
+                #[cfg(test)]
+                Operation::MakeUnreachable(_, _, _) => unreachable!(),
             }
         }
     }
@@ -1318,83 +1312,85 @@ where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut cdc = vec![];
-        let index = self.index.read();
-        // Fall back to the last node when the value sorts above every index
-        // key, exactly like `put` and `lock_node_for_value`: during a stale-key
-        // window (a node whose maximum grew before its UpdateMax repair
-        // committed) the value lives in the last node even though no index key
-        // covers it. Without the fallback such a value is un-removable while
-        // `contains` still finds it.
-        if let Some(target_node_entry) =
-            first_for_borrowed_bound(&index, Bound::Included(value), self.borrow_order_matches)
-                .or_else(|| index.last_key_value())
-        {
-            let mut node_guard = target_node_entry.1.clone().write_arc();
-            let old_max = node_guard.max().cloned();
-            let deleted = NodeLike::delete(&mut *node_guard, value);
-            if deleted.is_none() {
-                return (None, cdc);
-            }
-            let (deleted, idx) = deleted.expect("should be ok as checked before");
+        loop {
+            let index = self.index.read();
+            // A delayed maximum repair can leave a value above the last route.
+            let Some((routing_key, node)) =
+                first_for_borrowed_bound(&index, Bound::Included(value), self.borrow_order_matches)
+                    .or_else(|| index.last_key_value())
+            else {
+                return (None, vec![]);
+            };
+            let mut node_guard = node.clone().write_arc();
+            if node_guard.len() <= 1 {
+                if !node_guard.contains(value) {
+                    return (None, vec![]);
+                }
 
-            let operation = if node_guard.len() > 0 {
+                // Release both guards before taking the topology write lock.
+                // Re-route under that lock because the candidate may have moved,
+                // grown, or been replaced while the guards were released.
+                drop(node_guard);
+                drop(index);
+                let mut index = self.index.write();
+                let Some((routing_key, node)) =
+                    first_for_borrowed_bound(&index, Bound::Included(value), self.borrow_order_matches)
+                        .or_else(|| index.last_key_value())
+                else {
+                    return (None, vec![]);
+                };
+                let mut node_guard = node.clone().write_arc();
+                if node_guard.len() > 1 {
+                    continue;
+                }
+                let routing_key = routing_key.clone();
+                let Some((deleted, _)) = NodeLike::delete(&mut *node_guard, value) else {
+                    return (None, vec![]);
+                };
+                index.remove::<T>(&routing_key);
+
                 #[cfg(feature = "cdc")]
-                if EMIT_CDC {
-                    let node_element_removal = ChangeEvent::RemoveAt {
-                        // is correct as node is locked and current thread is the only that can
-                        // fetch event_id, so events for this node will have monotonic id's.
+                let cdc = if EMIT_CDC {
+                    vec![ChangeEvent::RemoveNode {
                         event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
-                        max_value: old_max.clone().expect("Max value should exist as Node is not empty"),
-                        value: deleted.clone(),
-                        index: idx,
-                    };
-                    cdc.push(node_element_removal);
-                }
+                        max_value: deleted.clone(),
+                    }]
+                } else {
+                    vec![]
+                };
+                #[cfg(not(feature = "cdc"))]
+                let cdc = vec![];
 
-                if old_max.as_ref() == node_guard.max() {
-                    return (Some(deleted), cdc);
-                }
+                return (Some(deleted), cdc);
+            }
 
-                // Address the repair by the entry's current key, not by the
-                // observed old maximum: see `put_checked_inner`. In a
-                // stale-key window they differ, and a repair addressed by the
-                // maximum is dropped at commit time, leaving the entry stale.
-                Some(Operation::UpdateMax(
-                    target_node_entry.1.clone(),
-                    target_node_entry.0.clone(),
-                ))
+            let old_max = node_guard.max().cloned();
+            let Some((deleted, idx)) = NodeLike::delete(&mut *node_guard, value) else {
+                return (None, vec![]);
+            };
+
+            #[cfg(feature = "cdc")]
+            let cdc = if EMIT_CDC {
+                vec![ChangeEvent::RemoveAt {
+                    event_id: self.event_id.fetch_add(1, Ordering::Relaxed).into(),
+                    max_value: old_max.clone().expect("node was nonempty before removal"),
+                    value: deleted.clone(),
+                    index: idx,
+                }]
             } else {
-                Some(Operation::MakeUnreachable(
-                    target_node_entry.1.clone(),
-                    target_node_entry.0.clone(),
-                ))
+                vec![]
             };
+            #[cfg(not(feature = "cdc"))]
+            let (cdc, _) = (vec![], idx);
 
-            drop(node_guard);
-            drop(index);
-
-            let operation = operation.unwrap();
-            let mut index = match &operation {
-                Operation::UpdateMax(_, _) => self.index.write_rekey(),
-                Operation::Split(_, _, _) | Operation::MakeUnreachable(_, _) => self.index.write(),
-            };
-
-            return if let Ok((_, value_cdc)) = operation.commit::<EMIT_CDC>(&mut index, no_identity_adoption) {
-                #[cfg(feature = "cdc")]
-                if EMIT_CDC {
-                    for unassigned_event in value_cdc {
-                        let event_id = self.event_id.fetch_add(1, Ordering::Relaxed).into();
-                        cdc.push(unassigned_event.assign_id(event_id));
-                    }
-                }
-                (Some(deleted), cdc)
-            } else {
-                (Some(deleted), cdc)
-            };
+            if old_max.as_ref() != node_guard.max() {
+                let repair = Operation::UpdateMax(node.clone(), routing_key.clone());
+                drop(node_guard);
+                drop(index);
+                let _ = repair.commit::<false>(&mut self.index.write_rekey(), no_identity_adoption);
+            }
+            return (Some(deleted), cdc);
         }
-
-        (None, vec![])
     }
 
     pub fn remove_cdc<Q>(&self, value: &Q) -> (Option<T>, Vec<ChangeEvent<T>>)
@@ -3142,18 +3138,23 @@ mod tests {
         assert_eq!(set.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
-    // Simulates the first phase of a remove that empties a node: the elements
-    // are deleted under the node lock, leaving the index entry with a stale
-    // key, and the caller receives the not-yet-committed MakeUnreachable.
+    // Models the legacy split-phase drain, with an empty node left linked
+    // until the synthetic MakeUnreachable commits.
     fn drain_node_with_pending_unlink(set: &BTreeSet<u64>, values: &[u64], stale_key: u64) -> Operation<u64, Vec<u64>> {
         let node = set.index.read().last_key_value().expect("node must exist").1.clone();
-        {
+        let last_removed = {
             let mut guard = node.write();
+            let mut last_removed = None;
             for value in values {
-                NodeLike::delete(&mut *guard, value).expect("seeded value must be present");
+                last_removed = Some(
+                    NodeLike::delete(&mut *guard, value)
+                        .expect("seeded value must be present")
+                        .0,
+                );
             }
-        }
-        Operation::MakeUnreachable(node, stale_key)
+            last_removed.expect("at least one value must be drained")
+        };
+        Operation::MakeUnreachable(node, stale_key, last_removed)
     }
 
     #[test]
@@ -3300,6 +3301,97 @@ mod tests {
             .commit::<true>(&mut set.index.write(), super::no_identity_adoption)
             .is_err());
         assert!(set.contains(&15));
+    }
+
+    #[cfg(feature = "cdc")]
+    #[test]
+    fn singleton_pair_delete_excludes_refill_until_remove_node_is_ordered() {
+        use crate::core::pair::Pair;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct Probe {
+            armed: AtomicBool,
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+
+        #[derive(Debug)]
+        struct Payload(u64, Option<Arc<Probe>>);
+
+        impl Clone for Payload {
+            fn clone(&self) -> Self {
+                if let Some(probe) = &self.1 {
+                    if probe.armed.swap(false, Ordering::Relaxed) {
+                        probe.entered.send(()).unwrap();
+                        probe
+                            .resume
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                    }
+                }
+                Self(self.0, self.1.clone())
+            }
+        }
+
+        let set = BTreeSet::<Pair<u64, Payload>>::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let probe = Arc::new(Probe {
+            armed: AtomicBool::new(false),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        });
+        set.put_cdc(Pair {
+            key: 22,
+            value: Payload(1, None),
+        });
+        set.put_cdc(Pair {
+            key: 22,
+            value: Payload(2, Some(probe.clone())),
+        });
+        let (route, old_node) = {
+            let index = set.index.read();
+            let (route, node) = index.first_key_value().unwrap();
+            (route.clone(), node.clone())
+        };
+        assert_eq!(route.value.0, 1);
+        let pending_rekey = Operation::UpdateMax(old_node.clone(), route);
+        probe.armed.store(true, Ordering::Relaxed);
+
+        let (removed, remove_events, refill_events) = thread::scope(|scope| {
+            let delete = scope.spawn(|| set.remove_cdc(&22u64));
+            // Cloning the deleted payload pauses CDC construction. A refill
+            // needs a topology read guard, which must be excluded here.
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let refill_blocked = set.index.index.try_read().is_none();
+            resume_tx.send(()).unwrap();
+            let (_, refill_events) = set.put_cdc(Pair {
+                key: 22,
+                value: Payload(3, None),
+            });
+            let (removed, remove_events) = delete.join().unwrap();
+            assert!(refill_blocked);
+            (removed, remove_events, refill_events)
+        });
+
+        assert_eq!(removed.map(|pair| (pair.key, pair.value.0)), Some((22, 2)));
+        let [ChangeEvent::RemoveNode { max_value: removed, .. }] = remove_events.as_slice() else {
+            panic!("expected one RemoveNode, got {remove_events:?}");
+        };
+        let [ChangeEvent::CreateNode { max_value: created, .. }] = refill_events.as_slice() else {
+            panic!("expected one CreateNode, got {refill_events:?}");
+        };
+        assert_eq!((removed.key, removed.value.0), (22, 2));
+        assert_eq!((created.key, created.value.0), (22, 3));
+        assert_eq!(refill_events[0].id().inner(), remove_events[0].id().inner() + 1);
+        assert!(pending_rekey
+            .commit::<true>(&mut set.index.write_rekey(), super::no_identity_adoption)
+            .is_err());
+        let index = set.index.read();
+        assert!(!Arc::ptr_eq(index.first_key_value().unwrap().1, &old_node));
     }
 
     #[test]
@@ -3529,7 +3621,7 @@ mod tests {
         const ITERATIONS: u64 = 1_000;
 
         // Tiny nodes over adjacent keys: removes empty nodes constantly, so
-        // inserts keep racing pending MakeUnreachable repairs.
+        // inserts keep racing singleton removals.
         let set = Arc::new(BTreeSet::<u64>::with_maximum_node_size(2));
         for key in 0..THREADS {
             set.insert(key);
