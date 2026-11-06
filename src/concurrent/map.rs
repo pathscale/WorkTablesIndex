@@ -654,6 +654,30 @@ mod tests {
         assert_eq!(error, TopologyError::OverlappingNodes { left: 0, right: 1 });
     }
 
+    #[cfg(feature = "cdc")]
+    #[test]
+    fn remove_node_cdc_reports_the_actual_singleton_member_after_replacements() {
+        let map = BTreeMap::<u64, u64>::new();
+        assert_eq!(map.insert_cdc(22, 1).0, None);
+        assert_eq!(map.insert_cdc(22, 2).0, Some(1));
+        assert_eq!(map.insert_cdc(22, 3).0, Some(2));
+
+        let (removed, events) = map.remove_cdc(&22);
+        assert_eq!(removed, Some((22, 3)));
+
+        let removed_member = events
+            .iter()
+            .find_map(|event| match event {
+                ChangeEvent::RemoveNode { max_value, .. } => Some(max_value),
+                _ => None,
+            })
+            .expect("removing the singleton must emit RemoveNode");
+        // Pair equality intentionally compares only keys, so check the value
+        // explicitly to catch a stale routing pair from before replacement.
+        assert_eq!(removed_member.key, 22);
+        assert_eq!(removed_member.value, 3);
+    }
+
     #[test]
     fn test_range_edge_cast() {
         let maximum_node_size = 3;

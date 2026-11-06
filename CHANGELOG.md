@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.16]
+
+### Fixed
+
+- Final deletion of a replaced singleton now emits the stored member's CDC
+  identity and unlinks the node atomically with respect to concurrent refill.
+  Persisted consumers no longer retain an obsolete primary-index entry after
+  the table becomes empty and its row storage is reused.
+
 ## [0.0.14]
 
 ### Fixed
