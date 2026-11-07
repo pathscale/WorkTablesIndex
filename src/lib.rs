@@ -89,7 +89,7 @@ type Node<T> = Vec<T>;
 ///
 /// let set = BTreeSet::from_iter([1, 2, 3]);
 /// ```
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct BTreeSet<T>
 where
@@ -99,6 +99,73 @@ where
     index: FenwickTree<usize>,
     node_capacity: usize,
     len: usize,
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: Ord + Deserialize<'de>> Deserialize<'de> for BTreeSet<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        #[derive(Deserialize)]
+        #[serde(rename = "BTreeSet")]
+        struct Repr<T> {
+            inner: Vec<Node<T>>,
+            index: FenwickTree<usize>,
+            node_capacity: usize,
+            len: usize,
+        }
+
+        let Repr {
+            mut inner,
+            mut index,
+            node_capacity,
+            len,
+        } = Repr::<T>::deserialize(deserializer)?;
+
+        if ::core::alloc::Layout::array::<T>(node_capacity).is_err() {
+            return Err(D::Error::custom("invalid tree node capacity"));
+        }
+        if inner.is_empty() {
+            return Err(D::Error::custom("invalid tree node layout"));
+        }
+        if !inner
+            .iter()
+            .flatten()
+            .is_sorted_by(|left, right| left.cmp(right).is_lt())
+        {
+            return Err(D::Error::custom("tree elements must be strictly increasing"));
+        }
+
+        let lengths = inner.iter().map(Vec::len);
+        if lengths.clone().try_fold(0usize, usize::checked_add) != Some(len) {
+            return Err(D::Error::custom("tree length does not match node lengths"));
+        }
+        if index != FenwickTree::from_iter(lengths) {
+            return Err(D::Error::custom("tree index does not match node lengths"));
+        }
+
+        // Legacy splits could leave empty nodes. Validate the original index before
+        // repairing those layouts.
+        let node_count = inner.len();
+        if len == 0 {
+            inner.truncate(1);
+        } else {
+            inner.retain(|node| !node.is_empty());
+        }
+        if inner.len() != node_count {
+            index = FenwickTree::from_iter(inner.iter().map(Vec::len));
+        }
+
+        Ok(Self {
+            inner,
+            index,
+            node_capacity,
+            len,
+        })
+    }
 }
 
 enum NodeEntry {
@@ -131,7 +198,8 @@ impl<T: Ord> BTreeSet<T> {
         Self { ..Default::default() }
     }
     /// Makes a new, empty `BTreeSet` with the given maximum node size. Allocates one vec with
-    /// the capacity set to be the specified node size.
+    /// the capacity set to be the specified node size. Insertion uses a split threshold of
+    /// at least two so that a split leaves elements in both nodes.
     ///
     /// # Examples
     ///
@@ -160,7 +228,7 @@ impl<T: Ord> BTreeSet<T> {
     /// assert!(v.is_empty());
     /// ```
     pub fn clear(&mut self) {
-        self.inner = vec![Node::with_capacity(self.node_capacity)];
+        self.inner = vec![Node::new()];
         self.index = FenwickTree::from_iter(vec![0]);
         self.len = 0;
     }
@@ -350,7 +418,7 @@ impl<T: Ord> BTreeSet<T> {
         self.len
     }
     fn insert_at(&mut self, node_idx: usize, value: T) -> bool {
-        if self.inner[node_idx].len() == self.node_capacity {
+        if self.inner[node_idx].len() == self.node_capacity.max(2) {
             let new_node = self.inner[node_idx].halve();
             let mut insert_node_idx = node_idx;
             if value >= new_node[0] {
@@ -2517,7 +2585,8 @@ where
         Self { ..Default::default() }
     }
     /// Makes a new, empty `BTreeSet` with the given maximum node size. Allocates one vec with
-    /// the capacity set to be the specified node size.
+    /// the capacity set to be the specified node size. Insertion uses a split threshold of
+    /// at least two so that a split leaves elements in both nodes.
     ///
     /// # Examples
     ///
