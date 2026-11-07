@@ -17,6 +17,7 @@ crossbeam-skiplist = "0.1"
 loom = "0.7"
 rand = "0.9"
 scc = { version = "2.2.5" }
+serde_json = "1"
 uuid = { version = "1.17.0", features = ["v7"]}
 # For benches/locks.rs, which prices this crate's lock choice. `lock_api` is the
 # layer both parking_lot and spin are built on, so one generic body measures
