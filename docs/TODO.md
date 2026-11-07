@@ -17,6 +17,11 @@
 
 ## Resolved queue findings
 
+- [x] Both publisher cleanliness probes reject Git failures, including empty
+  output. The registry probe ignores implicit curl configuration and rejects
+  redirects instead of classifying their destinations. Thirteen offline
+  command-double scenarios, shell syntax and diff checks passed for 4678cc6;
+  no registry publication or workflow dispatch was performed.
 - [x] Final singleton deletion revalidates and unlinks under topology write,
   emitting the actual deleted member before concurrent refill can proceed.
   Ordinary non-final removals retain their read-lock path. Payload and
