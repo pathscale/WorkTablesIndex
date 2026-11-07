@@ -6,6 +6,12 @@ fail() {
   exit 1
 }
 
+require_clean_tree() {
+  local porcelain
+  porcelain=$(git status --porcelain --untracked-files=all) || fail 'could not determine working tree status'
+  [ -z "$porcelain" ] || fail 'working tree must be clean'
+}
+
 [ "${GITHUB_REF:-}" = 'refs/heads/master' ] || fail 'publishing is allowed only from master'
 [ "${LOCAL_CHECKS_ATTESTED:-}" = 'yes' ] || fail 'local checks were not attested'
 [ -n "${CARGO_REGISTRY_TOKEN:-}" ] || fail 'CARGO_REGISTRY_TOKEN is required'
@@ -17,7 +23,7 @@ esac
 [ "${#expected_commit}" -eq 40 ] || fail 'EXPECTED_COMMIT must be a full 40-character commit SHA'
 actual_commit=$(git rev-parse HEAD)
 [ "$actual_commit" = "$expected_commit" ] || fail 'checked out commit does not match EXPECTED_COMMIT'
-[ -z "$(git status --porcelain --untracked-files=all)" ] || fail 'working tree must be clean'
+require_clean_tree
 
 manifest=$(cargo read-manifest --manifest-path Cargo.toml)
 package_name=$(jq -er '.name | select(type == "string" and length > 0)' <<<"$manifest")
@@ -33,7 +39,7 @@ esac
 
 crate_id=$(jq -nr --arg name "$package_name" '$name | ascii_downcase | @uri')
 version_id=$(jq -nr --arg version "$version" '$version | @uri')
-status=$(curl --silent --show-error --location --max-redirs 3 \
+status=$(curl --disable --silent --show-error \
   --user-agent 'manifest-cargo-publisher (https://github.com/pathscale/WorkTablesIndex)' \
   --connect-timeout 10 --max-time 30 --retry 0 \
   --output /dev/null --write-out '%{http_code}' \
@@ -53,5 +59,5 @@ case "$status" in
     ;;
 esac
 
-[ -z "$(git status --porcelain --untracked-files=all)" ] || fail 'working tree must be clean'
+require_clean_tree
 cargo publish --registry crates-io --package "$package_name"
