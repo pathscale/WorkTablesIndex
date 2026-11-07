@@ -2,26 +2,18 @@
 
 ## Open review items
 
-- [x] Implement the [manifest-driven Cargo publishing contract](cargo-publishing.md)
-  for this crate: manual-only, exact reviewed commit, explicit registry
-  eligibility, and registry errors distinguished from an absent version.
-  Static review and ten mocked success/refusal scenarios passed; no live
-  publication or workflow dispatch was performed for this change.
+- [x] Keep crate publishing manual and master-only, using Cargo's manifest
+  version and the existing step-scoped crates.io token.
 
 - [ ] Define the compatible serde representation for tree invariants, then
   validate deserialized trees before exposing them to concurrent operations.
-- [ ] Review registry publish action references, token scope, and release inputs;
-  preserve the manual-only workflow trigger.
+- [x] Review registry publish action references and token scope; preserve the
+  manual-only workflow trigger.
 - [ ] Extend the source audit to iterators, node internals, range/split paths, and
   map operations. Keep static reasoning separate from tests and model evidence.
 
 ## Resolved queue findings
 
-- [x] Both publisher cleanliness probes reject Git failures, including empty
-  output. The registry probe ignores implicit curl configuration and rejects
-  redirects instead of classifying their destinations. Thirteen offline
-  command-double scenarios, shell syntax and diff checks passed for 4678cc6;
-  no registry publication or workflow dispatch was performed.
 - [x] Final singleton deletion revalidates and unlinks under topology write,
   emitting the actual deleted member before concurrent refill can proceed.
   Ordinary non-final removals retain their read-lock path. Payload and
