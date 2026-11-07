@@ -1,6 +1,6 @@
 [package]
 name = "WorkTablesIndex"
-version = "0.0.16"
+version = "0.0.17"
 publish = ["crates-io"]
 edition = "2021"
 documentation = "https://docs.rs/WorkTablesIndex/"
