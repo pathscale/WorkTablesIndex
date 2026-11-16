@@ -5,7 +5,7 @@
 - [x] Keep crate publishing manual and master-only, using Cargo's manifest
   version and the existing step-scoped crates.io token.
 
-- [ ] Define the compatible serde representation for tree invariants, then
+- [x] Define the compatible serde representation for tree invariants, then
   validate deserialized trees before exposing them to concurrent operations.
 - [x] Review registry publish action references and token scope; preserve the
   manual-only workflow trigger.

@@ -9,5 +9,4 @@ run the affected local checks and `cargo publish --dry-run`, then manually
 dispatch `Publish crate` from `master`. The workflow runs
 `cargo publish --registry crates-io` with the existing registry token.
 
-This workflow does not configure crates.vip or create GitHub Releases. Private
-packages must not include `crates-io` in their manifest allowlist.
+This workflow publishes only to crates.io and does not create GitHub Releases.
