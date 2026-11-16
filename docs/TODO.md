@@ -27,5 +27,3 @@
   contract. The unlink-to-retire fence is retained. This is source-reviewed;
   the focused ps-reclaim Loom gate passed for the matching domain protocol.
 
-See [the security review plan](plans/security-review-2026-11-05.md) for the
-dispositions, scope limits, and validation details.
