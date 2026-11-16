@@ -125,16 +125,14 @@ impl<'de, T: Ord + Deserialize<'de>> Deserialize<'de> for BTreeSet<T> {
             len,
         } = Repr::<T>::deserialize(deserializer)?;
 
-        if ::core::alloc::Layout::array::<T>(node_capacity).is_err() {
-            return Err(D::Error::custom("invalid tree node capacity"));
-        }
         if inner.is_empty() {
             return Err(D::Error::custom("invalid tree node layout"));
         }
         if !inner
             .iter()
             .flatten()
-            .is_sorted_by(|left, right| left.cmp(right).is_lt())
+            .zip(inner.iter().flatten().skip(1))
+            .all(|(left, right)| left < right)
         {
             return Err(D::Error::custom("tree elements must be strictly increasing"));
         }
@@ -228,7 +226,9 @@ impl<T: Ord> BTreeSet<T> {
     /// assert!(v.is_empty());
     /// ```
     pub fn clear(&mut self) {
-        self.inner = vec![Node::new()];
+        self.inner = vec![Node::with_capacity(
+            self.node_capacity.min(DEFAULT_INNER_SIZE),
+        )];
         self.index = FenwickTree::from_iter(vec![0]);
         self.len = 0;
     }
