@@ -1,6 +1,6 @@
 [package]
 name = "WorkTablesIndex"
-version = "0.0.17"
+version = "0.0.18"
 publish = ["crates-io"]
 edition = "2021"
 documentation = "https://docs.rs/WorkTablesIndex/"
@@ -53,7 +53,7 @@ ftree = { version = "1", default-features = false }
 # optional, kept under the `parking_lot` name because that is what the code
 # says. This crate uses `Mutex`, `RwLock` and `RawMutex` and nothing the fork
 # left behind.
-parking_lot = { package = "parking_lot_lite_hack", version = "^0.12", default-features = false, features = [
+parking_lot = { package = "parking_lot_lite_hack", version = "^0.12.9", default-features = false, features = [
     "send_guard",
     "arc_lock",
 ], optional = true }
@@ -144,8 +144,8 @@ while_let_loop = "allow"
 name = "locks"
 harness = false
 
-[target."cfg(unix)".dependencies.ps-reclaim]
-version = "^0.1, >=0.1.4"
+[target."cfg(any(unix, target_os = \"none\"))".dependencies.ps-reclaim]
+version = "^0.1, >=0.1.7"
 features = ["libc"]
 optional = true
 default-features = false
